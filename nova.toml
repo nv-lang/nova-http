@@ -1,0 +1,38 @@
+# nova.toml — nova-http: HTTP/1.1 client + server for Nova.
+#
+# Layout: src/ canon (Plan 195 §"Раскладка пакета"). Source root is set via
+# the legacy-but-honored `[lib] src` key (compiler-codegen/src/manifest.rs)
+# so module paths resolve relative to `src/` (D78 — module path does NOT
+# include `src`). Root files (`src/{body,cookie,effect,error,header,message,
+# method,mime,response_ext,status,url,version}.nv`) are root peers (D78
+# rev-4, Plan 203 Ф.1, 2026-07-13) declaring the bare `module http`; domain
+# subfolders (`src/client/`, `src/server/`, `src/servernet/`,
+# `src/serdejson/`, `src/transport/`) are folder-module peers declaring
+# `module http.client`, `module http.server`, etc. — unchanged from their
+# shape inside the monorepo (`std/src/http/**`), only the enclosing `http/`
+# directory itself disappeared (it IS this package's source root now).
+
+[package]
+name = "http"
+version = "0.1.0"
+description = "HTTP/1.1 client + server (headers, cookies, URL, JSON bodies, streaming/SSE) for Nova — extracted from Nova's std/http (Plan 203)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nv-lang/nova-http"
+
+[lib]
+src = "src"
+
+# Plan 203 (2026-07-13): std/http was extracted from std (sibling of the
+# Plan 193 nova-tls extraction) because a self-sufficient stdlib cannot
+# depend on an external package (`std/src/http/transport/real.nv` pulled in
+# `tls` for HTTPS) — and bare HTTP without TLS is rarely useful on its own
+# (Rust/Swift both keep http+tls outside std; Go/Python/Node keep both
+# inside, at the cost of bundling crypto). `http/transport/real.nv` and
+# `http/error.nv` import `tls` directly (`import tls.{...}`) — this
+# package's only external dependency.
+#
+# `path` — form for local development (mechanism 03.1, path-deps aren't
+# pinned). CI/publication would switch to the `git` form once this repo has
+# a remote (not switched yet — see docs/plans/203-http-out-of-std.md Ф.4).
+[dependencies]
+tls = { path = "../nova-tls" }
