@@ -1,0 +1,13 @@
+# nova.lock — сгенерирован автоматически (Plan 03.1 / D78).
+# Фиксирует точные версии зависимостей для воспроизводимых
+# сборок. Не редактируйте вручную; коммитьте в репозиторий.
+
+version = 1
+
+[[package]]
+name = "tls"
+source = "git"
+git = "https://github.com/nv-lang/nova-tls"
+pin = "version:>=0.1.0, <0.2.0"
+version = "0.1.0"
+commit = "510acc25335bb0cce0eb79f195dac1dd7a40f2dc"
