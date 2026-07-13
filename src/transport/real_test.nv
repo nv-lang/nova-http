@@ -14,7 +14,7 @@
 
 module http.transport
 
-import http.client.{HttpClient}
+import ../client.{HttpClient}
 import std.net.{mock_net}
 
 test "real_http: https делает реальное TLS-рукопожатие; non-TLS peer → Err(Tls)" {

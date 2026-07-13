@@ -37,8 +37,8 @@
 module http.servernet
 
 import std.net.{TcpListener, TcpStream, NetError}
-import http.server.{ServeMux, ServerResponse, StreamBody, route_once, serialize_response}
-import http.server.{serialize_response_head, encode_chunk, encode_chunk_end}
+import ../server.{ServeMux, ServerResponse, StreamBody, route_once, serialize_response}
+import ../server.{serialize_response_head, encode_chunk, encode_chunk_end}
 
 /// Read one full HTTP/1.1 request off `stream` (headers + Content-Length body),
 /// route it through `mux`, write the response, and close. One request per

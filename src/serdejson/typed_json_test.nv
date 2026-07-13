@@ -5,7 +5,7 @@
 
 module http.serdejson
 
-import http.client.{HttpClient, mock_http, MockResponse}
+import ../client.{HttpClient, mock_http, MockResponse}
 import http.{Http}
 import std.encoding.serde.{Serialize, Deserialize, Serializer, Deserializer, SerError, DeError}
 

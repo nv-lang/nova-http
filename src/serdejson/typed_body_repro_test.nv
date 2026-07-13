@@ -14,7 +14,7 @@
 
 module http.serdejson
 
-import http.server.{ServeMux, ServerResponse, handler_fn, serve_once}
+import ../server.{ServeMux, ServerResponse, handler_fn, serve_once}
 import std.encoding.serde.{Serialize, Deserialize, Serializer, Deserializer, SerError, DeError}
 
 #impl(Serialize + Deserialize)

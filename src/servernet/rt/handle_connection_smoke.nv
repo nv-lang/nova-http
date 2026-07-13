@@ -23,8 +23,8 @@
 module rt.handle_connection_smoke
 
 import std.net.{TcpListener, TcpStream, SocketAddr, real_net}
-import http.server.{ServeMux, ServerResponse, handler_fn}
-import http.servernet.{handle_connection}
+import ../../server.{ServeMux, ServerResponse, handler_fn}
+import ../../servernet.{handle_connection}
 
 fn routes() -> ServeMux {
     mut mux = ServeMux.new()

@@ -5,7 +5,7 @@
 // compile error (fixes the Go resp.Body leak at compile time).
 module neg.response_not_consumed
 
-import http.client.{HttpClient, mock_http, MockResponse}
+import ../client.{HttpClient, mock_http, MockResponse}
 import http.{Http}
 
 test "response from send() never consumed → compile error" {

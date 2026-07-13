@@ -14,8 +14,8 @@
 module rt.streaming_smoke
 
 import std.net.{TcpListener, TcpStream, SocketAddr, real_net}
-import http.server.{ServeMux, ServerResponse, StreamBody, handler_fn, sse_event}
-import http.servernet.{handle_connection}
+import ../../server.{ServeMux, ServerResponse, StreamBody, handler_fn, sse_event}
+import ../../servernet.{handle_connection}
 
 fn routes() -> ServeMux {
     mut mux = ServeMux.new()

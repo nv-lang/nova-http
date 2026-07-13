@@ -9,7 +9,7 @@
 
 module neg.server_header_setter_panic
 
-import http.server.{ServerResponse}
+import ../server.{ServerResponse}
 
 test "ServerResponse.header() panics on CR/LF-injected value (caller bug)" {
     mut resp = ServerResponse.text(200, "ok")
