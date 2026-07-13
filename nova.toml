@@ -31,11 +31,11 @@ src = "src"
 # `http/error.nv` import `tls` directly (`import tls.{...}`) — this
 # package's only external dependency.
 #
-# D420 (Plan 204, 2026-07-13): релизная форма — git+semver (теги vX.Y.Z,
-# caret-семантика); локальная разработка — [replace]-override ниже, НЕ меняющий
-# требование. nova.lock фиксирует точный тег+commit.
+# D420 (Plan 204, 2026-07-13; дофикс №2): релизная форма — git+semver (теги
+# vX.Y.Z, caret-семантика); nova.lock фиксирует точный тег+commit. Локальная
+# разработка (dev override на sibling-checkout) идёт ТОЛЬКО через соседний
+# `nova.local.toml` (не коммитится — см. `.gitignore`), НЕ здесь: закоммиченный
+# `[replace]` ломает чистый клон (override-путь существует только на машине
+# автора) — `nova build` теперь жёстко это проверяет (E_REPLACE_IN_MANIFEST).
 [dependencies]
 tls = { git = "https://github.com/nv-lang/nova-tls", version = "0.1" }
-
-[replace]
-tls = { path = "../nova-tls" }

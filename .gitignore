@@ -9,3 +9,9 @@ src/**/*.ilk
 # nova build/test scratch (obj dirs, libuv one-time build cache, lockfile
 # resolution scratch under target/).
 target/
+
+# Plan 204 дофикс №2 (D420): machine-local [replace] overrides — NEVER
+# commit (a committed [replace] would break a clean clone whose override
+# path only exists on the author's machine; see spec/decisions/09-tooling.md
+# D420 and compiler-codegen/src/manifest.rs `check_no_committed_replace`).
+nova.local.toml

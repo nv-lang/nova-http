@@ -93,9 +93,23 @@ unchanged) — migrated out of `std` 2026-07-13 (Plan 203).
 
 ## Building standalone
 
-Requires the Nova toolchain (`nova` CLI + clang) and a checkout of
-[`nova-tls`](https://github.com/nv-lang/nova-tls) as a sibling directory
-(the default `[dependencies] tls = { path = "../nova-tls" }`).
+Requires the Nova toolchain (`nova` CLI + clang). `[dependencies]` declares
+the release form (`tls = { git = "https://github.com/nv-lang/nova-tls",
+version = "0.1" }`) — `nova.lock` pins the resolved tag+commit, fetched into
+the shared `~/.nova/git` cache on first build (network required once).
+
+For local development against a sibling checkout of
+[`nova-tls`](https://github.com/nv-lang/nova-tls) instead, create a
+`nova.local.toml` (NOT committed — see `.gitignore`) next to this file:
+
+```toml
+[replace]
+tls = { path = "../nova-tls" }
+```
+
+(Plan 204 дофикс №2 / D420: a committed `[replace]` would break a clean
+clone whose override path only exists on the author's machine — `nova
+build` hard-errors on that, `E_REPLACE_IN_MANIFEST`.)
 
 ```sh
 # Boehm GC (mandatory Nova runtime dep) needs its own lib/include dirs —
