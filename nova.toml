@@ -31,8 +31,11 @@ src = "src"
 # `http/error.nv` import `tls` directly (`import tls.{...}`) — this
 # package's only external dependency.
 #
-# `path` — form for local development (mechanism 03.1, path-deps aren't
-# pinned). CI/publication would switch to the `git` form once this repo has
-# a remote (not switched yet — see docs/plans/203-http-out-of-std.md Ф.4).
+# D420 (Plan 204, 2026-07-13): релизная форма — git+semver (теги vX.Y.Z,
+# caret-семантика); локальная разработка — [replace]-override ниже, НЕ меняющий
+# требование. nova.lock фиксирует точный тег+commit.
 [dependencies]
+tls = { git = "https://github.com/nv-lang/nova-tls", version = "0.1" }
+
+[replace]
 tls = { path = "../nova-tls" }
