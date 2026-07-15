@@ -448,7 +448,7 @@ fn rewrite_encoding_headers(h HeaderMap, decoded_len int) -> HeaderMap {
     ro _ = hm.remove("content-encoding")
     ro _ = hm.remove("transfer-encoding")
     // Статически валидное имя заголовка — insert отказать не может.
-    ro _ = hm.insert("Content-Length", str.from(decoded_len))
+    ro _ = hm.insert("Content-Length", decoded_len.to_str())
     hm
 }
 
@@ -514,7 +514,7 @@ fn host_header_of(u Url) -> str {
         Some(h) => {
             ro hb = if h.contains(":") { "[${h}]" } else { h }
             match u.port {
-                Some(p) => "${hb}:${str.from(p)}"
+                Some(p) => "${hb}:${p}"
                 None    => hb
             }
         }
@@ -579,7 +579,7 @@ fn url_with_target(base Url, target str) -> Url {
         None => ()
     }
     match base.port {
-        Some(p) => { sb.append(":"); sb.append(str.from(p)); () }
+        Some(p) => { sb.append(":"); sb.append(p.to_str()); () }
         None    => ()
     }
     if !target.starts_with("/") { sb.append("/") }

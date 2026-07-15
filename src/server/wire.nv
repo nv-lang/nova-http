@@ -135,7 +135,7 @@ export fn serialize_response(resp ServerResponse) -> []u8 {
     mut buf = WriteBuffer.new()
     buf.cap(128 + body.len())
     buf.write_str("HTTP/1.1 ")
-    buf.write_str(str.from(status))
+    buf.write_str(status.to_str())
     buf.write_str(" ")
     buf.write_str(reason_of(status))
     buf.write_str("\r\n")
@@ -149,7 +149,7 @@ export fn serialize_response(resp ServerResponse) -> []u8 {
 
     if !headers.contains("content-length") && !headers.contains("transfer-encoding") {
         buf.write_str("Content-Length: ")
-        buf.write_str(str.from(body.len()))
+        buf.write_str(body.len().to_str())
         buf.write_str("\r\n")
     }
     if !headers.contains("connection") {
@@ -181,7 +181,7 @@ export fn serialize_response_head(resp ServerResponse) -> []u8 {
     mut buf = WriteBuffer.new()
     buf.cap(160)
     buf.write_str("HTTP/1.1 ")
-    buf.write_str(str.from(status))
+    buf.write_str(status.to_str())
     buf.write_str(" ")
     buf.write_str(reason_of(status))
     buf.write_str("\r\n")

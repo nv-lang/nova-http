@@ -162,7 +162,7 @@ export fn SetCookie @serialize() -> str {
     buf.append(@value)
     match @domain { Some(d) => { buf.append("; Domain="); buf.append(d); () }, None => () }
     match @path   { Some(p) => { buf.append("; Path="); buf.append(p); () }, None => () }
-    match @max_age { Some(m) => { buf.append("; Max-Age="); buf.append(str.from(m)); () }, None => () }
+    match @max_age { Some(m) => { buf.append("; Max-Age="); buf.append(m.to_str()); () }, None => () }
     if @secure { buf.append("; Secure") }
     if @http_only { buf.append("; HttpOnly") }
     buf.append("; SameSite=")

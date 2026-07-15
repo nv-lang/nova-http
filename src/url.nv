@@ -63,7 +63,7 @@ export fn ParseUrlError @to_str() -> str {
         MissingScheme                  => "missing scheme"
         InvalidScheme(value)           => "invalid scheme '${value}'"
         MalformedPort(value)           => "invalid port '${value}'"
-        InvalidPercentEncoding(position) => "invalid percent-encoding at ${str.from(position)}"
+        InvalidPercentEncoding(position) => "invalid percent-encoding at ${position}"
         InvalidHost(reason)            => "invalid host: ${reason}"
         ObfuscatedIp(value)            => "obfuscated IP literal '${value}' rejected"
         UnterminatedIpv6               => "unterminated IPv6 literal"
@@ -474,7 +474,7 @@ export fn Url @to_str() -> str {
                 ()
             }
             match @port {
-                Some(p) => { buf.append(":"); buf.append(str.from(p)); () }
+                Some(p) => { buf.append(":"); buf.append(p.to_str()); () }
                 None    => ()
             }
         }
@@ -516,7 +516,7 @@ export fn Url.encode_query(s str) -> str {
             buf.append('+')
         } else {
             // Percent-encode КАЖДЫЙ байт UTF-8-представления char'а.
-            for b in str.from(c).bytes() {
+            for b in c.to_str().bytes() {
                 ro n = b as int
                 buf.append('%')
                 buf.append(hex_upper(((n / 16) & 0xF) as u8))

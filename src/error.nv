@@ -174,8 +174,8 @@ export fn HttpError @to_str() -> str {
         Protocol(m)         => "protocol error: ${m}"
         InvalidUrl          => "invalid url"
         InvalidHeader       => "invalid header"
-        Status(c)           => "unexpected status ${str.from(c.as_u16())} ${c.reason()}"
-        TooManyRedirects(n) => "too many redirects (${str.from(n)})"
+        Status(c)           => "unexpected status ${c.as_u16()} ${c.reason()}"
+        TooManyRedirects(n) => "too many redirects (${n})"
         BodyTooLarge        => "body too large"
         Closed              => "connection closed"
         Canceled            => "canceled"
@@ -183,10 +183,10 @@ export fn HttpError @to_str() -> str {
         Other(m)            => m
     }
     match @source {
-        Some(UrlParse(e))     => "${base}: ${e.to_str()}"
-        Some(Net(e))          => "${base}: ${e.to_str()}"
-        Some(Compress(e))     => "${base}: ${e.to_str()}"
-        Some(Tls(e))          => "${base}: ${e.to_str()}"
+        Some(UrlParse(e))     => "${base}: ${e}"
+        Some(Net(e))          => "${base}: ${e}"
+        Some(Compress(e))     => "${base}: ${e}"
+        Some(Tls(e))          => "${base}: ${e}"
         Some(OtherSource(m))  => "${base}: ${m}"
         None                  => base
     }
