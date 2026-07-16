@@ -7,9 +7,10 @@ with a strict host/SSRF validator, cookies (RFC 6265bis), an `HttpClient`
 JSON bodies), and an `HTTP/1.1` server (`ServeMux`, streaming/SSE, live
 accept loop over `std.net`). HTTPS goes through [`tls`](../nova-tls).
 
-Pure Nova — no native C shim of its own; the only external dependency is
-`tls` (for the `secure = true` transport path). Transport for plaintext
-HTTP and TCP sockets comes from the standard library (`std.net`).
+Pure Nova — no native C shim of its own; external dependencies are `tls`
+(for the `secure = true` transport path) and `compress` (for transparent
+gzip/deflate/brotli response decompression, Plan 205 Ф.2). Transport for
+plaintext HTTP and TCP sockets comes from the standard library (`std.net`).
 
 Extracted from the Nova monorepo's `std/http` (Plan 178 core design) into a
 standalone repository per
@@ -45,7 +46,7 @@ fn make_mux() -> ServeMux {
 
 ```
 nova-http/
-├── nova.toml              [package] name = "http"; [lib] src = "src"; [dependencies] tls
+├── nova.toml              [package] name = "http"; [lib] src = "src"; [dependencies] tls, compress
 └── src/
     ├── body.nv             Body (+ BodyReader) — MUST-CONSUME (D359)
     ├── cookie.nv           Cookie / SetCookie (RFC 6265bis, D358)
@@ -95,16 +96,19 @@ unchanged) — migrated out of `std` 2026-07-13 (Plan 203).
 
 Requires the Nova toolchain (`nova` CLI + clang). `[dependencies]` declares
 the release form (`tls = { git = "https://github.com/nv-lang/nova-tls",
-version = "0.1" }`) — `nova.lock` pins the resolved tag+commit, fetched into
-the shared `~/.nova/git` cache on first build (network required once).
+version = "0.1" }`, same for `compress`) — `nova.lock` pins the resolved
+tag+commit, fetched into the shared `~/.nova/git` cache on first build
+(network required once).
 
 For local development against a sibling checkout of
-[`nova-tls`](https://github.com/nv-lang/nova-tls) instead, create a
-`nova.local.toml` (NOT committed — see `.gitignore`) next to this file:
+[`nova-tls`](https://github.com/nv-lang/nova-tls) and/or
+[`nova-compress`](https://github.com/nv-lang/nova-compress) instead, create
+a `nova.local.toml` (NOT committed — see `.gitignore`) next to this file:
 
 ```toml
 [replace]
 tls = { path = "../nova-tls" }
+compress = { path = "../nova-compress" }
 ```
 
 (Plan 204 дофикс №2 / D420: a committed `[replace]` would break a clean
