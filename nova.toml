@@ -37,5 +37,9 @@ src = "src"
 # `nova.local.toml` (не коммитится — см. `.gitignore`), НЕ здесь: закоммиченный
 # `[replace]` ломает чистый клон (override-путь существует только на машине
 # автора) — `nova build` теперь жёстко это проверяет (E_REPLACE_IN_MANIFEST).
+# Plan 205 Ф.2 (2026-07-16): auto-decompress (Content-Encoding: gzip/deflate/br)
+# pulls in the `compress` package (extracted from std/encoding/compress, same
+# extraction shape as `tls` above) — client/client.nv and error.nv import it.
 [dependencies]
 tls = { git = "https://github.com/nv-lang/nova-tls", version = "0.1" }
+compress = { git = "https://github.com/nv-lang/nova-compress", version = "0.1" }

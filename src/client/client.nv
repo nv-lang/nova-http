@@ -35,7 +35,7 @@ import http.{Method, Url, HeaderMap, Response, Request, Http, HttpError, ErrorKi
 
 import std.encoding.base64.{Base64}
 import std.encoding.json.{JsonValue, Json}
-import std.encoding.compress.{gzip_decode, zlib_decode, inflate, brotli_decode, CompressError}
+import compress.{gzip_decode, zlib_decode, inflate, brotli_decode, CompressError}
 
 // ── RedirectPolicy ───────────────────────────────────────────────────────────
 

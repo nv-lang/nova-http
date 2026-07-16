@@ -29,7 +29,7 @@
 
 module http
 
-import std.encoding.compress.{CompressError}
+import compress.{CompressError}
 import std.net.{NetError}
 import tls.{TlsError}
 

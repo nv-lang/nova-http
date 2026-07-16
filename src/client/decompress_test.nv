@@ -2,7 +2,7 @@
 // Plan 182 Ф.2 (migrated from nova_tests/http_decompress/decompress_test.nv) —
 // transparent Content-Encoding decode (gzip/deflate) + bomb guard.
 //
-// Circular proof: the mock server encodes a body with std.encoding.compress
+// Circular proof: the mock server encodes a body with `compress`
 // (`gzip_encode`/`zlib_encode`) and serves it with `Content-Encoding: gzip`
 // (resp. deflate); the client transparently decodes it back to the ORIGINAL
 // bytes. Negative: a body that decodes past the client's `max_decompressed`
@@ -17,7 +17,7 @@
 module http.client
 
 import http.{Http}
-import std.encoding.compress.{gzip_encode, zlib_encode, CompressLevel}
+import compress.{gzip_encode, zlib_encode, CompressLevel}
 
 // gzip-encode a string body (panics only in test setup if encoding fails).
 fn gz(s str) -> []u8 {
