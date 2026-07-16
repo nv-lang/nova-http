@@ -144,3 +144,11 @@ may need a longer timeout (`--timeout 300`) than the default under load.
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
 your option — same terms as the Nova compiler and standard library.
+
+## Roadmap
+
+- **`serve_static(mux, fs ReadFs)` + mime-по-расширению** (owner-go 2026-07-16): статик-хендлер поверх
+  read-only VFS-протокола `ReadFs` (nova std/fs, Plan 210 Ф.6б) — «dev = с диска (`DirFs`), prod = из
+  бинаря (`EmbeddedDir`/`embed_dir`)» одной строкой; Go `http.FileServer`-паритет. Mime-таблица по
+  расширению (минимальный набор: html/css/js/json/svg/png/jpg/woff2/wasm + `application/octet-stream`
+  fallback). Витрина — флагман-агрегатор (nova Plan 187): `embed_dir("frontend")` + `serve_static`.
