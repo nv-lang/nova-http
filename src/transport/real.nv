@@ -128,7 +128,7 @@ fn https_send_over_net(host str, port int, request str) Net -> Result[str, HttpE
     match err_detail {
         Some(d) => Err(HttpError.transport(ErrorKind.Tls, d))
         None    => {
-            ro acc_bytes []u8 = acc.into() // [M-lint-findings-writebuffer-into]
+            ro acc_bytes []u8 = acc.into_bytes()
             Ok(unsafe { acc_bytes.to_str_unchecked() })
         }
     }
@@ -171,6 +171,6 @@ fn http_send_over_net(host str, port int, request str) Net -> Result[str, HttpEr
     }
     stream.close()
     // [M-174.1-vec-method-chain-elem-erasure]: explicit `[]u8` local.
-    ro acc_bytes []u8 = acc.into() // [M-lint-findings-writebuffer-into]
+    ro acc_bytes []u8 = acc.into_bytes()
     Ok(unsafe { acc_bytes.to_str_unchecked() })
 }

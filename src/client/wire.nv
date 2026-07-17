@@ -69,11 +69,11 @@ fn serialize_request(method str, target str, host_header str, headers HeaderMap,
     if body.len() > 0 {
         buf.write_bytes(body)
     }
-    // [M-174.1-vec-method-chain-elem-erasure]: `.into()`'s `[]u8` result loses
+    // [M-174.1-vec-method-chain-elem-erasure]: `.into_bytes()`'s `[]u8` result loses
     // its concrete element type for facade-imported method lookup when chained
     // directly — bind to an explicit `[]u8` local first (see marker in
     // backlog-followups.md).
-    ro wire_bytes []u8 = buf.into() // [M-lint-findings-writebuffer-into]
+    ro wire_bytes []u8 = buf.into_bytes()
     unsafe { wire_bytes.to_str_unchecked() }
 }
 
@@ -108,7 +108,7 @@ fn serialize_response(status StatusCode, headers HeaderMap, body []u8) -> str {
         buf.write_bytes(body)
     }
     // [M-174.1-vec-method-chain-elem-erasure] (see marker above / backlog).
-    ro wire_bytes []u8 = buf.into() // [M-lint-findings-writebuffer-into]
+    ro wire_bytes []u8 = buf.into_bytes()
     unsafe { wire_bytes.to_str_unchecked() }
 }
 
@@ -317,7 +317,7 @@ fn decode_chunked(b []u8, start int) -> Result[[]u8, HttpError] {
             i = data_end + 2
         }
     }
-    Ok(out.into()) // [M-lint-findings-writebuffer-into]
+    Ok(out.into_bytes())
 }
 
 // Parse a chunk-size line (hex, up to optional ";chunk-ext"). Empty/no-hex → None.
