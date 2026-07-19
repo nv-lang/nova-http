@@ -78,7 +78,7 @@ fn https_send_over_net(host str, port int, request str) Net -> Result[str, HttpE
     // промежуточного consume-биндинга tcp (D131 path-merge).
     ro cfg = ClientConfig.new(host)
     ro conn = match TcpStream.connect(addr) {
-        Ok(s)  => TlsStream.connect(s, cfg)
+        Ok(consume s)  => TlsStream.connect(s, cfg)
         Err(e) => return Err(HttpError.from_net(ErrorKind.Connect, e))
     }
     consume tls = match conn {
@@ -145,7 +145,7 @@ fn http_send_over_net(host str, port int, request str) Net -> Result[str, HttpEr
         None    => return Err(HttpError.transport(ErrorKind.Dns, "no addresses resolved"))
     }
     mut stream = match TcpStream.connect(addr) {
-        Ok(s)  => s
+        Ok(consume s)  => s
         Err(e) => return Err(HttpError.from_net(ErrorKind.Connect, e))
     }
     match stream.write_all(request.bytes()) {

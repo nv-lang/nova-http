@@ -36,7 +36,7 @@ fn routes() -> ServeMux {
 test "servernet: live GET /health round-trip over loopback" {
     with Net = real_net() {
         ro lst = match TcpListener.bind(SocketAddr.loopback(0)) {
-            Ok(l)  => l
+            Ok(consume l)  => l
             Err(_) => { assert(false); return }
         }
         ro port = lst.local_port()
@@ -65,8 +65,8 @@ test "servernet: live GET /health round-trip over loopback" {
             // Client fiber: connect, send a raw GET, read the response.
             spawn {
                 match TcpStream.connect(SocketAddr.loopback(port)) {
-                    Ok(conn) => {
-                        mut cli = conn
+                    Ok(consume conn) => {
+                        consume cli = conn
                         match cli.write_str("GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n") {
                             Ok(_)  => ()
                             Err(_) => ()
