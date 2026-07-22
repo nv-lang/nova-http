@@ -37,8 +37,8 @@ test "decompress: brotli (br) body is transparently decoded" {
     ro comp = br_hexbytes("1b130000a4b0b2ea8147028a")
     ro m = mock_http().on("GET", "/b",
         MockResponse.new(200).header("Content-Encoding", "br").body(comp))
-    with Http = effect Http { send(host, port, secure, request) { m.reply(request) } } {
-        consume resp = HttpClient.new().get("http://x.example/b").send()!!
+    with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
+        ro resp = HttpClient.new().get("http://x.example/b").send()!!
         // Content-Encoding stripped; body is the decoded plaintext.
         assert(match resp.header("content-encoding") { Some(_) => false, None => true })
         assert(resp.text()!! == "XXXXXXXXXXYYYYYYYYYY")

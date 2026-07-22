@@ -21,7 +21,7 @@ test "HttpClientBuilder: mutating chain applies BOTH settings on one instance" {
     ro m = mock_http()
         .on("GET", "/echo-header", MockResponse.echo_request_header("x-trace"))
         .on("GET", "/echo-ua", MockResponse.echo_request_header("user-agent"))
-    with Http = effect Http { send(host, port, secure, request) { m.reply(request) } } {
+    with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
         mut b = HttpClient.builder()
         b.default_header("X-Trace", "abc")
         b.user_agent("nova-test/1.0")
