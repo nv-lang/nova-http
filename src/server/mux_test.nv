@@ -1,29 +1,26 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// Plan 182 Ф.2 (migrated from nova_tests/http_server/server_test.nv) —
-// HTTP/1.1 server CORE, mock-driven (no sockets): parse → route → serialize
-// via `serve_once`. Exercises ServeMux params/method/405-Allow, 404, POST
-// body echo, Host-mandatory + `..`-reject. [M-178-std-http] server core.
+// Plan 182 Ф.2 (migrated from nova_tests/http_server/server_test.nv); Plan 222.1
+// (2026-07-22): `ServeMux` retired for the Axum-class `Router` (router.nv) —
+// [M-servemux-routing-placeholder] closed. Same regression coverage as before
+// (params/method/405-Allow, 404, POST body echo, Host-mandatory + `..`-reject),
+// migrated onto the new registration API (`Result[(), HttpError]`, `!!`) +
+// `.fallback` (was `.not_found`).
 
 module http.server
 
 // Build a small router used across the cases.
-// [M-184-mut-chain-return-position] (http-хвост, 2026-07-07): беглая цепочка
-// mut-сеттеров КАК return-значение fn (`ServeMux.new().get(..)...` глубины 4)
-// после 184 Ф.2 всё ещё мискомпилируется — C-инициализация
-// `NovaValue_ServeMux` из `NovaValue_ServeMux*` (fleeting `-> @` отдаёт
-// указатель, return-позиция ждёт значение). Statement-/arg-позиции depth 2-3
-// покрыты p184_defect_b; return-позиция — нет. Канонический mut-биндинг ниже.
-fn routes() -> ServeMux {
-    mut mux = ServeMux.new()
-    mux.get("/health", handler_fn(|req| ServerResponse.text(200, "ok")))
-    mux.get("/users/{id}", handler_fn(|req| {
-        ServerResponse.text(200, "user " + req.param("id") ?? "?")
-    }))
-    mux.post("/echo", handler_fn(|req| {
+fn routes() -> Router {
+    mut r = Router.new()
+    r.get("/health", handler_fn(|req| ServerResponse.text(200, "ok")))!!
+    r.get("/users/{id}", handler_fn(|req| {
+        ro uid = req.param("id") ?? "?"
+        ServerResponse.text(200, "user ${uid}")
+    }))!!
+    r.post("/echo", handler_fn(|req| {
         ServerResponse.bytes(200, "application/octet-stream", req.body_bytes())
-    }))
-    mux.not_found(handler_fn(|req| ServerResponse.text(404, "nope")))
-    mux
+    }))!!
+    r.fallback(handler_fn(|req| ServerResponse.text(404, "nope")))
+    r
 }
 
 // Assert the response wire begins with a given status line and contains a substring.
@@ -65,7 +62,7 @@ test "server: POST /echo returns the request body" {
 
 // ── 404: no route matches ──────────────────────────────────────────────────────
 
-test "server: unknown path → 404 not_found handler" {
+test "server: unknown path → 404 fallback handler" {
     ro req = "GET /missing HTTP/1.1\r\nHost: x\r\n\r\n".bytes()
     ro wire = serve_once(routes(), req)
     assert(status_line(wire) == "HTTP/1.1 404 Not Found")

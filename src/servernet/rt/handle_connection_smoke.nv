@@ -23,19 +23,19 @@
 module rt.handle_connection_smoke
 
 import std.net.{TcpListener, TcpStream, SocketAddr, real_net}
-import ../../server.{ServeMux, ServerResponse, handler_fn}
+import ../../server.{Router, ServerResponse, handler_fn}
 import ../../servernet.{handle_connection}
 
-fn routes() -> ServeMux {
-    mut mux = ServeMux.new()
-    mux.get("/health", handler_fn(|req| ServerResponse.text(200, "ok")))
-    mux.not_found(handler_fn(|req| ServerResponse.text(404, "nope")))
-    mux
+fn routes() -> Router {
+    mut r = Router.new()
+    r.get("/health", handler_fn(|req| ServerResponse.text(200, "ok")))!!
+    r.fallback(handler_fn(|req| ServerResponse.text(404, "nope")))
+    r
 }
 
 test "servernet: live GET /health round-trip over loopback" {
     with Net = real_net() {
-        ro lst = match TcpListener.bind(SocketAddr.loopback(0)) {
+        consume lst = match TcpListener.bind(SocketAddr.loopback(0)) {
             Ok(consume l)  => l
             Err(_) => { assert(false); return }
         }
@@ -51,7 +51,7 @@ test "servernet: live GET /health round-trip over loopback" {
             // Server fiber: accept one connection, serve it through handle_connection.
             spawn {
                 match lst.accept() {
-                    Ok(srv) => {
+                    Ok(consume srv) => {
                         consume s = srv
                         match handle_connection(s, routes()) {
                             Ok(_)  => { ok_tx.try_send(true) }
@@ -60,7 +60,6 @@ test "servernet: live GET /health round-trip over loopback" {
                     }
                     Err(_) => ()
                 }
-                lst.close()
             }
             // Client fiber: connect, send a raw GET, read the response.
             spawn {
@@ -81,6 +80,7 @@ test "servernet: live GET /health round-trip over loopback" {
                 }
             }
         }
+        lst.close()
         ok_tx.close()
         got_tx.close()
         ro server_ok = ok_rx.try_recv() ?? false

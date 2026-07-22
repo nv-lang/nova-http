@@ -336,161 +336,27 @@ export fn handler_fn(f fn(ServerRequest) -> ServerResponse) -> Handler => { f }
 #stable(since = "0.1")
 export fn Handler @handle(req ServerRequest) -> ServerResponse => (@f)(req)
 
-// ── ServeMux (Go-1.22-style routing) ──────────────────────────────────────────
-
-type Route value { ro method str, ro pattern str, ro handler Handler }
-
-/// Path-routing multiplexer: registers `(METHOD, pattern)` → `Handler`. Patterns
-/// are `/lit/{param}` segments; `{name}` matches one segment. Dispatch yields 404
-/// (no path match) or 405 + `Allow` (path matched, method did not). `HEAD` falls
-/// back to a `GET` route.
-#stable(since = "0.1")
-export type ServeMux value { priv routes []Route, priv not_found Option[Handler] }
-
-/// Empty mux.
-#stable(since = "0.1")
-export fn ServeMux.new() -> ServeMux => { routes: []Route.new(), not_found: None }
-
-/// Register `handler` for `method` + `pattern`.
-///
-/// [M-http-builders-second-pass] (http-хвост, 2026-07-07): копирующие
-/// строители ServeMux → мутирующие свойства (D117 AMEND-2, канон
-/// `mut @x(v) -> @`, auto self-return D409). Копирующая форма shallow-copy'ила
-/// heap-backed `routes` — разделяла буфер с до-вызовным экземпляром без
-/// реальной независимости. Беглые value-цепочки (`ServeMux.new().get(...)`)
-/// корректны после 184 Ф.2.
-#stable(since = "0.1")
-export fn ServeMux mut @handle(method str, pattern str, handler Handler) -> @ {
-    @routes.push(Route { method: method.to_ascii_upper(), pattern, handler })
-}
-
-/// Register a `GET` route.
-#stable(since = "0.1")
-export fn ServeMux mut @get(pattern str, handler Handler) -> @ { @handle("GET", pattern, handler) }
-/// Register a `POST` route.
-#stable(since = "0.1")
-export fn ServeMux mut @post(pattern str, handler Handler) -> @ { @handle("POST", pattern, handler) }
-/// Register a `PUT` route.
-#stable(since = "0.1")
-export fn ServeMux mut @put(pattern str, handler Handler) -> @ { @handle("PUT", pattern, handler) }
-/// Register a `DELETE` route.
-#stable(since = "0.1")
-export fn ServeMux mut @delete(pattern str, handler Handler) -> @ { @handle("DELETE", pattern, handler) }
-/// Register a `PATCH` route.
-#stable(since = "0.1")
-export fn ServeMux mut @patch(pattern str, handler Handler) -> @ { @handle("PATCH", pattern, handler) }
-
-/// Set the 404 (no-route) handler.
-#stable(since = "0.1")
-export fn ServeMux mut @not_found(handler Handler) -> @ { @not_found = Some(handler) }
-
-/// Route a request → response. 404 if no path matches; 405 + `Allow` if the path
-/// matches but the method does not; otherwise the matched handler (with params).
-#stable(since = "0.1")
-// Plan 184 Р10 (D326-ревизия): the request is taken by value (ro) and copied into a
-// local `mut rq` — @dispatch mutates the request LOCALLY (sets matched path params) and
-// forwards it to the handler; the mutation must NOT reach the caller (Category-A: the old
-// `mut req` "private copy" intent). Under the new in-out `mut x T` model a `mut` value-record
-// param would be by-pointer in-out, so the local copy makes the local-only intent explicit.
-export fn ServeMux @dispatch(req ServerRequest) -> ServerResponse {
-    mut rq = req
-    ro reqm = rq.method().str()
-    mut path_matched = false
-    mut allow = []str.new()
-    for r in @routes {
-        match match_pattern(r.pattern, rq.path()) {
-            Some(params) => {
-                path_matched = true
-                ro mok = r.method == reqm || (r.method == "GET" && reqm == "HEAD")
-                if mok {
-                    // [M-http-props-mut-chain-argpos-value-ptr-mismatch]
-                    // цепочка до фикса — `r.handler.handle(rq.params(params))` (fleeting
-                    // `-> @` chain-result used DIRECTLY as a call argument) is a codegen
-                    // gap for `value`-type receivers: CC-FAIL "passing NovaValue_ServerRequest*
-                    // to parameter of incompatible type NovaValue_ServerRequest; dereference
-                    // with *". Split into a bare-statement mutation + plain-value pass.
-                    rq.params(params)
-                    return r.handler.handle(rq)
-                } else {
-                    allow.push(r.method)
-                }
-            }
-            None => ()
-        }
-    }
-    if path_matched {
-        method_not_allowed(allow)
-    } else {
-        match @not_found {
-            Some(h) => h.handle(rq)
-            None    => ServerResponse.text(404, "404 page not found")
-        }
-    }
-}
-
-fn method_not_allowed(allow []str) -> ServerResponse {
-    consume sb = StringBuilder.new()
-    sb.cap(32)
-    mut first = true
-    for m in allow {
-        if !first { sb.append(", ") }
-        sb.append(m)
-        first = false
-    }
-    mut resp = ServerResponse.text(405, "405 method not allowed")
-    resp.header("Allow", sb.into_str())
-    resp
-}
-
-// Match a route pattern against a request path. Returns matched {name} params, or
-// None if no match. Segment counts must be equal; literal segments compare exactly;
-// `{name}` binds one segment.
-fn match_pattern(pattern str, path str) -> Option[[](str, str)] {
-    ro pseg = split_segments(pattern)
-    ro rseg = split_segments(path)
-    if pseg.len() != rseg.len() { return None }
-    mut params [](str, str) = []
-    mut i = 0
-    ro n = pseg.len()
-    while i < n {
-        ro p = pseg[i]
-        ro r = rseg[i]
-        if p.starts_with("{") && p.ends_with("}") {
-            ro name = p[1..p.byte_len() - 1]
-            params.push((name, percent_decode(r)))
-        } else if p != r {
-            return None
-        }
-        i += 1
-    }
-    Some(params)
-}
-
-fn split_segments(s str) -> []str {
-    mut out = []str.new()
-    for part in s.split("/") {
-        if part.byte_len() > 0 { out.push(part) }
-    }
-    out
-}
-
 // ── serve_once: the pure request→response driver (mock-testable, no sockets) ──
+//
+// Routing itself (`Router` — segment-trie, `MethodRouter`, precedence,
+// `{param}`/`{*rest}`, nest/fallback) lives in router.nv (Plan 222.1; replaces
+// the old linear-scan `ServeMux`, `[M-servemux-routing-placeholder]`).
 
-/// Parse a raw HTTP/1.1 request and route it through `mux` — the routed
+/// Parse a raw HTTP/1.1 request and route it through `router` — the routed
 /// `ServerResponse`, WITHOUT serializing. Malformed request → the same 400
 /// `ServerResponse` `serve_once` would serialize. Exported so
 /// `http.servernet`'s live socket runner can inspect `@is_streaming()`
 /// before picking the fixed vs. chunked write path (`serve_once` stays the
 /// single-shot pure entry point mock tests use).
 #stable(since = "0.1")
-export fn route_once(mux ServeMux, raw []u8) -> ServerResponse {
+export fn route_once(router Router, raw []u8) -> ServerResponse {
     match parse_request(raw) {
-        Ok(req) => mux.dispatch(req)
+        Ok(req) => router.dispatch(req)
         Err(_)  => ServerResponse.text(400, "400 bad request")
     }
 }
 
-/// Parse a raw HTTP/1.1 request, route it through `mux`, and serialize the
+/// Parse a raw HTTP/1.1 request, route it through `router`, and serialize the
 /// response. The single unit reused by both the mock tests and the live socket
 /// runner (http.servernet). Malformed request → 400. A streaming response
 /// (`@is_streaming()`) is fully drained HERE (mock-test/pure use — the wire
@@ -500,8 +366,8 @@ export fn route_once(mux ServeMux, raw []u8) -> ServerResponse {
 /// incremental delivery — that is the whole point of streaming, see
 /// servernet.nv `handle_connection`.
 #stable(since = "0.1")
-export fn serve_once(mux ServeMux, raw []u8) -> []u8 {
-    ro resp = route_once(mux, raw)
+export fn serve_once(router Router, raw []u8) -> []u8 {
+    ro resp = route_once(router, raw)
     if resp.is_streaming() { drain_stream_to_bytes(resp) } else { serialize_response(resp) }
 }
 
