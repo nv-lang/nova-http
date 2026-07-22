@@ -1,0 +1,146 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: config.nv — accept-loop + connection policy knobs, `[M-178-
+// server-policy-surface]` (owner decision 2026-07-22: закрыть сейчас).
+//
+// Named `ServerPolicy`, NOT `ServerConfig`: a same-CU bare-name collision
+// was hit during development against `tls`'s OWN (unrelated, internal)
+// `ServerConfig` type (`nova-tls/src/server.nv`, `cert_pem`/`key_pem`
+// fields) — `nova check`/`nova build`/`nova test` compile this package
+// together with its FULL transitive dependency graph as one unit, and this
+// compiler resolves at least some type-member lookups by bare type name
+// across that whole unit rather than per-(module, type) — the same class of
+// cross-module bare-name collision this package's OWN `servernet.nv` file
+// header already documents hitting once before (`std.net2`'s `NetError`
+// shadowing `ParseUrlError.InvalidPort`, worked around there by module
+// separation, not a compiler patch). Renaming here is the same kind of
+// legitimate avoidance, not a masked behavior bug — `ServerPolicy` is also
+// the more accurate name for what this type actually holds (accept-loop +
+// connection POLICY knobs, not a generic "server config").
+//
+// `ServerPolicy` is a plain `value` record (no owned/linear fields — every
+// field is a scalar or `Duration`, itself a `value` record), so `serve()`/
+// `serve_connection()` (`serve.nv`) can freely copy it per accepted
+// connection (a `detach { ... }` capture) with no share()/consume dance —
+// same non-linear-capture reasoning `ServeMux` itself already relies on.
+//
+// `with_*` convention (D117 AMEND-2 / D409, memory
+// `feedback-with-star-and-property-methods.md`): mutating fleeting
+// properties (`@x()` getter / `mut @x(v) -> @` setter, auto self-return) —
+// the SAME shape `server.nv`'s own `ServeMux mut @get(pattern, handler) ->
+// @` already uses for its builder chain. Fields are plain (no `ro`) because
+// the setters reassign them directly (mirrors `ServerRequest.params`, the
+// one other mutable-via-property field in this package — `ro` fields may
+// only be mutated through a method call on the field itself, e.g.
+// `ServerResponse.@header`'s `@headers.insert(...)`, never by direct
+// reassignment, per `E_READONLY_FIELD`).
+
+module http.servernet
+
+import std.time.duration
+
+/// Accept-loop + per-connection policy surface for `serve()`/
+/// `serve_connection()` (`serve.nv`). All fields are policy KNOBS, not
+/// runtime state — defaults (`ServerPolicy.new()`) are reasonable for a
+/// bounded demo/production server; every knob is independently tunable via
+/// its `mut @x(v) -> @` setter.
+#stable(since = "0.1")
+export type ServerPolicy value {
+    max_inflight          int
+    reject_with_503       bool
+    max_requests_per_conn int
+    header_deadline       Duration
+    read_deadline         Duration
+    idle_deadline         Duration
+    max_body_bytes        int
+}
+
+/// Defaults:
+///   - `max_inflight: 16` — matches the flagship aggregator's own
+///     empirically-gated admission bound
+///     (`[M-187-high-concurrency-connection-wedge]`, examples/flagship/
+///     aggregator/src/main.nv `MAX_INFLIGHT_CONNS`) — 16 matches the M:N
+///     runtime's worker-pool size, the real backpressure bound once the
+///     work-conserving-pump fix landed (see that constant's own doc-comment
+///     for the gate history); a fresh knob here, not a hardcoded copy, so a
+///     consumer package can widen/narrow it without touching this package.
+///   - `reject_with_503: true` — an honest `503 Service Unavailable` +
+///     `Connection: close` is friendlier to a well-behaved client (retry-
+///     able, no ambiguity) than a bare TCP close (which some clients read as
+///     a transient network error and blindly retry the same request without
+///     backoff); `false` recovers the old bare-close behavior for a caller
+///     that wants zero per-reject work.
+///   - `max_requests_per_conn: 100` — bounds a single persistent
+///     connection's lifetime (matches the common `nginx`/`Go net/http`
+///     default order of magnitude) — prevents one long-lived keep-alive
+///     connection from starving fairness across many clients.
+///   - `header_deadline` / `read_deadline: 5s` — bounds the header block and
+///     the body read respectively (slowloris mitigation, deliverable 3);
+///     `idle_deadline: 60s` — how long a keep-alive connection may sit idle
+///     between requests before this server gives up on it.
+///   - `max_body_bytes: 1 MiB` — a generous-but-bounded request body cap
+///     (deliverable 4); exceeding it is a `413 Payload Too Large`, not a
+///     silent unbounded buffer grow (the pre-hardening `read_request`'s own
+///     gap, see `servernet.nv`'s own file-header note this plan closes).
+#stable(since = "0.1")
+export fn ServerPolicy.new() -> ServerPolicy => {
+    max_inflight: 16,
+    reject_with_503: true,
+    max_requests_per_conn: 100,
+    header_deadline: 5.to_seconds(),
+    read_deadline: 5.to_seconds(),
+    idle_deadline: 60.to_seconds(),
+    max_body_bytes: 1048576,
+}
+
+/// Max connections handled concurrently; over budget → admission reject
+/// (`reject_with_503`-gated) — see `serve()`, `serve.nv`.
+#stable(since = "0.1")
+export fn ServerPolicy @max_inflight() -> int => @max_inflight
+#stable(since = "0.1")
+export fn ServerPolicy mut @max_inflight(n int) -> @ { @max_inflight = n }
+
+/// Whether an over-budget accept is answered with a real `503` (default) or
+/// just closed immediately with no bytes written.
+#stable(since = "0.1")
+export fn ServerPolicy @reject_with_503() -> bool => @reject_with_503
+#stable(since = "0.1")
+export fn ServerPolicy mut @reject_with_503(on bool) -> @ { @reject_with_503 = on }
+
+/// Requests served on one persistent connection before this server forces
+/// `Connection: close` on the next response, regardless of the client's own
+/// `Connection` header.
+#stable(since = "0.1")
+export fn ServerPolicy @max_requests_per_conn() -> int => @max_requests_per_conn
+#stable(since = "0.1")
+export fn ServerPolicy mut @max_requests_per_conn(n int) -> @ { @max_requests_per_conn = n }
+
+/// Deadline for completing the header block, counted from the FIRST byte of
+/// a request (not from connection-accept/idle-wait — see `idle_deadline`
+/// for that phase). Slowloris mitigation (deliverable 3).
+#stable(since = "0.1")
+export fn ServerPolicy @header_deadline() -> Duration => @header_deadline
+#stable(since = "0.1")
+export fn ServerPolicy mut @header_deadline(d Duration) -> @ { @header_deadline = d }
+
+/// Deadline for completing the request BODY (identity or chunked-decoded),
+/// counted from the moment body reading starts (fresh window, not shared
+/// with `header_deadline`).
+#stable(since = "0.1")
+export fn ServerPolicy @read_deadline() -> Duration => @read_deadline
+#stable(since = "0.1")
+export fn ServerPolicy mut @read_deadline(d Duration) -> @ { @read_deadline = d }
+
+/// Deadline waiting for the FIRST byte of the next request on an already-
+/// open persistent connection (keep-alive idle timeout). Also doubles as
+/// the very-first-request timeout on a brand-new connection.
+#stable(since = "0.1")
+export fn ServerPolicy @idle_deadline() -> Duration => @idle_deadline
+#stable(since = "0.1")
+export fn ServerPolicy mut @idle_deadline(d Duration) -> @ { @idle_deadline = d }
+
+/// Request body size cap (identity Content-Length OR chunked-decoded total)
+/// — exceeding it is a `413 Payload Too Large` (deliverable 4).
+#stable(since = "0.1")
+export fn ServerPolicy @max_body_bytes() -> int => @max_body_bytes
+#stable(since = "0.1")
+export fn ServerPolicy mut @max_body_bytes(n int) -> @ { @max_body_bytes = n }
