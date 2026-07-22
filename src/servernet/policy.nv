@@ -54,10 +54,34 @@ type ReadAttempt enum
 
 fn read_attempt(s mut TcpStream, deadline Monotonic) Net Time -> ReadAttempt {
     ro (tx, rx) = Channel.new(1)
+    // [M-nv-spawn-ctx-capture-mut-param-ptr-mismatch]: `s.share()` evaluated
+    // INLINE as the `spawn consume` initializer (`spawn consume ws = s.share()
+    // { ... }`) CC-FAILs — the generated spawn-ctx struct's captured-variable
+    // field for `s` (referenced inside the init EXPRESSION, since the C
+    // codegen defers evaluating that expression into the spawned fiber's own
+    // preamble) is emitted as a plain-VALUE `NovaValue_TcpStream` struct field,
+    // but `s` here is a `mut TcpStream` PARAMETER — by-pointer in-out
+    // representation in C (`NovaValue_TcpStream *`) — so the generated
+    // `ctx->s = s;` assignment is a value-from-pointer type mismatch (clang:
+    // "assigning to 'NovaValue_TcpStream' from incompatible type
+    // 'NovaValue_TcpStream *'; dereference with *"). Same DEFECT CLASS already
+    // documented in this package (`server.nv`'s own
+    // `[M-http-props-mut-chain-argpos-value-ptr-mismatch]` /
+    // `[M-187-nested-spawn-scope-var-cc-fail]` in the flagship aggregator) —
+    // a value/pointer representation mismatch between a captured variable's
+    // declaration-site representation and the auto-generated closure-context
+    // struct field. WORKAROUND (not a masked behavior bug — same Nova
+    // semantics, different phrasing the codegen handles correctly, same style
+    // as `write_streaming`/`write_stream_chunks`'s own split): evaluate
+    // `s.share()` into a plain LOCAL binding `w` BEFORE the `spawn`, so the
+    // spawn's init-expression captures a plain local (value representation)
+    // instead of re-deriving from the `mut`-parameter `s` inside the deferred
+    // init expression itself.
+    consume w = s.share()
     mut timed_out = false
     with Fail[TimeoutError] = |_e| { timed_out = true } {
         supervised(deadline: deadline) {
-            spawn consume ws = s.share() {
+            spawn consume ws = w {
                 match ws.read_to_vec(65536) {
                     Ok(chunk) => { ro _ = tx.try_send(chunk) }
                     Err(_)    => ()

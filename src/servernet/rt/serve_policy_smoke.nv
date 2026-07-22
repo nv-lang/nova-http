@@ -1,0 +1,314 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// [M-178-server-policy-surface] (owner decision 2026-07-22) — LIVE HTTP/1.1
+// smoke over loopback sockets for `serve()`/`serve_connection()`
+// (`../serve.nv`) + `ServerPolicy` (`../config.nv`): keep-alive across
+// multiple requests, request body-size cap → 413, chunked-request decode,
+// header-deadline slowloris cutoff → 408, admission-control → 503. Pure/
+// unit-level coverage of the byte-level policy helpers themselves
+// (`is_chunked`/`expects_100_continue`/`connection_header_value`/
+// `is_http10`/`should_keep_alive`/`parse_chunk_size_line`/
+// `rebuild_framed_request`) lives in `../policy_test.nv` instead (no
+// sockets needed there — same-module private-fn access).
+//
+// `serve()` is an INFINITE accept loop by design (same as any real HTTP
+// server) — every test below wraps its `supervised { spawn { serve(...) }
+// spawn { <client> } }` in `with Fail[TimeoutError] = |_| {} { supervised
+// (timeout: ...) { ... } }` (mirrors `std/concurrency/
+// supervised_deadline_test.nv`'s own pattern): once the client fiber(s)
+// finish and the bounded timeout elapses, the whole scope (including the
+// still-blocked-in-accept() server fiber) is cooperatively cancelled — the
+// clean, structured way to bound a test around code that never returns on
+// its own. Assertions run AFTER the `with Fail[TimeoutError]` block, on
+// results already handed back over a `Channel` (D415: fiber results flow
+// through channels, not outer-`mut` capture — same reasoning as
+// `handle_connection_smoke.nv`).
+//
+// The listener is bound INSIDE the server's own `spawn` body (its port sent
+// out over a `Channel` to the client fiber(s)) — NOT bound in the outer test
+// body and then captured into the spawn: `TcpListener` is `consume`-typed,
+// and `serve()`'s own `consume listener` param wants the SAME binding-then-
+// immediately-fully-consumed-within-one-fiber shape the flagship
+// aggregator's own `main()` accept loop already uses (`consume lst = match
+// TcpListener.bind(addr) {...}` lives entirely inside the one `spawn` that
+// also runs the whole loop) — binding it in the outer scope and moving it
+// into the spawn's closure left the OUTER function's own D133 "not consumed
+// before scope-exit" flow analysis unable to see the move (the analysis does
+// not consider a `spawn { ... }` body execution as ordered/guaranteed
+// relative to the enclosing scope for a linear-consume obligation).
+//
+// EXPECT_TIMEOUT_MS-marked (standalone per test-conventions.md — never folds
+// into the shared http.servernet folder-CU).
+//
+// EXPECT_TIMEOUT_MS 30000
+
+module rt.serve_policy_smoke
+
+import std.net.{TcpListener, TcpStream, SocketAddr, real_net}
+import ../../server.{ServeMux, ServerResponse, handler_fn}
+import ../../servernet.{serve, ServerPolicy}
+
+fn echo_routes() -> ServeMux {
+    mut mux = ServeMux.new()
+    mux.get("/health", handler_fn(|_req| ServerResponse.text(200, "ok")))
+    mux.post("/echo", handler_fn(|req| {
+        ro body = unsafe { req.body_bytes().to_str_unchecked() }
+        ServerResponse.text(200, body)
+    }))
+    mux
+}
+
+// ── 1. keep-alive: two requests over ONE connection, honest close on the
+//    client's own second `Connection: close` (deliverable 2) ─────────────
+
+test "serve(): keep-alive — two requests over one connection, honest close on client header" {
+    with Net = real_net() {
+        ro (port_tx, port_rx) = Channel.new(1)
+        ro (r1_tx, r1_rx) = Channel.new(1)
+        ro (r2_tx, r2_rx) = Channel.new(1)
+        with Fail[TimeoutError] = |_e| {} {
+            supervised(timeout: 3.to_seconds()) {
+                spawn {
+                    consume lst = match TcpListener.bind(SocketAddr.loopback(0)) {
+                        Ok(consume l)  => l
+                        Err(_) => { ro _ = port_tx.try_send(0 as u16); return }
+                    }
+                    ro _ = port_tx.try_send(lst.local_port())
+                    serve(lst, echo_routes(), ServerPolicy.new())
+                }
+                spawn {
+                    ro port = match port_rx.recv() { Some(p) => p, None => 0 as u16 }
+                    match TcpStream.connect(SocketAddr.loopback(port)) {
+                        Ok(consume conn) => {
+                            consume cli = conn
+                            ro _ = cli.write_str("GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                            match cli.read_to_vec(4096) {
+                                Ok(chunk) => { ro _ = r1_tx.try_send(chunk) }
+                                Err(_)    => ()
+                            }
+                            ro _ = cli.write_str("GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                            match cli.read_to_vec(4096) {
+                                Ok(chunk) => { ro _ = r2_tx.try_send(chunk) }
+                                Err(_)    => ()
+                            }
+                            cli.close()
+                        }
+                        Err(_) => ()
+                    }
+                }
+            }
+        }
+        r1_tx.close()
+        r2_tx.close()
+        ro r1 = r1_rx.try_recv() ?? []u8.new()
+        ro r2 = r2_rx.try_recv() ?? []u8.new()
+        ro s1 = unsafe { r1.to_str_unchecked() }
+        ro s2 = unsafe { r2.to_str_unchecked() }
+        assert(s1.contains("HTTP/1.1 200 OK"))
+        assert(s1.contains("ok"))
+        assert(s1.contains("connection: keep-alive"))
+        assert(s2.contains("HTTP/1.1 200 OK"))
+        assert(s2.contains("connection: close"))
+    }
+}
+
+// ── 2. body-size cap → 413 (deliverable 4) ─────────────────────────────────
+
+test "serve(): declared Content-Length over the configured cap -> 413" {
+    with Net = real_net() {
+        // [M-nv-props-mut-chain-argpos-value-ptr-mismatch] (same class as
+        // `server.nv`'s own `[M-http-props-mut-chain-argpos-value-ptr-
+        // mismatch]`): `ServerPolicy.new().max_body_bytes(8)` used DIRECTLY
+        // as a call ARGUMENT CC-FAILs (invalid C cast to a struct type, the
+        // fleeting `-> @` chain-result-as-argument codegen gap for value-type
+        // receivers) — bind to a plain local FIRST (statement-position value
+        // chains are fine after Plan 184 Ф.2), then pass the local.
+        ro policy = ServerPolicy.new().max_body_bytes(8)
+        ro (port_tx, port_rx) = Channel.new(1)
+        ro (got_tx, got_rx) = Channel.new(1)
+        with Fail[TimeoutError] = |_e| {} {
+            supervised(timeout: 3.to_seconds()) {
+                spawn {
+                    consume lst = match TcpListener.bind(SocketAddr.loopback(0)) {
+                        Ok(consume l)  => l
+                        Err(_) => { ro _ = port_tx.try_send(0 as u16); return }
+                    }
+                    ro _ = port_tx.try_send(lst.local_port())
+                    serve(lst, echo_routes(), policy)
+                }
+                spawn {
+                    ro port = match port_rx.recv() { Some(p) => p, None => 0 as u16 }
+                    match TcpStream.connect(SocketAddr.loopback(port)) {
+                        Ok(consume conn) => {
+                            consume cli = conn
+                            // Declared length (100) exceeds the 8-byte cap — the
+                            // server must reject BEFORE attempting to read a body
+                            // this small connect never actually sends.
+                            ro _ = cli.write_str("POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n")
+                            match cli.read_to_vec(4096) {
+                                Ok(chunk) => { ro _ = got_tx.try_send(chunk) }
+                                Err(_)    => ()
+                            }
+                            cli.close()
+                        }
+                        Err(_) => ()
+                    }
+                }
+            }
+        }
+        got_tx.close()
+        ro got = got_rx.try_recv() ?? []u8.new()
+        ro s = unsafe { got.to_str_unchecked() }
+        assert(s.contains("413"))
+    }
+}
+
+// ── 3. chunked-request decode (deliverable 5) ─────────────────────────────
+
+test "serve(): chunked request body decodes and reaches the handler" {
+    with Net = real_net() {
+        ro (port_tx, port_rx) = Channel.new(1)
+        ro (got_tx, got_rx) = Channel.new(1)
+        with Fail[TimeoutError] = |_e| {} {
+            supervised(timeout: 3.to_seconds()) {
+                spawn {
+                    consume lst = match TcpListener.bind(SocketAddr.loopback(0)) {
+                        Ok(consume l)  => l
+                        Err(_) => { ro _ = port_tx.try_send(0 as u16); return }
+                    }
+                    ro _ = port_tx.try_send(lst.local_port())
+                    serve(lst, echo_routes(), ServerPolicy.new())
+                }
+                spawn {
+                    ro port = match port_rx.recv() { Some(p) => p, None => 0 as u16 }
+                    match TcpStream.connect(SocketAddr.loopback(port)) {
+                        Ok(consume conn) => {
+                            consume cli = conn
+                            ro _ = cli.write_str("POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+                            match cli.read_to_vec(4096) {
+                                Ok(chunk) => { ro _ = got_tx.try_send(chunk) }
+                                Err(_)    => ()
+                            }
+                            cli.close()
+                        }
+                        Err(_) => ()
+                    }
+                }
+            }
+        }
+        got_tx.close()
+        ro got = got_rx.try_recv() ?? []u8.new()
+        ro s = unsafe { got.to_str_unchecked() }
+        assert(s.contains("HTTP/1.1 200 OK"))
+        assert(s.contains("hello"))
+    }
+}
+
+// ── 4. header-deadline slowloris cutoff → 408 (deliverable 3) ─────────────
+
+test "serve(): incomplete headers past header_deadline -> 408" {
+    with Net = real_net() {
+        ro (port_tx, port_rx) = Channel.new(1)
+        ro (got_tx, got_rx) = Channel.new(1)
+        ro policy = ServerPolicy.new().header_deadline(150.to_millis()).idle_deadline(150.to_millis())
+        with Fail[TimeoutError] = |_e| {} {
+            supervised(timeout: 3.to_seconds()) {
+                spawn {
+                    consume lst = match TcpListener.bind(SocketAddr.loopback(0)) {
+                        Ok(consume l)  => l
+                        Err(_) => { ro _ = port_tx.try_send(0 as u16); return }
+                    }
+                    ro _ = port_tx.try_send(lst.local_port())
+                    serve(lst, echo_routes(), policy)
+                }
+                spawn {
+                    ro port = match port_rx.recv() { Some(p) => p, None => 0 as u16 }
+                    match TcpStream.connect(SocketAddr.loopback(port)) {
+                        Ok(consume conn) => {
+                            consume cli = conn
+                            // A partial request line with NO terminating blank
+                            // line — the header block never completes.
+                            ro _ = cli.write_str("GET /health HTTP/1.1\r\nHost: localhost\r\n")
+                            (500).to_millis().sleep()
+                            match cli.read_to_vec(4096) {
+                                Ok(chunk) => { ro _ = got_tx.try_send(chunk) }
+                                Err(_)    => ()
+                            }
+                            cli.close()
+                        }
+                        Err(_) => ()
+                    }
+                }
+            }
+        }
+        got_tx.close()
+        ro got = got_rx.try_recv() ?? []u8.new()
+        ro s = unsafe { got.to_str_unchecked() }
+        assert(s.contains("408"))
+    }
+}
+
+// ── 5. admission control → 503 (deliverable 1) ────────────────────────────
+
+test "serve(): over max_inflight -> 503, first connection still served" {
+    with Net = real_net() {
+        // Capacity 2 + sent TWICE below: BOTH client fibers (A and B) each
+        // do their own `port_rx.recv()` — a capacity-1 channel would starve
+        // the second receiver forever (each value is delivered to exactly
+        // one receiver).
+        ro (port_tx, port_rx) = Channel.new(2)
+        ro (a_ready_tx, a_ready_rx) = Channel.new(1)
+        ro (b_got_tx, b_got_rx) = Channel.new(1)
+        ro policy = ServerPolicy.new().max_inflight(1).idle_deadline(5.to_seconds())
+        with Fail[TimeoutError] = |_e| {} {
+            supervised(timeout: 3.to_seconds()) {
+                spawn {
+                    consume lst = match TcpListener.bind(SocketAddr.loopback(0)) {
+                        Ok(consume l)  => l
+                        Err(_) => { ro _ = port_tx.try_send(0 as u16); ro _ = port_tx.try_send(0 as u16); return }
+                    }
+                    ro _ = port_tx.try_send(lst.local_port())
+                    ro _ = port_tx.try_send(lst.local_port())
+                    serve(lst, echo_routes(), policy)
+                }
+                // Client A: connect, hold the ONLY admission slot open long
+                // enough for B to observe the reject, then disconnect.
+                spawn {
+                    ro port = match port_rx.recv() { Some(p) => p, None => 0 as u16 }
+                    match TcpStream.connect(SocketAddr.loopback(port)) {
+                        Ok(consume conn) => {
+                            consume cli = conn
+                            ro _ = a_ready_tx.try_send(true)
+                            (600).to_millis().sleep()
+                            cli.close()
+                        }
+                        Err(_) => { ro _ = a_ready_tx.try_send(false) }
+                    }
+                }
+                // Client B: wait for A to be connected, then connect and
+                // expect an immediate 503 (no route dispatch attempted).
+                spawn {
+                    ro a_ready = match a_ready_rx.recv() { Some(v) => v, None => false }
+                    if a_ready {
+                        (50).to_millis().sleep()   // let A's accept()/admission-count land first
+                        ro port2 = match port_rx.recv() { Some(p) => p, None => 0 as u16 }
+                        match TcpStream.connect(SocketAddr.loopback(port2)) {
+                            Ok(consume conn) => {
+                                consume cli = conn
+                                match cli.read_to_vec(4096) {
+                                    Ok(chunk) => { ro _ = b_got_tx.try_send(chunk) }
+                                    Err(_)    => ()
+                                }
+                                cli.close()
+                            }
+                            Err(_) => ()
+                        }
+                    }
+                }
+            }
+        }
+        b_got_tx.close()
+        ro got = b_got_rx.try_recv() ?? []u8.new()
+        ro s = unsafe { got.to_str_unchecked() }
+        assert(s.contains("503"))
+    }
+}

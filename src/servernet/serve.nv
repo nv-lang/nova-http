@@ -145,21 +145,29 @@ export fn serve_connection(consume stream TcpStream, mux ServeMux, policy Server
 #stable(since = "0.1")
 export fn serve(consume listener TcpListener, mux ServeMux, policy ServerPolicy) Net Time Detach {
     consume lst = listener
+    // [M-nv-spawn-ctx-capture-mut-param-ptr-mismatch] (see `policy.nv`'s
+    // `read_attempt` for the full repro/root-cause note): capturing the bare
+    // `policy ServerPolicy` PARAMETER into the `detach { ... }` ctx below
+    // CC-FAILs once an earlier accessor call (`policy.max_inflight()`) has
+    // been made on it in this same function — same value/pointer
+    // representation mismatch class. Re-binding to a plain local up front
+    // avoids it (same workaround style as `read_attempt`'s own fix).
+    ro policy_local = policy
     mut inflight = AtomicInt.new(0)
     mut running = true
     while running {
         match lst.accept() {
             Ok(consume stream) => {
-                if inflight.load() >= policy.max_inflight() {
+                if inflight.load() >= policy_local.max_inflight() {
                     consume s = stream
-                    if policy.reject_with_503() {
+                    if policy_local.reject_with_503() {
                         ro _ = s.write_all("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".bytes())
                     }
                     s.close()
                 } else {
                     ro _ = inflight.fetch_add(1)
                     detach consume stream {
-                        ro _ = serve_connection(stream, mux, policy)
+                        ro _ = serve_connection(stream, mux, policy_local)
                         ro _ = inflight.fetch_sub(1)
                     }
                 }
