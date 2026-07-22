@@ -39,35 +39,12 @@
 // ordered/guaranteed relative to the enclosing scope for a linear-consume
 // obligation).
 //
-// KNOWN BLOCKERS (task report has full repros — NOT fixed here, main `nova`
-// repo is out of this task's remit): this file's `nova check` is clean, but
-// `nova test` could not be driven to completion this pass —
-//   1. [M-nv-duration-record-field-debug-bytes-missing]: ANY full build
-//      (not `check`) touching a value/heap record with a `Duration` field
-//      (`ServerPolicy` needs one for its deadline knobs) CC-FAILs in the
-//      auto-derived `@debug` body (`nova_str` passed where `[]u8` is
-//      expected) — isolated minimal repro (a bare one-field record, zero
-//      Net/servernet involved) in the task report. Blocks EVERY test in
-//      this file, and in `../policy_test.nv`.
-//   2. [M-nv-cancel-loop-accept-swallowed]: even once (1) is fixed,
-//      `supervised(timeout:)` reliably cancels a SINGLE bare `accept()` call
-//      but NOT one retried inside a `while` loop (`serve()`'s own accept
-//      loop) — the loop's `Err` arm appears to absorb the one-shot
-//      cancellation signal and re-parks on a fresh `accept()` that is never
-//      cancelled again. Isolated minimal repro (loop shape, no serve(), no
-//      Router/ServerPolicy) in the task report. Blocks tests 1/3/4/5 below
-//      (each wraps a live `serve_router()` loop); does not affect a
-//      single-shot `accept()` (`../rt/handle_connection_smoke.nv`'s own
-//      proven shape).
-// Both compiler-level fixes are tracked in a separate wave
-// (p-fix-2227-blockers, per the coordinator's 2026-07-23 message) — not yet
-// merged as of this refit. `nova test` on this file will be re-run once
-// that lands (owner signal expected).
-//
-// (The E_STR_CONCAT_PLUS in `server/mux_test.nv` and E_CONSUME_KEYWORD_MISSING
-// in `handle_connection_smoke.nv` this file's earlier revision flagged as
-// pre-existing baseline breakage are BOTH gone after merging master —
-// Plan 222.1's Router migration touched both files along the way.)
+// Compiler blockers this file used to document here
+// ([M-nv-duration-record-field-debug-bytes-missing],
+// [M-nv-cancel-loop-accept-swallowed]) are CLOSED — fixed upstream in `nova`
+// main (b31a157f5 + the p-fix-2227-blockers wave, 2026-07-23) and confirmed
+// by a real `nova test` run of this file (see the task report for the pass
+// count). No workaround left in this file or in `policy.nv`/`serve.nv`.
 //
 // EXPECT_TIMEOUT_MS-marked (standalone per test-conventions.md — never folds
 // into the shared http.servernet folder-CU).
@@ -149,14 +126,6 @@ test "serve_router(): keep-alive — two requests over one connection, honest cl
 
 test "serve_router(): declared Content-Length over the configured cap -> 413" {
     with Net = real_net() {
-        // [M-nv-props-mut-chain-argpos-value-ptr-mismatch] (same class as
-        // `server.nv`'s own `[M-http-props-mut-chain-argpos-value-ptr-
-        // mismatch]`): `ServerPolicy.new().max_body_bytes(8)` used DIRECTLY
-        // as a call ARGUMENT CC-FAILs (invalid C cast to a struct type, the
-        // fleeting `-> @` chain-result-as-argument codegen gap for value-type
-        // receivers) — bind to a plain local FIRST (statement-position value
-        // chains are fine after Plan 184 Ф.2), then pass the local.
-        ro policy = ServerPolicy.new().max_body_bytes(8)
         ro (port_tx, port_rx) = Channel.new(1)
         ro (got_tx, got_rx) = Channel.new(1)
         with Fail[TimeoutError] = |_e| {} {
@@ -167,7 +136,7 @@ test "serve_router(): declared Content-Length over the configured cap -> 413" {
                         Err(_) => { ro _ = port_tx.try_send(0 as u16); return }
                     }
                     ro _ = port_tx.try_send(lst.local_port())
-                    serve_router(lst, echo_routes(), policy)
+                    serve_router(lst, echo_routes(), ServerPolicy.new().max_body_bytes(8))
                 }
                 spawn {
                     ro port = match port_rx.recv() { Some(p) => p, None => 0 as u16 }

@@ -153,36 +153,21 @@ export fn serve_connection(consume stream TcpStream, handler fn([]u8) -> ServerR
 #stable(since = "0.1")
 export fn serve(consume listener TcpListener, handler fn([]u8) -> ServerResponse, policy ServerPolicy) Net Time Detach {
     consume lst = listener
-    // [M-nv-spawn-ctx-capture-mut-param-ptr-mismatch] (see `policy.nv`'s
-    // `read_attempt` for the full repro/root-cause note): capturing the bare
-    // `policy ServerPolicy` PARAMETER into the `detach { ... }` ctx below
-    // CC-FAILs once an earlier accessor call (`policy.max_inflight()`) has
-    // been made on it in this same function — same value/pointer
-    // representation mismatch class. Re-binding to a plain local up front
-    // avoids it (same workaround style as `read_attempt`'s own fix). Same
-    // defensive rebind applied to `handler` (a fn-value param) even though
-    // no accessor call precedes its own capture here — cheap, keeps the
-    // pattern uniform in case codegen's fn-value ctx-capture path turns out
-    // to have the same defect once this can actually be built (blocked by
-    // [M-nv-duration-record-field-debug-bytes-missing] this pass — see task
-    // report).
-    ro policy_local = policy
-    ro handler_local = handler
     mut inflight = AtomicInt.new(0)
     mut running = true
     while running {
         match lst.accept() {
             Ok(consume stream) => {
-                if inflight.load() >= policy_local.max_inflight() {
+                if inflight.load() >= policy.max_inflight() {
                     consume s = stream
-                    if policy_local.reject_with_503() {
+                    if policy.reject_with_503() {
                         ro _ = s.write_all("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".bytes())
                     }
                     s.close()
                 } else {
                     ro _ = inflight.fetch_add(1)
                     detach consume stream {
-                        ro _ = serve_connection(stream, handler_local, policy_local)
+                        ro _ = serve_connection(stream, handler, policy)
                         ro _ = inflight.fetch_sub(1)
                     }
                 }

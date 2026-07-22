@@ -19,3 +19,8 @@ nova.local.toml
 # Machine-local nova.exe copy (Plan 222.1 worktree convenience — main repo's
 # compiler was mid-rebuild when this worktree was set up).
 .tools/
+
+# Machine-local fresh nova-cli build (Plan 222.7 blocker-fix verification,
+# 2026-07-23) — `cargo build --release --target-dir <this>/target-cli`,
+# built straight from nova main's own sources; not the repo's own artifact.
+target-cli/
