@@ -6,48 +6,26 @@
 // (`../config.nv`)): keep-alive across multiple requests, request body-size
 // cap → 413, chunked-request decode, header-deadline slowloris cutoff →
 // 408, admission-control → 503. Pure/unit-level coverage of the byte-level
-// policy helpers themselves (`is_chunked`/`expects_100_continue`/
-// `connection_header_value`/`is_http10`/`should_keep_alive`/
-// `parse_chunk_size_line`/`rebuild_framed_request`) lives in
-// `../policy_test.nv` instead (no sockets needed there — same-module
-// private-fn access).
+// policy helpers lives in `../policy_test.nv` instead (no sockets needed
+// there — same-module private-fn access). Full design rationale (why each
+// test binds its listener INSIDE the server's own `spawn`, why `with
+// Fail[TimeoutError] = |_| {} { supervised(timeout: ...) { ... } }` bounds a
+// test around `serve_router()`'s inherently infinite loop) was trimmed from
+// this header — see git history (pre-2026-07-23) or `../policy_test.nv`'s
+// own banner for the same pattern spelled out in full; kept short here so
+// `EXPECT_TIMEOUT_MS` stays inside the test-runner's own first-30-lines scan
+// window (`test_runner.rs` — a marker past line 30 is invisible to the
+// timeout-lane gate, confirmed by hitting exactly this the first time this
+// file's header grew past it).
 //
-// `serve_router`/`serve` is an INFINITE accept loop by design (same as any
-// real HTTP server) — every test below wraps its `supervised { spawn {
-// serve_router(...) } spawn { <client> } }` in `with Fail[TimeoutError] =
-// |_| {} { supervised(timeout: ...) { ... } }` (mirrors `std/concurrency/
-// supervised_deadline_test.nv`'s own pattern): once the client fiber(s)
-// finish and the bounded timeout elapses, the whole scope (including the
-// still-blocked-in-accept() server fiber) is cooperatively cancelled — the
-// clean, structured way to bound a test around code that never returns on
-// its own. Assertions run AFTER the `with Fail[TimeoutError]` block, on
-// results already handed back over a `Channel` (D415: fiber results flow
-// through channels, not outer-`mut` capture — same reasoning as
-// `handle_connection_smoke.nv`).
-//
-// The listener is bound INSIDE the server's own `spawn` body (its port sent
-// out over a `Channel` to the client fiber(s)) — NOT bound in the outer test
-// body and then captured into the spawn: `TcpListener` is `consume`-typed,
-// and `serve_router()`'s own `consume listener` param wants the SAME
-// binding-then-immediately-fully-consumed-within-one-fiber shape the
-// flagship aggregator's own `main()` accept loop already uses (`consume lst
-// = match TcpListener.bind(addr) {...}` lives entirely inside the one
-// `spawn` that also runs the whole loop) — binding it in the outer scope and
-// moving it into the spawn's closure left the OUTER function's own D133
-// "not consumed before scope-exit" flow analysis unable to see the move
-// (the analysis does not consider a `spawn { ... }` body execution as
-// ordered/guaranteed relative to the enclosing scope for a linear-consume
-// obligation).
-//
-// Compiler blockers this file used to document here
-// ([M-nv-duration-record-field-debug-bytes-missing],
-// [M-nv-cancel-loop-accept-swallowed]) are CLOSED — fixed upstream in `nova`
-// main (b31a157f5 + the p-fix-2227-blockers wave, 2026-07-23) and confirmed
-// by a real `nova test` run of this file (see the task report for the pass
-// count). No workaround left in this file or in `policy.nv`/`serve.nv`.
-//
-// EXPECT_TIMEOUT_MS-marked (standalone per test-conventions.md — never folds
-// into the shared http.servernet folder-CU).
+// KNOWN STILL-OPEN compiler defect (task report has the isolated repro):
+// [M-nv-cancel-loop-accept-swallowed] — a bare single `accept()` cancels
+// fine under `supervised(timeout:)`, but `serve()`'s own accept LOOP (retry-
+// on-Err) swallows the one-shot cancellation and never re-delivers it — so
+// every test below (each bounding a live `serve_router()` loop) hangs until
+// this lands upstream. Not a regression in this package (`nova check` stays
+// clean); confirmed via a minimal repro with zero Router/ServerPolicy
+// involved.
 //
 // EXPECT_TIMEOUT_MS 30000
 
