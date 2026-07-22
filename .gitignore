@@ -15,3 +15,7 @@ target/
 # path only exists on the author's machine; see spec/decisions/09-tooling.md
 # D420 and compiler-codegen/src/manifest.rs `check_no_committed_replace`).
 nova.local.toml
+
+# Machine-local nova.exe copy (Plan 222.1 worktree convenience — main repo's
+# compiler was mid-rebuild when this worktree was set up).
+.tools/

@@ -37,19 +37,19 @@
 module http.servernet
 
 import std.net.{TcpListener, TcpStream, NetError}
-import ../server.{ServeMux, ServerResponse, StreamBody, route_once, serialize_response}
+import ../server.{Router, ServerResponse, StreamBody, route_once, serialize_response}
 import ../server.{serialize_response_head, encode_chunk, encode_chunk_end}
 
 /// Read one full HTTP/1.1 request off `stream` (headers + Content-Length body),
-/// route it through `mux`, write the response, and close. One request per
+/// route it through `router`, write the response, and close. One request per
 /// connection (CORE: `Connection: close`; keep-alive is a server marker).
 /// Fixed-body responses serialize in one shot; streaming responses
 /// (`[M-178-server-streaming]`) write incrementally — see `write_streaming`.
 #stable(since = "0.1")
-export fn handle_connection(consume stream TcpStream, mux ServeMux) Net -> Result[(), NetError] {
+export fn handle_connection(consume stream TcpStream, router Router) Net -> Result[(), NetError] {
     consume s = stream
     ro raw = read_request(s)
-    ro resp = route_once(mux, raw)
+    ro resp = route_once(router, raw)
     if resp.is_streaming() {
         write_streaming(s, resp)
     } else {

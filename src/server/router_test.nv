@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Plan 222.1 (2026-07-22) — Axum-class `Router` feature coverage: precedence
+// (static > param > catch-all, with backtracking), `MethodRouter` composability
+// (`get(h).post(h2)`), `Router.nest`, global `Router.fallback` (404) vs
+// per-route `MethodRouter.fallback` (405 override), and route-conflict
+// registration errors (typed `Result`, not a panic — [M-servemux-routing-placeholder]
+// closed by this file + mux_test.nv/server_test.nv/streaming_test.nv).
+//
+// `status_line`/`resp_contains` are defined in mux_test.nv (same module — peer-
+// file namespace, no import/redeclare needed, same pattern streaming_test.nv
+// already relies on).
+
+module http.server
+
+fn get_req(path str) -> []u8 => "GET ${path} HTTP/1.1\r\nHost: x\r\n\r\n".bytes()
+fn post_req(path str) -> []u8 => "POST ${path} HTTP/1.1\r\nHost: x\r\n\r\n".bytes()
+
+// ── precedence: static > param > catch-all (structural, not registration order) ─
+
+fn precedence_router() -> Router {
+    mut r = Router.new()
+    // Registered catch-all FIRST, param SECOND, literal LAST — precedence must
+    // still resolve static > param > catch-all regardless of registration order.
+    r.get("/users/{*rest}", handler_fn(|req| {
+        ro rest = req.param("rest") ?? "?"
+        ServerResponse.text(200, "rest=${rest}")
+    }))!!
+    r.get("/users/{id}", handler_fn(|req| {
+        ro uid = req.param("id") ?? "?"
+        ServerResponse.text(200, "id=${uid}")
+    }))!!
+    r.get("/users/me", handler_fn(|req| ServerResponse.text(200, "me")))!!
+    r
+}
+
+test "router: static segment wins over {param} for an exact literal match" {
+    ro wire = serve_once(precedence_router(), get_req("/users/me"))
+    assert(status_line(wire) == "HTTP/1.1 200 OK")
+    assert(resp_contains(wire, "me"))
+    assert(!resp_contains(wire, "id="))
+}
+
+test "router: {param} wins over {*catch-all} for a single remaining segment" {
+    ro wire = serve_once(precedence_router(), get_req("/users/42"))
+    assert(status_line(wire) == "HTTP/1.1 200 OK")
+    assert(resp_contains(wire, "id=42"))
+}
+
+test "router: {*catch-all} matches when the deeper {param} slot is a dead end (backtrack)" {
+    ro wire = serve_once(precedence_router(), get_req("/users/a/b"))
+    assert(status_line(wire) == "HTTP/1.1 200 OK")
+    assert(resp_contains(wire, "rest=a/b"))
+}
+
+// ── MethodRouter composability: get(h).post(h2) on ONE route ───────────────────
+
+test "router: MethodRouter composes multiple methods on one path" {
+    mut r = Router.new()
+    r.route("/multi", get(handler_fn(|req| ServerResponse.text(200, "got"))).post(handler_fn(|req| ServerResponse.text(200, "posted"))))!!
+    ro wg = serve_once(r, get_req("/multi"))
+    ro wp = serve_once(r, post_req("/multi"))
+    assert(resp_contains(wg, "got"))
+    assert(resp_contains(wp, "posted"))
+}
+
+// ── nest: sub-router merged under a prefix ──────────────────────────────────────
+
+test "router: nest merges a sub-router's routes under a prefix" {
+    mut sub = Router.new()
+    sub.get("/settings", handler_fn(|req| ServerResponse.text(200, "settings")))!!
+    mut r = Router.new()
+    r.nest("/api", sub)!!
+    ro wire = serve_once(r, get_req("/api/settings"))
+    assert(status_line(wire) == "HTTP/1.1 200 OK")
+    assert(resp_contains(wire, "settings"))
+}
+
+test "router: nest preserves {param} segments from the sub-router" {
+    mut sub = Router.new()
+    sub.get("/widgets/{id}", handler_fn(|req| {
+        ro wid = req.param("id") ?? "?"
+        ServerResponse.text(200, "widget ${wid}")
+    }))!!
+    mut r = Router.new()
+    r.nest("/api", sub)!!
+    ro wire = serve_once(r, get_req("/api/widgets/9"))
+    assert(resp_contains(wire, "widget 9"))
+}
+
+// ── global 404 fallback ────────────────────────────────────────────────────────
+
+test "router: no route + no fallback → default 404 body" {
+    ro r = Router.new()
+    ro wire = serve_once(r, get_req("/missing"))
+    assert(status_line(wire) == "HTTP/1.1 404 Not Found")
+    assert(resp_contains(wire, "404 page not found"))
+}
+
+test "router: Router.fallback serves a custom global 404" {
+    mut r = Router.new()
+    r.fallback(handler_fn(|req| ServerResponse.text(404, "custom not found")))
+    ro wire = serve_once(r, get_req("/missing"))
+    assert(status_line(wire) == "HTTP/1.1 404 Not Found")
+    assert(resp_contains(wire, "custom not found"))
+}
+
+// ── per-route 405 override (MethodRouter.fallback) vs generic 405+Allow ────────
+
+test "router: no per-route fallback → generic 405 + Allow" {
+    mut r = Router.new()
+    r.get("/only-get", handler_fn(|req| ServerResponse.text(200, "ok")))!!
+    ro wire = serve_once(r, post_req("/only-get"))
+    assert(status_line(wire) == "HTTP/1.1 405 Method Not Allowed")
+    assert(resp_contains(wire, "allow: GET"))
+}
+
+test "router: MethodRouter.fallback overrides the generic 405 for that route" {
+    mut r = Router.new()
+    mut mr = get(handler_fn(|req| ServerResponse.text(200, "ok")))
+    mr.fallback(handler_fn(|req| ServerResponse.text(405, "custom method not allowed")))
+    r.route("/guarded", mr)!!
+    ro wire = serve_once(r, post_req("/guarded"))
+    assert(status_line(wire) == "HTTP/1.1 405 Method Not Allowed")
+    assert(resp_contains(wire, "custom method not allowed"))
+}
+
+// ── route conflicts: typed Result error at registration, NOT a panic ───────────
+
+test "router: duplicate exact-path registration → Err, not panic" {
+    mut r = Router.new()
+    r.get("/dup", handler_fn(|req| ServerResponse.text(200, "first")))!!
+    ro second = r.route("/dup", get(handler_fn(|req| ServerResponse.text(200, "second"))))
+    assert(match second { Err(_) => true, Ok(_) => false })
+}
+
+test "router: conflicting {param} names at the same trie slot → Err" {
+    mut r = Router.new()
+    r.get("/things/{id}", handler_fn(|req| ServerResponse.text(200, "ok")))!!
+    ro conflicting = r.route("/things/{name}", get(handler_fn(|req| ServerResponse.text(200, "ok"))))
+    assert(match conflicting { Err(_) => true, Ok(_) => false })
+}
+
+test "router: two {*catch-all} at the same slot → Err" {
+    mut r = Router.new()
+    r.get("/files/{*path}", handler_fn(|req| ServerResponse.text(200, "ok")))!!
+    ro conflicting = r.route("/files/{*rest}", get(handler_fn(|req| ServerResponse.text(200, "ok"))))
+    assert(match conflicting { Err(_) => true, Ok(_) => false })
+}
+
+test "router: {*catch-all} not the last segment → Err" {
+    mut r = Router.new()
+    ro bad = r.route("/bad/{*rest}/tail", get(handler_fn(|req| ServerResponse.text(200, "ok"))))
+    assert(match bad { Err(_) => true, Ok(_) => false })
+}
+
+test "router: nest re-checks conflicts against the parent's existing routes" {
+    mut sub = Router.new()
+    sub.get("/dup", handler_fn(|req| ServerResponse.text(200, "sub")))!!
+    mut r = Router.new()
+    r.get("/api/dup", handler_fn(|req| ServerResponse.text(200, "parent")))!!
+    ro nested = r.nest("/api", sub)
+    assert(match nested { Err(_) => true, Ok(_) => false })
+}
