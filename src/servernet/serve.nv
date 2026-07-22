@@ -9,8 +9,8 @@
 // own `[M-187-nested-spawn-scope-var-cc-fail]`/
 // `[M-187-high-concurrency-connection-wedge]` notes, which this module
 // reuses the PROVEN shapes from: one `spawn` owns bind + the whole accept
-// loop, `detach consume stream { ... }` per accepted connection, an
-// `AtomicInt` admission counter). `handle_connection` (`servernet.nv`,
+// loop, `detach consume stream { ... }` per accepted connection, a
+// `Semaphore` admission gate). `handle_connection` (`servernet.nv`,
 // single-shot `Connection: close`) is UNCHANGED — this is a new, additive
 // entry point; existing callers (the flagship aggregator, this package's
 // own `rt/*_smoke.nv` tests) keep working exactly as before.
@@ -23,6 +23,36 @@
 // generalized into this package as a policy KNOB (`ServerPolicy.
 // max_inflight`/`reject_with_503`) instead of a hardcoded app-level constant.
 //
+// ADMISSION GATE = `Semaphore`, NOT a bare `AtomicInt` counter (owner
+// decision 2026-07-23, while the compiler-fix window for
+// [M-nv-cancel-loop-accept-swallowed] is still open — good time for this):
+// `std/runtime/sync.nv`'s own doc-comment names "connection pool capacity"
+// as `Semaphore`'s canonical use case. WHY THE SWITCH MATTERS: a handler
+// panic unwinds the connection-handling fiber via `longjmp` — a bare
+// `ro _ = inflight.fetch_sub(1)` statement placed AFTER the panicking call
+// (the OLD shape) is simply never reached (longjmp jumps PAST it, no
+// unwind-time hook fires for an ordinary sequential statement) — the
+// admission slot leaks forever. `defer expr` IS registered on the unwind
+// path (same guarantee `Semaphore.with_permit`'s own doc-comment claims for
+// `defer permit.release()` — "Panic-safe: runs even if body throws"), so
+// `defer inflight.release()` reliably frees the slot whether
+// `serve_connection` returns normally OR panics.
+//
+// NON-BLOCKING REJECT: `Semaphore.acquire() -> Permit consume` is the
+// panic-safest form (`Permit`'s own `@cleanup` releases on scope-exit
+// including panic) but PARKS when exhausted — wrong here, admission must
+// reject immediately, never queue. The only non-parking primitive the API
+// offers is `@try_acquire() -> bool` (no `Permit`-returning non-blocking
+// form exists in `sync.nv` as of this writing) — paired with the
+// `#deprecated` bare `@release()` (the V1 pre-`Permit`-guard API), which is
+// exactly the correct counterpart for a bool-returning acquire. The
+// deprecation is a conscious, disclosed tradeoff: `defer` is what actually
+// buys the panic-safety here (a general unwind-registered-cleanup
+// guarantee, not something unique to the `Permit` type — `with_lock`/
+// `with_read`/`with_write` all use plain `defer guard.unlock()` the exact
+// same way), so pairing `try_acquire()` with a deferred bare `release()` is
+// panic-safe despite neither being the "modern" `Permit`-guard spelling.
+//
 // LAYER CONTRACT (Plan 222 §0а, refit 2026-07-23): same as `servernet.nv`'s
 // own note — `serve`/`serve_connection` take a byte-level callback
 // (`fn([]u8) -> ServerResponse`), NOT a `Router` — this module never imports
@@ -32,7 +62,7 @@
 module http.servernet
 
 import std.net.{TcpListener, TcpStream, NetError}
-import std.runtime.sync.{AtomicInt}
+import std.runtime.sync.{Semaphore}
 import std.time.duration
 import ../server.{ServerResponse, serialize_response}
 import ../server.{serialize_response_head, encode_chunk, encode_chunk_end}
@@ -135,15 +165,29 @@ export fn serve_connection(consume stream TcpStream, handler fn([]u8) -> ServerR
     final_result
 }
 
+// Run `serve_connection`, releasing `sem`'s permit on the way out — success,
+// error return, OR panic (`defer` runs on all three, same guarantee
+// `std/runtime/sync.nv`'s own `Mutex.with_lock`/`Semaphore.with_permit`
+// document for their own `defer guard.unlock()`/`defer permit.release()`).
+// A PLAIN function (not a closure/detach body) on purpose — see `serve()`'s
+// own `[M-nv-defer-captured-var-in-detach-undeclared]` note for why `defer`
+// can't reference a CAPTURED variable directly inside the `detach { }` body
+// itself right now; `sem` here is an ordinary PARAMETER, sidestepping that.
+fn release_after(consume stream TcpStream, handler fn([]u8) -> ServerResponse, policy ServerPolicy, mut sem Semaphore) Net Time -> Result[(), NetError] {
+    defer sem.release()
+    serve_connection(stream, handler, policy)
+}
+
 // ── serve: the reusable library accept loop ────────────────────────────────
 //
 // Shape mirrors the flagship aggregator's own `main()` accept loop (proven
 // against two documented codegen/runtime failure modes — see this file's
 // own header): exactly ONE `spawn` holds bind + the whole loop; each
 // accepted connection is handed to `detach consume stream { serve_connection
-// (...) }` (bounded-concurrent, not sequential); an `AtomicInt` permit
-// counter is the admission gate. Two hardening fixes over that hand-rolled
-// original (deliverable 1):
+// (...) }` (bounded-concurrent, not sequential); a `Semaphore` (see this
+// file's own header — NOT a bare `AtomicInt` counter, panic-safety) is the
+// admission gate. Two hardening fixes over that hand-rolled original
+// (deliverable 1):
 //   - `Err(_)` from `accept()` no longer kills the loop — it backs off
 //     briefly and continues (a transient accept error, e.g. the OS FD table
 //     momentarily full, should not take the whole server down);
@@ -168,25 +212,49 @@ export fn serve(consume listener TcpListener, handler fn([]u8) -> ServerResponse
     // policy.some_method() { detach { policy.some_method() } } }`. Reported
     // back to the coordinator this same pass — kept here (not silently
     // dropped) because the fix does NOT cover it yet. Re-binding to a plain
-    // local up front avoids it, same as before.
+    // local up front avoids it, same as before. `inflight` itself is a plain
+    // LOCAL (not a parameter) — same as the old `AtomicInt` before it, it
+    // captures into `detach {}` with no issue (the bug is parameter-specific).
     ro policy_local = policy
     ro handler_local = handler
-    mut inflight = AtomicInt.new(0)
+    mut inflight = Semaphore.new(policy_local.max_inflight())
     mut running = true
     while running {
         match lst.accept() {
             Ok(consume stream) => {
-                if inflight.load() >= policy_local.max_inflight() {
+                if !inflight.try_acquire() {
                     consume s = stream
                     if policy_local.reject_with_503() {
                         ro _ = s.write_all("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".bytes())
                     }
                     s.close()
                 } else {
-                    ro _ = inflight.fetch_add(1)
+                    // [M-nv-defer-captured-var-in-detach-undeclared]: `defer
+                    // inflight.release()` written INLINE right here (`inflight`
+                    // a closure-captured local from the enclosing `serve()`)
+                    // CC-FAILs — "use of undeclared identifier 'inflight'" —
+                    // the generated cleanup-registration code emits the bare
+                    // variable name instead of the detach-ctx struct field
+                    // (`_c->inflight`) every OTHER captured reference in this
+                    // same block correctly gets (`_c->handler_local`/
+                    // `_c->policy_local` both work). `defer` inside a
+                    // `detach`/`spawn` body referencing a captured (not a
+                    // plain parameter/local-to-that-body) variable appears to
+                    // be the untested combination — `std/runtime/sync.nv`'s
+                    // OWN `with_lock`/`with_permit` precedents only ever
+                    // `defer` a PARAMETER/local of an ordinary (non-spawned)
+                    // function. WORKAROUND (not silently hiding the bug — see
+                    // this file's own note above the `serve()` signature; same
+                    // style as this package's other CC-FAIL workarounds):
+                    // route the `defer` through `release_after`, an ORDINARY
+                    // function where the semaphore is a plain PARAMETER (not
+                    // a captured closure var) — `inflight` itself is passed as
+                    // a normal call ARGUMENT into the detach block (the exact
+                    // capture mechanism `handler_local`/`policy_local` already
+                    // use successfully), sidestepping the defer-in-closure
+                    // path entirely.
                     detach consume stream {
-                        ro _ = serve_connection(stream, handler_local, policy_local)
-                        ro _ = inflight.fetch_sub(1)
+                        ro _ = release_after(stream, handler_local, policy_local, inflight)
                     }
                 }
             }

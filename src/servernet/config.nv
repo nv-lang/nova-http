@@ -38,6 +38,25 @@ module http.servernet
 
 import std.time.duration
 
+/// What `serve_connection()` answers with when the handler callback panics
+/// mid-request (owner decision 2026-07-23) — SCAFFOLDING ONLY as of this
+/// commit: the field/getter/setter below exist so the config surface is
+/// ready, but nothing in `serve.nv` catches a handler panic yet (a
+/// `longjmp`-unwind still propagates past `serve_connection`/`serve` all the
+/// way up to whatever `supervised` scope the caller installed — same as
+/// today). The actual catch-panic hook (whatever primitive lets a `Net`-
+/// effect fn observe/recover from a panic in a called closure) is a
+/// SEPARATE, not-yet-landed compiler window; wiring `panic_response` into
+/// real behavior is that window's job, not this commit's. Named
+/// `HandlerPanicResponse` (not a bare `PanicResponse`) — same collision-
+/// avoidance discipline as `ServerPolicy` itself (this file's own banner):
+/// a short, generic sum-type name is exactly the shape that has already
+/// collided once in this exact compile unit.
+#stable(since = "0.1")
+export type HandlerPanicResponse enum
+    | Close            // no response body — just close the connection
+    | InternalError500 // a generic `500 Internal Server Error` response
+
 /// Accept-loop + per-connection policy surface for `serve()`/
 /// `serve_connection()` (`serve.nv`). All fields are policy KNOBS, not
 /// runtime state — defaults (`ServerPolicy.new()`) are reasonable for a
@@ -52,6 +71,7 @@ export type ServerPolicy value {
     read_deadline         Duration
     idle_deadline         Duration
     max_body_bytes        int
+    panic_response        HandlerPanicResponse
 }
 
 /// Defaults:
@@ -81,6 +101,10 @@ export type ServerPolicy value {
 ///     (deliverable 4); exceeding it is a `413 Payload Too Large`, not a
 ///     silent unbounded buffer grow (the pre-hardening `read_request`'s own
 ///     gap, see `servernet.nv`'s own file-header note this plan closes).
+///   - `panic_response: InternalError500` — SCAFFOLDING (see
+///     `HandlerPanicResponse`'s own doc-comment above): not wired to any
+///     actual catch-panic behavior yet, but a well-behaved-server default
+///     once it is (an honest `500`, not a silent connection drop).
 #stable(since = "0.1")
 export fn ServerPolicy.new() -> ServerPolicy => {
     max_inflight: 16,
@@ -90,6 +114,7 @@ export fn ServerPolicy.new() -> ServerPolicy => {
     read_deadline: 5.to_seconds(),
     idle_deadline: 60.to_seconds(),
     max_body_bytes: 1048576,
+    panic_response: HandlerPanicResponse.InternalError500,
 }
 
 /// Max connections handled concurrently; over budget → admission reject
@@ -144,3 +169,11 @@ export fn ServerPolicy mut @idle_deadline(d Duration) -> @ { @idle_deadline = d 
 export fn ServerPolicy @max_body_bytes() -> int => @max_body_bytes
 #stable(since = "0.1")
 export fn ServerPolicy mut @max_body_bytes(n int) -> @ { @max_body_bytes = n }
+
+/// What a handler panic should answer with — SCAFFOLDING (see
+/// `HandlerPanicResponse`'s own doc-comment): not wired to real catch-panic
+/// behavior yet, landing in a separate compiler window.
+#stable(since = "0.1")
+export fn ServerPolicy @panic_response() -> HandlerPanicResponse => @panic_response
+#stable(since = "0.1")
+export fn ServerPolicy mut @panic_response(v HandlerPanicResponse) -> @ { @panic_response = v }
