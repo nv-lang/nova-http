@@ -33,23 +33,39 @@
 // std.net2 brings `NetError` into the namespace, whose `InvalidPort` shadows
 // `ParseUrlError.InvalidPort` reachable through http. Keeping the net dependency
 // here preserves http.server's clean namespace.
+//
+// LAYER CONTRACT (Plan 222 §0а, [M-178-server-policy-surface] refit
+// 2026-07-23): this module is layer 1 (the wire) — it NEVER imports `Router`/
+// `route_once`/`Handler` (layer 2, routing/dispatch, `server.nv`/
+// `server_router.nv`). `handle_connection`/`serve`/`serve_connection` take a
+// plain byte-level callback (`fn([]u8) -> ServerResponse`) instead of a
+// `Router` directly — a lower layer must never import a higher one. The
+// `Router → callback` adapter (`router_callback`/`handle_connection_router`/
+// `serve_router`) lives on the layer-2 side, `server/server_serve.nv`
+// (imports FROM this module — the allowed direction). `ServerResponse`/
+// `StreamBody` stay imported here: they are the wire-level response MODEL
+// (serialize/stream to the socket), not routing/dispatch logic, so importing
+// them is not a layer violation — only `Router`/`route_once`/`Handler` are.
 
 module http.servernet
 
 import std.net.{TcpListener, TcpStream, NetError}
-import ../server.{Router, ServerResponse, StreamBody, route_once, serialize_response}
+import ../server.{ServerResponse, StreamBody, serialize_response}
 import ../server.{serialize_response_head, encode_chunk, encode_chunk_end}
 
 /// Read one full HTTP/1.1 request off `stream` (headers + Content-Length body),
-/// route it through `router`, write the response, and close. One request per
-/// connection (CORE: `Connection: close`; keep-alive is a server marker).
-/// Fixed-body responses serialize in one shot; streaming responses
-/// (`[M-178-server-streaming]`) write incrementally — see `write_streaming`.
+/// run it through `handler` (a plain byte-level callback — see this file's own
+/// layer-contract note above; `server/server_serve.nv`'s `handle_connection_router`
+/// is the `Router`-taking convenience wrapper most callers actually want), write
+/// the response, and close. One request per connection (CORE: `Connection:
+/// close`; keep-alive is a server marker). Fixed-body responses serialize in
+/// one shot; streaming responses (`[M-178-server-streaming]`) write
+/// incrementally — see `write_streaming`.
 #stable(since = "0.1")
-export fn handle_connection(consume stream TcpStream, router Router) Net -> Result[(), NetError] {
+export fn handle_connection(consume stream TcpStream, handler fn([]u8) -> ServerResponse) Net -> Result[(), NetError] {
     consume s = stream
     ro raw = read_request(s)
-    ro resp = route_once(router, raw)
+    ro resp = handler(raw)
     if resp.is_streaming() {
         write_streaming(s, resp)
     } else {

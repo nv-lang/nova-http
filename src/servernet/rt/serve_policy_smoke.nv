@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// [M-178-server-policy-surface] (owner decision 2026-07-22) — LIVE HTTP/1.1
-// smoke over loopback sockets for `serve()`/`serve_connection()`
-// (`../serve.nv`) + `ServerPolicy` (`../config.nv`): keep-alive across
-// multiple requests, request body-size cap → 413, chunked-request decode,
-// header-deadline slowloris cutoff → 408, admission-control → 503. Pure/
-// unit-level coverage of the byte-level policy helpers themselves
-// (`is_chunked`/`expects_100_continue`/`connection_header_value`/
-// `is_http10`/`should_keep_alive`/`parse_chunk_size_line`/
-// `rebuild_framed_request`) lives in `../policy_test.nv` instead (no
-// sockets needed there — same-module private-fn access).
+// [M-178-server-policy-surface] (owner decision 2026-07-22; layer-contract
+// refit 2026-07-23, Plan 222 §0а) — LIVE HTTP/1.1 smoke over loopback
+// sockets for `serve_router()` (`../../serve/serve.nv`, the `Router`-taking
+// convenience wrapper over `http.servernet.serve` + `ServerPolicy`
+// (`../config.nv`)): keep-alive across multiple requests, request body-size
+// cap → 413, chunked-request decode, header-deadline slowloris cutoff →
+// 408, admission-control → 503. Pure/unit-level coverage of the byte-level
+// policy helpers themselves (`is_chunked`/`expects_100_continue`/
+// `connection_header_value`/`is_http10`/`should_keep_alive`/
+// `parse_chunk_size_line`/`rebuild_framed_request`) lives in
+// `../policy_test.nv` instead (no sockets needed there — same-module
+// private-fn access).
 //
-// `serve()` is an INFINITE accept loop by design (same as any real HTTP
-// server) — every test below wraps its `supervised { spawn { serve(...) }
-// spawn { <client> } }` in `with Fail[TimeoutError] = |_| {} { supervised
-// (timeout: ...) { ... } }` (mirrors `std/concurrency/
+// `serve_router`/`serve` is an INFINITE accept loop by design (same as any
+// real HTTP server) — every test below wraps its `supervised { spawn {
+// serve_router(...) } spawn { <client> } }` in `with Fail[TimeoutError] =
+// |_| {} { supervised(timeout: ...) { ... } }` (mirrors `std/concurrency/
 // supervised_deadline_test.nv`'s own pattern): once the client fiber(s)
 // finish and the bounded timeout elapses, the whole scope (including the
 // still-blocked-in-accept() server fiber) is cooperatively cancelled — the
@@ -26,15 +28,16 @@
 // The listener is bound INSIDE the server's own `spawn` body (its port sent
 // out over a `Channel` to the client fiber(s)) — NOT bound in the outer test
 // body and then captured into the spawn: `TcpListener` is `consume`-typed,
-// and `serve()`'s own `consume listener` param wants the SAME binding-then-
-// immediately-fully-consumed-within-one-fiber shape the flagship
-// aggregator's own `main()` accept loop already uses (`consume lst = match
-// TcpListener.bind(addr) {...}` lives entirely inside the one `spawn` that
-// also runs the whole loop) — binding it in the outer scope and moving it
-// into the spawn's closure left the OUTER function's own D133 "not consumed
-// before scope-exit" flow analysis unable to see the move (the analysis does
-// not consider a `spawn { ... }` body execution as ordered/guaranteed
-// relative to the enclosing scope for a linear-consume obligation).
+// and `serve_router()`'s own `consume listener` param wants the SAME
+// binding-then-immediately-fully-consumed-within-one-fiber shape the
+// flagship aggregator's own `main()` accept loop already uses (`consume lst
+// = match TcpListener.bind(addr) {...}` lives entirely inside the one
+// `spawn` that also runs the whole loop) — binding it in the outer scope and
+// moving it into the spawn's closure left the OUTER function's own D133
+// "not consumed before scope-exit" flow analysis unable to see the move
+// (the analysis does not consider a `spawn { ... }` body execution as
+// ordered/guaranteed relative to the enclosing scope for a linear-consume
+// obligation).
 //
 // KNOWN BLOCKERS (task report has full repros — NOT fixed here, main `nova`
 // repo is out of this task's remit): this file's `nova check` is clean, but
@@ -52,15 +55,19 @@
 //      loop) — the loop's `Err` arm appears to absorb the one-shot
 //      cancellation signal and re-parks on a fresh `accept()` that is never
 //      cancelled again. Isolated minimal repro (loop shape, no serve(), no
-//      ServeMux/ServerPolicy) in the task report. Blocks tests 1/3/4/5 below
-//      (each wraps a live `serve()` loop); does not affect a single-shot
-//      `accept()` (`../rt/handle_connection_smoke.nv`'s own proven shape).
-// This package ALSO currently fails `nova test` even on a clean,
-// UNMODIFIED checkout, for reasons unrelated to both of the above
-// (`E_STR_CONCAT_PLUS` in `server/mux_test.nv`, `E_CONSUME_KEYWORD_MISSING`
-// in `handle_connection_smoke.nv` — pre-existing compiler-version skew,
-// confirmed on the unmodified repo too) — see the task report for the full
-// verification-status writeup.
+//      Router/ServerPolicy) in the task report. Blocks tests 1/3/4/5 below
+//      (each wraps a live `serve_router()` loop); does not affect a
+//      single-shot `accept()` (`../rt/handle_connection_smoke.nv`'s own
+//      proven shape).
+// Both compiler-level fixes are tracked in a separate wave
+// (p-fix-2227-blockers, per the coordinator's 2026-07-23 message) — not yet
+// merged as of this refit. `nova test` on this file will be re-run once
+// that lands (owner signal expected).
+//
+// (The E_STR_CONCAT_PLUS in `server/mux_test.nv` and E_CONSUME_KEYWORD_MISSING
+// in `handle_connection_smoke.nv` this file's earlier revision flagged as
+// pre-existing baseline breakage are BOTH gone after merging master —
+// Plan 222.1's Router migration touched both files along the way.)
 //
 // EXPECT_TIMEOUT_MS-marked (standalone per test-conventions.md — never folds
 // into the shared http.servernet folder-CU).
@@ -70,23 +77,24 @@
 module rt.serve_policy_smoke
 
 import std.net.{TcpListener, TcpStream, SocketAddr, real_net}
-import ../../server.{ServeMux, ServerResponse, handler_fn}
-import ../../servernet.{serve, ServerPolicy}
+import ../../server.{Router, ServerResponse, handler_fn}
+import ../../servernet.{ServerPolicy}
+import ../../serve.{serve_router}
 
-fn echo_routes() -> ServeMux {
-    mut mux = ServeMux.new()
-    mux.get("/health", handler_fn(|_req| ServerResponse.text(200, "ok")))
-    mux.post("/echo", handler_fn(|req| {
+fn echo_routes() -> Router {
+    mut r = Router.new()
+    r.get("/health", handler_fn(|_req| ServerResponse.text(200, "ok")))!!
+    r.post("/echo", handler_fn(|req| {
         ro body = unsafe { req.body_bytes().to_str_unchecked() }
         ServerResponse.text(200, body)
-    }))
-    mux
+    }))!!
+    r
 }
 
 // ── 1. keep-alive: two requests over ONE connection, honest close on the
 //    client's own second `Connection: close` (deliverable 2) ─────────────
 
-test "serve(): keep-alive — two requests over one connection, honest close on client header" {
+test "serve_router(): keep-alive — two requests over one connection, honest close on client header" {
     with Net = real_net() {
         ro (port_tx, port_rx) = Channel.new(1)
         ro (r1_tx, r1_rx) = Channel.new(1)
@@ -99,7 +107,7 @@ test "serve(): keep-alive — two requests over one connection, honest close on 
                         Err(_) => { ro _ = port_tx.try_send(0 as u16); return }
                     }
                     ro _ = port_tx.try_send(lst.local_port())
-                    serve(lst, echo_routes(), ServerPolicy.new())
+                    serve_router(lst, echo_routes(), ServerPolicy.new())
                 }
                 spawn {
                     ro port = match port_rx.recv() { Some(p) => p, None => 0 as u16 }
@@ -139,7 +147,7 @@ test "serve(): keep-alive — two requests over one connection, honest close on 
 
 // ── 2. body-size cap → 413 (deliverable 4) ─────────────────────────────────
 
-test "serve(): declared Content-Length over the configured cap -> 413" {
+test "serve_router(): declared Content-Length over the configured cap -> 413" {
     with Net = real_net() {
         // [M-nv-props-mut-chain-argpos-value-ptr-mismatch] (same class as
         // `server.nv`'s own `[M-http-props-mut-chain-argpos-value-ptr-
@@ -159,7 +167,7 @@ test "serve(): declared Content-Length over the configured cap -> 413" {
                         Err(_) => { ro _ = port_tx.try_send(0 as u16); return }
                     }
                     ro _ = port_tx.try_send(lst.local_port())
-                    serve(lst, echo_routes(), policy)
+                    serve_router(lst, echo_routes(), policy)
                 }
                 spawn {
                     ro port = match port_rx.recv() { Some(p) => p, None => 0 as u16 }
@@ -190,7 +198,7 @@ test "serve(): declared Content-Length over the configured cap -> 413" {
 
 // ── 3. chunked-request decode (deliverable 5) ─────────────────────────────
 
-test "serve(): chunked request body decodes and reaches the handler" {
+test "serve_router(): chunked request body decodes and reaches the handler" {
     with Net = real_net() {
         ro (port_tx, port_rx) = Channel.new(1)
         ro (got_tx, got_rx) = Channel.new(1)
@@ -202,7 +210,7 @@ test "serve(): chunked request body decodes and reaches the handler" {
                         Err(_) => { ro _ = port_tx.try_send(0 as u16); return }
                     }
                     ro _ = port_tx.try_send(lst.local_port())
-                    serve(lst, echo_routes(), ServerPolicy.new())
+                    serve_router(lst, echo_routes(), ServerPolicy.new())
                 }
                 spawn {
                     ro port = match port_rx.recv() { Some(p) => p, None => 0 as u16 }
@@ -231,7 +239,7 @@ test "serve(): chunked request body decodes and reaches the handler" {
 
 // ── 4. header-deadline slowloris cutoff → 408 (deliverable 3) ─────────────
 
-test "serve(): incomplete headers past header_deadline -> 408" {
+test "serve_router(): incomplete headers past header_deadline -> 408" {
     with Net = real_net() {
         ro (port_tx, port_rx) = Channel.new(1)
         ro (got_tx, got_rx) = Channel.new(1)
@@ -244,7 +252,7 @@ test "serve(): incomplete headers past header_deadline -> 408" {
                         Err(_) => { ro _ = port_tx.try_send(0 as u16); return }
                     }
                     ro _ = port_tx.try_send(lst.local_port())
-                    serve(lst, echo_routes(), policy)
+                    serve_router(lst, echo_routes(), policy)
                 }
                 spawn {
                     ro port = match port_rx.recv() { Some(p) => p, None => 0 as u16 }
@@ -275,7 +283,7 @@ test "serve(): incomplete headers past header_deadline -> 408" {
 
 // ── 5. admission control → 503 (deliverable 1) ────────────────────────────
 
-test "serve(): over max_inflight -> 503, first connection still served" {
+test "serve_router(): over max_inflight -> 503, first connection still served" {
     with Net = real_net() {
         // Capacity 2 + sent TWICE below: BOTH client fibers (A and B) each
         // do their own `port_rx.recv()` — a capacity-1 channel would starve
@@ -294,7 +302,7 @@ test "serve(): over max_inflight -> 503, first connection still served" {
                     }
                     ro _ = port_tx.try_send(lst.local_port())
                     ro _ = port_tx.try_send(lst.local_port())
-                    serve(lst, echo_routes(), policy)
+                    serve_router(lst, echo_routes(), policy)
                 }
                 // Client A: connect, hold the ONLY admission slot open long
                 // enough for B to observe the reject, then disconnect.

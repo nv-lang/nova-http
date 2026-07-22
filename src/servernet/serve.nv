@@ -22,13 +22,19 @@
 // aggregator's own mitigation (`[M-187-high-concurrency-connection-wedge]`)
 // generalized into this package as a policy KNOB (`ServerPolicy.
 // max_inflight`/`reject_with_503`) instead of a hardcoded app-level constant.
+//
+// LAYER CONTRACT (Plan 222 §0а, refit 2026-07-23): same as `servernet.nv`'s
+// own note — `serve`/`serve_connection` take a byte-level callback
+// (`fn([]u8) -> ServerResponse`), NOT a `Router` — this module never imports
+// `Router`/`route_once` (layer 2). `server/server_serve.nv`'s `serve_router`
+// is the `Router`-taking convenience wrapper.
 
 module http.servernet
 
 import std.net.{TcpListener, TcpStream, NetError}
 import std.runtime.sync.{AtomicInt}
 import std.time.duration
-import ../server.{ServeMux, ServerResponse, route_once, serialize_response}
+import ../server.{ServerResponse, serialize_response}
 import ../server.{serialize_response_head, encode_chunk, encode_chunk_end}
 
 // ── Non-consuming response write (keep-alive: the stream survives to serve
@@ -86,17 +92,19 @@ fn write_stream_chunks_keepalive(s mut TcpStream, resp ServerResponse) Net -> Re
 // Replaces `handle_connection`'s single-shot "read one, respond, close"
 // with a loop: read a GOVERNED request (`read_one_request`, `policy.nv` —
 // deadlines/body-cap/chunked-decode already applied), dispatch it through
-// the UNCHANGED `ServeMux`/`route_once`, force the wire `Connection` header
-// to match the keep-alive decision (the pure-core serializer defaults to
-// `close` whenever the response doesn't already set one — `server/wire.nv`
-// `serialize_response`/`serialize_response_head` — so an explicit override
-// here is what actually MAKES keep-alive happen on the wire, no server.nv
-// change needed), write it, and loop again if both sides agreed to
-// continue. `served_count` is the loop's own counter (starts at 0, passed
-// to `read_one_request` so `should_keep_alive` can enforce
-// `max_requests_per_conn`).
+// `handler` (byte-level callback — see this file's own layer-contract note;
+// `server/server_serve.nv`'s `serve_router` is the `Router`-taking
+// convenience wrapper most callers actually want), force the wire
+// `Connection` header to match the keep-alive decision (the pure-core
+// serializer defaults to `close` whenever the response doesn't already set
+// one — `server/wire.nv` `serialize_response`/`serialize_response_head` —
+// so an explicit override here is what actually MAKES keep-alive happen on
+// the wire, no server.nv change needed), write it, and loop again if both
+// sides agreed to continue. `served_count` is the loop's own counter
+// (starts at 0, passed to `read_one_request` so `should_keep_alive` can
+// enforce `max_requests_per_conn`).
 #stable(since = "0.1")
-export fn serve_connection(consume stream TcpStream, mux ServeMux, policy ServerPolicy) Net Time -> Result[(), NetError] {
+export fn serve_connection(consume stream TcpStream, handler fn([]u8) -> ServerResponse, policy ServerPolicy) Net Time -> Result[(), NetError] {
     consume s = stream
     mut served_count = 0
     mut keep_going = true
@@ -105,7 +113,7 @@ export fn serve_connection(consume stream TcpStream, mux ServeMux, policy Server
         match read_one_request(s, policy, served_count) {
             Ready(raw, keep_alive) => {
                 served_count += 1
-                mut resp = route_once(mux, raw)
+                mut resp = handler(raw)
                 resp.header("Connection", if keep_alive { "keep-alive" } else { "close" })
                 match write_response_keepalive(s, resp) {
                     Ok(_)  => { keep_going = keep_alive }
@@ -143,7 +151,7 @@ export fn serve_connection(consume stream TcpStream, mux ServeMux, policy Server
 //     (`policy.reject_with_503()`) instead of always just closing — a
 //     friendlier, retry-safe signal to a well-behaved client.
 #stable(since = "0.1")
-export fn serve(consume listener TcpListener, mux ServeMux, policy ServerPolicy) Net Time Detach {
+export fn serve(consume listener TcpListener, handler fn([]u8) -> ServerResponse, policy ServerPolicy) Net Time Detach {
     consume lst = listener
     // [M-nv-spawn-ctx-capture-mut-param-ptr-mismatch] (see `policy.nv`'s
     // `read_attempt` for the full repro/root-cause note): capturing the bare
@@ -151,8 +159,15 @@ export fn serve(consume listener TcpListener, mux ServeMux, policy ServerPolicy)
     // CC-FAILs once an earlier accessor call (`policy.max_inflight()`) has
     // been made on it in this same function — same value/pointer
     // representation mismatch class. Re-binding to a plain local up front
-    // avoids it (same workaround style as `read_attempt`'s own fix).
+    // avoids it (same workaround style as `read_attempt`'s own fix). Same
+    // defensive rebind applied to `handler` (a fn-value param) even though
+    // no accessor call precedes its own capture here — cheap, keeps the
+    // pattern uniform in case codegen's fn-value ctx-capture path turns out
+    // to have the same defect once this can actually be built (blocked by
+    // [M-nv-duration-record-field-debug-bytes-missing] this pass — see task
+    // report).
     ro policy_local = policy
+    ro handler_local = handler
     mut inflight = AtomicInt.new(0)
     mut running = true
     while running {
@@ -167,7 +182,7 @@ export fn serve(consume listener TcpListener, mux ServeMux, policy ServerPolicy)
                 } else {
                     ro _ = inflight.fetch_add(1)
                     detach consume stream {
-                        ro _ = serve_connection(stream, mux, policy_local)
+                        ro _ = serve_connection(stream, handler_local, policy_local)
                         ro _ = inflight.fetch_sub(1)
                     }
                 }

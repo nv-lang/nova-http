@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: serve/serve.nv — `Router`-taking convenience wrappers over
+// `http.servernet`'s byte-level accept-loop primitives (Plan 222 §0а layer
+// contract, [M-178-server-policy-surface] refit 2026-07-23).
+//
+// WHY A THIRD MODULE (not `http.server`, not `http.servernet`): the layer
+// contract says a lower layer (`http.servernet`, the wire) never imports a
+// higher one (`http.server`'s `Router`/`route_once`) — `servernet.nv`/
+// `serve.nv` take a plain `fn([]u8) -> ServerResponse` callback instead
+// (`router_callback`, `http.server/server_serve.nv`). The REVERSE direction
+// (a file under `http.server` importing FROM `http.servernet`) looks legal on
+// paper (upper depends on lower), but `http.servernet` ALREADY imports FROM
+// `http.server` too (`ServerResponse`/`StreamBody`/the wire serializers —
+// legitimate wire-level model, not the flagged violation). Putting a
+// `http.servernet`-importing function INSIDE `http.server` therefore makes
+// the two modules MUTUALLY dependent — confirmed empirically: doing exactly
+// that produced spurious `undefined identifier 'serialize_response'` errors
+// inside `servernet.nv`/`serve.nv` themselves (which type-check clean in
+// isolation) the moment a THIRD file pulled in both modules together — the
+// module-resolution-deadlock signature of an A⇄B import cycle, not a real
+// missing symbol. This module is the one place allowed to import BOTH layers
+// at once, because NEITHER layer imports FROM it — no cycle.
+
+module http.serve
+
+import std.net.{TcpListener, TcpStream, NetError}
+import ../server.{Router, router_callback}
+import ../servernet.{handle_connection, serve, ServerPolicy}
+
+/// `http.servernet.handle_connection`, but taking a `Router` directly (thin
+/// sugar over `router_callback`) — single-shot `Connection: close`, one
+/// request per connection. For keep-alive/deadlines/body-cap/chunked-decode
+/// use `serve_router` (a full accept loop) instead.
+#stable(since = "0.1")
+export fn handle_connection_router(consume stream TcpStream, router Router) Net -> Result[(), NetError] =>
+    handle_connection(stream, router_callback(router))
+
+/// `http.servernet.serve`, but taking a `Router` directly (thin sugar) — the
+/// common case: a full accept loop with keep-alive/deadlines/body-cap/
+/// chunked-decode/admission-control (`ServerPolicy`), routed through
+/// `router`.
+#stable(since = "0.1")
+export fn serve_router(consume listener TcpListener, router Router, policy ServerPolicy) Net Time Detach {
+    serve(listener, router_callback(router), policy)
+}

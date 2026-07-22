@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: server_serve.nv — `Router` → byte-level callback adapter (Plan
+// 222 §0а layer contract, [M-178-server-policy-surface] refit 2026-07-23).
+//
+// WHY THIS FILE EXISTS: `http.servernet` (layer 1, the wire — accept loop,
+// keep-alive, deadlines, body-size cap, chunked decode) must NEVER import
+// `Router`/`route_once`/`Handler` (layer 2, routing/dispatch —
+// `server.nv`/`server_router.nv`): a lower layer never imports a higher one
+// (Plan 222 §0а, owner-fixed contract). `http.servernet.handle_connection`/
+// `serve`/`serve_connection` therefore take a plain byte-level callback
+// (`fn([]u8) -> ServerResponse`) instead of a `Router` directly.
+// `router_callback` is that adapter — capturing `router` into a closure of
+// the shape `servernet`'s primitives expect.
+//
+// NOT HERE: `handle_connection_router`/`serve_router` (the "just hand me a
+// Router" one-call convenience wrappers) — those need to import BOTH
+// `http.server` (for `Router`) AND `http.servernet` (for `handle_connection`/
+// `serve`). Since `http.servernet` ALREADY imports FROM `http.server`
+// (`ServerResponse`/`StreamBody`/the wire serializers — legitimate, NOT the
+// layer violation; see `servernet.nv`'s own banner), adding a file to
+// `http.server` that imports back FROM `http.servernet` makes the two
+// modules mutually dependent — confirmed empirically during this refit: with
+// `handle_connection_router`/`serve_router` defined HERE, `nova check` on any
+// file that pulls in this module and `http.servernet` together fails with
+// spurious `undefined identifier 'serialize_response'`/etc. inside
+// `servernet.nv`/`serve.nv` — the module-resolution deadlock symptom of an
+// A↔B cycle (http.server ⇄ http.servernet), not a real missing symbol
+// (`serve.nv`/`servernet.nv` type-check CLEAN in isolation). Those two thin
+// wrappers live in the genuinely third, standalone `http.serve` module
+// (`../serve/serve.nv`) instead — the only file allowed to import BOTH
+// layers, since neither layer imports FROM it (no cycle).
+//
+// Filename sorts alphabetically AFTER `server_router.nv` (folder-module
+// peers compile in sorted order, D78/imports.rs `sib_paths.sort()`) — needs
+// `Router`/`ServerResponse` already declared, same ordering rationale
+// `server_router.nv`'s own banner documents for its position after
+// `server.nv`.
+
+module http.server
+
+/// Wrap `router` as the raw-bytes callback `http.servernet`'s layer-1
+/// primitives expect (`route_once` does the parse+dispatch; this just
+/// captures `router` into a closure of the right shape). No import of
+/// `http.servernet` needed here — this file only ever depends on symbols
+/// already in THIS module (`Router`/`ServerResponse`/`route_once`), which is
+/// exactly what keeps it cycle-free; see the file banner above for what
+/// happens if a `http.servernet`-importing wrapper is added HERE instead of
+/// in `http.serve`.
+#stable(since = "0.1")
+export fn router_callback(router Router) -> fn([]u8) -> ServerResponse => |raw| route_once(router, raw)
