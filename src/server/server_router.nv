@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// nova-http: router.nv — Axum-class HTTP router (Plan 222.1). Replaces the old
-// `ServeMux` (linear scan, 1-segment `{param}` only, first-match-by-registration-
-// order — `[M-servemux-routing-placeholder]`).
+// nova-http: server_router.nv — Axum-class HTTP router (Plan 222.1). Replaces
+// the old `ServeMux` (linear scan, 1-segment `{param}` only, first-match-by-
+// registration-order — `[M-servemux-routing-placeholder]`). Filename sorts
+// alphabetically AFTER `server.nv` (folder-module peers compile in sorted
+// order, D78/imports.rs `sib_paths.sort()`) — `MethodEntry`/`RouteNode` embed
+// `Handler` (declared in `server.nv`) BY VALUE, which needs `Handler`'s C
+// struct already complete at THIS file's struct-declaration site; a plain
+// `router.nv` sorts BEFORE `server.nv` and CC-FAILs ("incomplete type
+// NovaValue_Handler").
 //
 // `Router` is a segment-trie (arena of `RouteNode`s, indices instead of nested
 // owned pointers — sidesteps recursive-value-mutation entirely: every mutation is
