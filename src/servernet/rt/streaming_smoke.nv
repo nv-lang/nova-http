@@ -54,7 +54,6 @@ test "servernet: live SSE streaming round-trip over loopback" {
                     }
                     Err(_) => ()
                 }
-                lst.close()
             }
             // Client fiber: connect, send a raw GET, read the WHOLE streamed
             // response (loop until EOF — the server closes after the last
@@ -84,6 +83,7 @@ test "servernet: live SSE streaming round-trip over loopback" {
                 }
             }
         }
+        lst.close()
         ok_tx.close()
         got_tx.close()
         ro server_ok = ok_rx.try_recv() ?? false
