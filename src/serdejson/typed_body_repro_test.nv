@@ -14,7 +14,7 @@
 
 module http.serdejson
 
-import ../server.{ServeMux, ServerResponse, handler_fn, serve_once}
+import ../server.{Router, ServerResponse, handler_fn, serve_once}
 import std.encoding.serde.{Serialize, Deserialize, Serializer, Deserializer, SerError, DeError}
 
 #impl(Serialize + Deserialize)
@@ -27,18 +27,18 @@ test "typed request body: json_decode_body[T] decodes ServerRequest.body_bytes()
     ro req = "POST /w HTTP/1.1\r\nHost: x\r\nContent-Length: 24\r\n\r\n{\"id\":7,\"name\":\"gizmo\"}".bytes()
     mut got_id = 0
     mut got_name = ""
-    ro mux = ServeMux.new()
-        .post("/w", handler_fn(|r| {
-            match json_decode_body[ReqWidget](r.body_bytes()) {
-                Ok(w) => {
-                    got_id = w.id
-                    got_name = w.name
-                    ServerResponse.text(200, "ok")
-                }
-                Err(_) => ServerResponse.text(400, "bad")
+    mut router = Router.new()
+    router.post("/w", handler_fn(|r| {
+        match json_decode_body[ReqWidget](r.body_bytes()) {
+            Ok(w) => {
+                got_id = w.id
+                got_name = w.name
+                ServerResponse.text(200, "ok")
             }
-        }))
-    ro wire []u8 = serve_once(mux, req)
+            Err(_) => ServerResponse.text(400, "bad")
+        }
+    }))!!
+    ro wire []u8 = serve_once(router, req)
     ro s = unsafe { wire.to_str_unchecked() }
     assert(s.contains("200"))
     assert(got_id == 7)

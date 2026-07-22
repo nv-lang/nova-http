@@ -38,13 +38,17 @@ test "ServerResponse.header(): repeated call on the SAME mut binding accumulates
     assert(s.contains("x-two: 2"))
 }
 
-// ── ServeMux dispatch: path params attach via mutating ServerRequest.@params ──
+// ── Router dispatch: path params attach via mutating ServerRequest.@params ────
+// (migrated off `ServeMux` — Plan 222.1, [M-servemux-routing-placeholder])
 
-test "ServeMux dispatch: path params attach via mutating @params" {
-    ro mux = ServeMux.new()
-        .get("/users/{id}", handler_fn(|req| ServerResponse.text(200, "user " + req.param("id") ?? "?")))
+test "Router dispatch: path params attach via mutating @params" {
+    mut router = Router.new()
+    router.get("/users/{id}", handler_fn(|req| {
+        ro uid = req.param("id") ?? "?"
+        ServerResponse.text(200, "user ${uid}")
+    }))!!
     ro req = "GET /users/77 HTTP/1.1\r\nHost: x\r\n\r\n".bytes()
-    ro wire []u8 = serve_once(mux, req)
+    ro wire []u8 = serve_once(router, req)
     ro s = unsafe { wire.to_str_unchecked() }
     assert(s.contains("user 77"))
 }

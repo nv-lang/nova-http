@@ -1,0 +1,471 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: server_router.nv — Axum-class HTTP router (Plan 222.1). Replaces
+// the old `ServeMux` (linear scan, 1-segment `{param}` only, first-match-by-
+// registration-order — `[M-servemux-routing-placeholder]`). Filename sorts
+// alphabetically AFTER `server.nv` (folder-module peers compile in sorted
+// order, D78/imports.rs `sib_paths.sort()`) — `MethodEntry`/`RouteNode` embed
+// `Handler` (declared in `server.nv`) BY VALUE, which needs `Handler`'s C
+// struct already complete at THIS file's struct-declaration site; a plain
+// `router.nv` sorts BEFORE `server.nv` and CC-FAILs ("incomplete type
+// NovaValue_Handler").
+//
+// `Router` is a segment-trie (arena of `RouteNode`s, indices instead of nested
+// owned pointers — sidesteps recursive-value-mutation entirely: every mutation is
+// a read-modify-write on `@nodes[idx]`, see `@insert_segs` below): literal
+// segments, `{name}` (one segment), `{*name}` (catch-all, must be the LAST
+// segment). Precedence at dispatch is structural (`@match_from`'s try-order:
+// literal → param → catch-all, backtracking on a deeper dead end) — NOT
+// registration order, unlike the old ServeMux.
+//
+// `MethodRouter` is Axum's composable per-route method dispatch object
+// (`get(h).post(h2)`) — a `Router.route(path, mr)` registers one `MethodRouter`
+// at `path`; the single-method sugar (`Router.@get(path, h)` etc.) builds a
+// throwaway one-method `MethodRouter` under the hood. 405 (path matched, method
+// did not) first tries the matched `MethodRouter`'s OWN `@fallback` (per-route
+// override), then falls through to the wire `405 + Allow` response.
+//
+// Route conflicts (exact-duplicate path registration, OR two different `{name}`
+// param names claiming the same trie slot) are a typed `Result` at REGISTRATION
+// time (`HttpError` with `ErrorKind.Other` detail) — Axum panics on the
+// equivalent; typed-Result-not-panic is the deliberate improvement the plan
+// calls for (§2, "мы лучше Axum").
+//
+// `Router.nest(prefix, sub)` merges `sub`'s already-conflict-free route tree
+// into `self` at `prefix` (re-running the SAME conflict-checked insertion per
+// collected route) — `sub`'s own `@fallback` is intentionally NOT threaded
+// through (only the top-level `Router.fallback` / per-route `MethodRouter.
+// fallback` are in the plan's scope, §2 point 4); documented simplification,
+// not a gap the plan asks to close.
+
+module http.server
+
+import http.{HttpError, ErrorKind}
+
+// ── MethodRouter (composable per-route method dispatch) ───────────────────────
+
+/// A composable method-dispatch object for one route: `get(h).post(h2)` chains
+/// onto ONE `MethodRouter`, then `Router.route(path, mr)` registers the whole
+/// set atomically. `@fallback` (property, D84) is the PER-ROUTE 405 override —
+/// distinct from `Router.@fallback` (global 404).
+// `(str, Handler)` tuple-element Vecs aren't exercised elsewhere in this
+// package (unlike the well-trodden `[](str, str)`) — a small named record
+// sidesteps relying on that untested tuple-monomorphization path.
+type MethodEntry value { ro method str, ro handler Handler }
+
+#stable(since = "0.1")
+export type MethodRouter value {
+    mut routes   []MethodEntry
+    mut fallback Option[Handler]
+}
+
+/// Empty method-set (no methods registered yet).
+#stable(since = "0.1")
+export fn MethodRouter.new() -> MethodRouter => { routes: []MethodEntry.new(), fallback: None }
+
+fn MethodRouter mut @add(method str, h Handler) -> @ { @routes.push(MethodEntry{method, handler: h}) }
+
+/// Add a `GET` handler to this route's method set.
+#stable(since = "0.1")
+export fn MethodRouter mut @get(h Handler) -> @ { @add("GET", h) }
+/// Add a `POST` handler to this route's method set.
+#stable(since = "0.1")
+export fn MethodRouter mut @post(h Handler) -> @ { @add("POST", h) }
+/// Add a `PUT` handler to this route's method set.
+#stable(since = "0.1")
+export fn MethodRouter mut @put(h Handler) -> @ { @add("PUT", h) }
+/// Add a `DELETE` handler to this route's method set.
+#stable(since = "0.1")
+export fn MethodRouter mut @delete(h Handler) -> @ { @add("DELETE", h) }
+/// Add a `PATCH` handler to this route's method set.
+#stable(since = "0.1")
+export fn MethodRouter mut @patch(h Handler) -> @ { @add("PATCH", h) }
+
+/// Per-route 405 override (property write) — served instead of the generic
+/// `405 + Allow` wire response when the path matches but the method does not.
+#stable(since = "0.1")
+export fn MethodRouter mut @fallback(h Handler) -> @ { @fallback = Some(h) }
+
+/// Per-route 405 override (property read).
+#stable(since = "0.1")
+export fn MethodRouter @fallback() -> Option[Handler] => @fallback
+
+fn MethodRouter @find_handler(method str) -> Option[Handler] {
+    for e in @routes {
+        if e.method == method { return Some(e.handler) }
+    }
+    if method == "HEAD" {
+        for e in @routes {
+            if e.method == "GET" { return Some(e.handler) }
+        }
+    }
+    None
+}
+
+fn MethodRouter @allowed_methods() -> []str {
+    mut out = []str.new()
+    for e in @routes { out.push(e.method) }
+    out
+}
+
+/// Start a method-chain with a `GET` handler (`get(h).post(h2)` composability).
+#stable(since = "0.1")
+export fn get(h Handler) -> MethodRouter { mut mr = MethodRouter.new(); mr.get(h); mr }
+/// Start a method-chain with a `POST` handler.
+#stable(since = "0.1")
+export fn post(h Handler) -> MethodRouter { mut mr = MethodRouter.new(); mr.post(h); mr }
+/// Start a method-chain with a `PUT` handler.
+#stable(since = "0.1")
+export fn put(h Handler) -> MethodRouter { mut mr = MethodRouter.new(); mr.put(h); mr }
+/// Start a method-chain with a `DELETE` handler.
+#stable(since = "0.1")
+export fn delete(h Handler) -> MethodRouter { mut mr = MethodRouter.new(); mr.delete(h); mr }
+/// Start a method-chain with a `PATCH` handler.
+#stable(since = "0.1")
+export fn patch(h Handler) -> MethodRouter { mut mr = MethodRouter.new(); mr.patch(h); mr }
+
+// ── RouteNode (arena element — index-based, no recursive owned pointers) ──────
+
+// Small named edge records (same rationale as `MethodEntry` above: `(str,
+// int)`/`(str, MethodRouter)` tuple-element Vecs/Options aren't exercised
+// elsewhere in this package — named records use the well-trodden struct path).
+type LiteralEdge  value { ro seg str, ro idx int }
+type ParamEdge    value { ro name str, ro idx int }
+type CatchallEdge value { ro name str, ro methods MethodRouter }
+
+/// One trie node. `literal_children`/`param_child`/`catchall` hold child NODE
+/// INDICES into the owning `Router.@nodes` arena (`catchall` is always terminal
+/// — a `{*name}` segment consumes the rest of the path, so it carries the
+/// `MethodRouter` directly instead of a further child index).
+type RouteNode value {
+    mut literal_children []LiteralEdge
+    mut param_child       Option[ParamEdge]
+    mut catchall          Option[CatchallEdge]
+    mut methods           Option[MethodRouter]
+}
+
+fn RouteNode.new() -> RouteNode =>
+    { literal_children: []LiteralEdge.new(), param_child: None, catchall: None, methods: None }
+
+fn find_literal_child(node RouteNode, seg str) -> Option[int] {
+    for e in node.literal_children {
+        if e.seg == seg { return Some(e.idx) }
+    }
+    None
+}
+
+// ── segment helpers ────────────────────────────────────────────────────────────
+
+fn split_segments(s str) -> []str {
+    mut out = []str.new()
+    for part in s.split("/") {
+        if part.byte_len() > 0 { out.push(part) }
+    }
+    out
+}
+
+fn is_catchall_seg(seg str) -> bool => seg.starts_with("{*") && seg.ends_with("}")
+fn is_param_seg(seg str) -> bool => seg.starts_with("{") && seg.ends_with("}") && !is_catchall_seg(seg)
+
+fn extend_segs(base []str, extra str) -> []str {
+    mut out = []str.new(cap: base.len() + 1)
+    out.append(base)
+    out.push(extra)
+    out
+}
+
+// Rejoin the remaining (percent-decoded) raw path segments from `i` on — the
+// captured value of a `{*name}` catch-all.
+fn catchall_rest(segs []str, i int) -> str {
+    consume sb = StringBuilder.new()
+    mut first = true
+    mut j = i
+    ro n = segs.len()
+    while j < n {
+        if !first { sb.append("/") }
+        sb.append(percent_decode(segs[j]))
+        first = false
+        j += 1
+    }
+    sb.into_str()
+}
+
+fn route_conflict_error(path str) -> HttpError =>
+    HttpError.new(Other("route conflict: '${path}' conflicts with an already-registered route"))
+
+fn validate_pattern(path str, segs []str) -> Result[(), HttpError] {
+    ro n = segs.len()
+    mut i = 0
+    while i < n {
+        if is_catchall_seg(segs[i]) && i != n - 1 {
+            return Err(HttpError.new(Other("route pattern '${path}': {*...} catch-all must be the last segment")))
+        }
+        i += 1
+    }
+    Ok(())
+}
+
+fn method_not_allowed(allow []str) -> ServerResponse {
+    consume sb = StringBuilder.new()
+    mut first = true
+    for m in allow {
+        if !first { sb.append(", ") }
+        sb.append(m)
+        first = false
+    }
+    mut resp = ServerResponse.text(405, "405 method not allowed")
+    resp.header("Allow", sb.into_str())
+    resp
+}
+
+// ── MatchResult / CollectedRoute (small read-only value carriers) ─────────────
+
+type MatchResult value { ro methods MethodRouter, ro params [](str, str) }
+type CollectedRoute value { ro segs []str, ro methods MethodRouter }
+
+// ── Router ─────────────────────────────────────────────────────────────────────
+
+/// Segment-trie HTTP router (Plan 222.1, Axum-class): static segments, `{param}`,
+/// `{*rest}` catch-all; precedence static > param > catch-all; `MethodRouter`
+/// per-route method dispatch (405 + `Allow` when the path matches but the
+/// method doesn't); `@nest` for prefix-grouped sub-routers; `@fallback` for the
+/// global 404. Route registration (`@route`/`@get`/…/`@nest`) is fallible
+/// (`Result[(), HttpError]`) — a duplicate/conflicting route is a typed error,
+/// not a panic.
+#stable(since = "0.1")
+export type Router value {
+    mut nodes    []RouteNode
+    mut fallback Option[Handler]
+}
+
+/// Empty router (a bare root node, no routes, no fallback).
+#stable(since = "0.1")
+export fn Router.new() -> Router {
+    mut nodes []RouteNode = []RouteNode.new()
+    nodes.push(RouteNode.new())
+    { nodes, fallback: None }
+}
+
+/// Global 404 handler (property write) — served when NO path in the trie
+/// matches at all (distinct from `MethodRouter.@fallback`, the per-route 405
+/// override below).
+#stable(since = "0.1")
+export fn Router mut @fallback(h Handler) -> @ { @fallback = Some(h) }
+/// Global 404 handler (property read).
+#stable(since = "0.1")
+export fn Router @fallback() -> Option[Handler] => @fallback
+
+/// Register `mr` (a composed `MethodRouter`, e.g. `get(h).post(h2)`) at `path`.
+/// `path` segments: literal / `{name}` / `{*name}` (must be last). Conflicts
+/// (exact-duplicate path, or a `{name}` clashing with a DIFFERENT existing
+/// param name at the same trie slot, or two `{*...}` at the same slot) are a
+/// typed `Err(HttpError)`, not a panic.
+#stable(since = "0.1")
+export fn Router mut @route(path str, mr MethodRouter) -> Result[(), HttpError] {
+    @insert_segs(split_segments(path), path, mr)
+}
+
+fn Router mut @insert_segs(segs []str, path str, mr MethodRouter) -> Result[(), HttpError] {
+    match validate_pattern(path, segs) {
+        Ok(_)  => ()
+        Err(e) => return Err(e)
+    }
+    mut idx = 0
+    ro n = segs.len()
+    mut i = 0
+    while i < n {
+        ro seg = segs[i]
+        if is_catchall_seg(seg) {
+            ro name = seg[2..seg.byte_len() - 1]
+            mut node = @nodes[idx]
+            match node.catchall {
+                Some(_) => return Err(route_conflict_error(path))
+                None    => {
+                    node.catchall = Some(CatchallEdge{name, methods: mr})
+                    @nodes[idx] = node
+                    return Ok(())
+                }
+            }
+        } else if is_param_seg(seg) {
+            ro name = seg[1..seg.byte_len() - 1]
+            ro node = @nodes[idx]
+            match node.param_child {
+                Some(pe) => {
+                    if pe.name != name { return Err(route_conflict_error(path)) }
+                    idx = pe.idx
+                }
+                None => {
+                    @nodes.push(RouteNode.new())
+                    ro new_idx = @nodes.len() - 1
+                    mut updated = node
+                    updated.param_child = Some(ParamEdge{name, idx: new_idx})
+                    @nodes[idx] = updated
+                    idx = new_idx
+                }
+            }
+        } else {
+            ro node = @nodes[idx]
+            match find_literal_child(node, seg) {
+                Some(child_idx) => { idx = child_idx }
+                None => {
+                    @nodes.push(RouteNode.new())
+                    ro new_idx = @nodes.len() - 1
+                    mut updated = node
+                    updated.literal_children.push(LiteralEdge{seg, idx: new_idx})
+                    @nodes[idx] = updated
+                    idx = new_idx
+                }
+            }
+        }
+        i += 1
+    }
+    mut node = @nodes[idx]
+    match node.methods {
+        Some(_) => Err(route_conflict_error(path))
+        None    => {
+            node.methods = Some(mr)
+            @nodes[idx] = node
+            Ok(())
+        }
+    }
+}
+
+/// Register a single `GET` handler at `path` (sugar over `@route(path, get(h))`).
+#stable(since = "0.1")
+export fn Router mut @get(path str, h Handler) -> Result[(), HttpError] => @route(path, get(h))
+/// Register a single `POST` handler at `path`.
+#stable(since = "0.1")
+export fn Router mut @post(path str, h Handler) -> Result[(), HttpError] => @route(path, post(h))
+/// Register a single `PUT` handler at `path`.
+#stable(since = "0.1")
+export fn Router mut @put(path str, h Handler) -> Result[(), HttpError] => @route(path, put(h))
+/// Register a single `DELETE` handler at `path`.
+#stable(since = "0.1")
+export fn Router mut @delete(path str, h Handler) -> Result[(), HttpError] => @route(path, delete(h))
+/// Register a single `PATCH` handler at `path`.
+#stable(since = "0.1")
+export fn Router mut @patch(path str, h Handler) -> Result[(), HttpError] => @route(path, patch(h))
+
+/// Merge `sub`'s route tree under `prefix` (Axum-style nesting/grouping).
+/// `sub`'s own routes were already conflict-free at ITS OWN registration time;
+/// `@nest` re-runs the same conflict check against `self`'s (possibly
+/// non-empty) tree, so a prefix collision with an existing route in `self` is
+/// still a typed `Err`, not a panic. `sub.@fallback` is NOT threaded through
+/// (documented simplification, see file banner).
+#stable(since = "0.1")
+export fn Router mut @nest(prefix str, sub Router) -> Result[(), HttpError] {
+    ro prefix_segs = split_segments(prefix)
+    ro collected = sub.collect_from(0, []str.new())
+    mut i = 0
+    ro n = collected.len()
+    while i < n {
+        ro r = collected[i]
+        mut full = []str.new(cap: prefix_segs.len() + r.segs.len())
+        full.append(prefix_segs)
+        full.append(r.segs)
+        match @insert_segs(full, prefix, r.methods) {
+            Ok(_)  => ()
+            Err(e) => return Err(e)
+        }
+        i += 1
+    }
+    Ok(())
+}
+
+// DFS over the trie, reconstructing each registered route's segment list
+// (literal / "{name}" / "{*name}") + its `MethodRouter` — used by `@nest` to
+// re-insert `sub`'s routes under `prefix`.
+fn Router @collect_from(idx int, prefix []str) -> []CollectedRoute {
+    ro node = @nodes[idx]
+    mut out = []CollectedRoute.new()
+    match node.methods {
+        Some(mr) => out.push(CollectedRoute{segs: prefix, methods: mr})
+        None     => ()
+    }
+    for e in node.literal_children {
+        out.append(@collect_from(e.idx, extend_segs(prefix, e.seg)))
+    }
+    match node.param_child {
+        Some(pe) => out.append(@collect_from(pe.idx, extend_segs(prefix, "{${pe.name}}")))
+        None => ()
+    }
+    match node.catchall {
+        Some(ce) => out.push(CollectedRoute{segs: extend_segs(prefix, "{*${ce.name}}"), methods: ce.methods})
+        None => ()
+    }
+    out
+}
+
+// Trie lookup with Axum-class precedence (literal > param > catch-all,
+// backtracking on a deeper dead end) — pure read traversal, no mutation.
+fn Router @match_from(idx int, segs []str, i int) -> Option[MatchResult] {
+    ro node = @nodes[idx]
+    if i == segs.len() {
+        return match node.methods {
+            Some(mr) => {
+                mut ps [](str, str) = []
+                Some(MatchResult{methods: mr, params: ps})
+            }
+            None => None
+        }
+    }
+    ro seg = segs[i]
+    for e in node.literal_children {
+        if e.seg == seg {
+            match @match_from(e.idx, segs, i + 1) {
+                Some(m) => return Some(m)
+                None    => ()
+            }
+        }
+    }
+    match node.param_child {
+        Some(pe) => {
+            match @match_from(pe.idx, segs, i + 1) {
+                Some(m) => {
+                    mut p [](str, str) = []
+                    p.push((pe.name, percent_decode(seg)))
+                    p.append(m.params)
+                    return Some(MatchResult{methods: m.methods, params: p})
+                }
+                None => ()
+            }
+        }
+        None => ()
+    }
+    match node.catchall {
+        Some(ce) => {
+            mut p [](str, str) = []
+            p.push((ce.name, catchall_rest(segs, i)))
+            return Some(MatchResult{methods: ce.methods, params: p})
+        }
+        None => ()
+    }
+    None
+}
+
+/// Route a request → response: 404 (`@fallback`, or a default 404 body) if NO
+/// path in the trie matches; the matched `MethodRouter`'s own `@fallback` (or a
+/// generic `405 + Allow`) if the path matches but the method doesn't; otherwise
+/// the matched handler, with `{name}`/`{*name}` captures attached as raw
+/// `ServerRequest.@params` (typed extraction is 222.3, layered on top).
+#stable(since = "0.1")
+export fn Router @dispatch(req ServerRequest) -> ServerResponse {
+    mut rq = req
+    ro segs = split_segments(rq.path())
+    match @match_from(0, segs, 0) {
+        Some(m) => {
+            rq.params(m.params)
+            ro reqm = rq.method().str()
+            match m.methods.find_handler(reqm) {
+                Some(h) => h.handle(rq)
+                None => match m.methods.fallback() {
+                    Some(h) => h.handle(rq)
+                    None    => method_not_allowed(m.methods.allowed_methods())
+                }
+            }
+        }
+        None => match @fallback {
+            Some(h) => h.handle(rq)
+            None    => ServerResponse.text(404, "404 page not found")
+        }
+    }
+}
