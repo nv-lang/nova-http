@@ -1,0 +1,222 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: ws/rt/socket_echo_smoke.nv — LIVE WebSocket echo over a loopback
+// socket (Plan 222.14 Ф.3: "фибро-модель" check). Proves the `http.ws`
+// СЛОЙ-1 stack end-to-end over a REAL `TcpStream`, fiber-per-connection
+// (Plan 173/83.x substrate, same `supervised { spawn {...}; spawn {...} }`
+// shape as `servernet/rt/handle_connection_smoke.nv`):
+//   · handshake bytes (`ws_accept_key`) on the wire, both directions;
+//   · `WebSocket.recv`/`.send`/`.close` driving a real echo loop server-side;
+//   · masked (client-role) frames in, unmasked (server-role) frames out;
+//   · fragmentation (a 2-frame message) reassembled server-side;
+//   · Ping -> automatic Pong (plan §4) observed on the wire;
+//   · the close handshake (client-initiated) echoed back.
+//
+// Deliberately does NOT go through `Router`/`servernet.handle_connection` —
+// `WebSocketUpgrade`'s `@on_upgrade` cannot yet hand the live raw socket to a
+// handler (no channel from a `FromRequest` extractor, which only sees the
+// buffered `ServerRequest` value, to the connection's actual `TcpStream` —
+// that requires extending `ServerResponse`/`servernet.handle_connection`,
+// OUT OF ZONE this wave, `servernet/**` untouched, tracked for whoever wires
+// 222.7). This smoke drives the handshake + `WebSocket` object directly
+// against a self-managed accept/connect pair instead — proving the
+// SOCKET/PROTOCOL layer is real and correct so that future servernet wiring
+// is "plumbing", not "does the protocol work". `[M-ws-on_upgrade-hijack-not-wired]`
+//
+// EXPECT_TIMEOUT_MS-marked (standalone per test-conventions.md — binds a
+// real loopback port, same discipline as the servernet smoke).
+//
+// EXPECT_TIMEOUT_MS 30000
+
+module rt.socket_echo_smoke
+
+import std.net.{TcpListener, TcpStream, SocketAddr, real_net}
+import http.ws.{Frame, OpCode, Message, WebSocket, ws_accept_key, frame_len_hint}
+
+// RFC 6455 §1.3 worked-example key/accept pair (reused as a fixed test
+// fixture key — any 16-byte-base64 value works, this one is just already
+// verified in handshake_test.nv so a mismatch here would be immediately
+// legible as a REGRESSION, not a fixture typo).
+fn test_client_key() -> str => "dGhlIHNhbXBsZSBub25jZQ=="
+
+// Index of CRLFCRLF in `b`, or -1 — local copy (http.server's own `dcrlf` is
+// module-private, and this smoke deliberately does not depend on
+// http.server at all, СЛОЙ discipline: `http.ws` never imports UP).
+fn find_crlfcrlf(b []u8) -> int {
+    ro n = b.len()
+    mut i = 0
+    while i + 3 < n {
+        if (b[i] as int) == 0x0D && (b[i + 1] as int) == 0x0A &&
+           (b[i + 2] as int) == 0x0D && (b[i + 3] as int) == 0x0A {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+test "ws: live handshake + echo (text, fragmented text, binary, ping) + close, over loopback" {
+    with Net = real_net() {
+        consume lst = match TcpListener.bind(SocketAddr.loopback(0)) {
+            Ok(consume l) => l
+            Err(_) => { assert(false); return }
+        }
+        ro port = lst.local_port()
+        assert(port > 0)
+
+        ro (server_ok_tx, server_ok_rx) = Channel.new(1)
+        ro (client_ok_tx, client_ok_rx) = Channel.new(1)
+
+        supervised {
+            // ── server fiber: accept, handshake, echo loop ────────────────
+            spawn {
+                match lst.accept() {
+                    Ok(consume srv) => {
+                        consume s = srv
+                        mut acc []u8 = []u8.new()
+                        mut header_end = -1
+                        mut reading = true
+                        while reading && header_end < 0 {
+                            match s.read_to_vec(4096) {
+                                Ok(chunk) => {
+                                    if chunk.len() == 0 { reading = false }
+                                    else { acc.append(chunk); header_end = find_crlfcrlf(acc) }
+                                }
+                                Err(_) => { reading = false }
+                            }
+                        }
+                        ro accept_key = match ws_accept_key(test_client_key()) {
+                            Ok(k)  => k
+                            Err(_) => ""
+                        }
+                        ro resp_head = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept_key}\r\n\r\n"
+                        match s.write_all(resp_head.bytes()) {
+                            Ok(_) => {
+                                mut ws = WebSocket.with_limit(s, 65536)
+                                mut running = true
+                                while running {
+                                    match ws.recv() {
+                                        Ok(Some(Message.Text(t)))   => { ro _ = ws.send(Message.Text(t)) }
+                                        Ok(Some(Message.Binary(b))) => { ro _ = ws.send(Message.Binary(b)) }
+                                        Ok(Some(_))                 => ()      // Ping/Pong — already auto-handled inside recv()
+                                        Ok(None)                    => { running = false }
+                                        Err(_)                      => { running = false }
+                                    }
+                                }
+                                ro _ = ws.close(1000, "bye")
+                                server_ok_tx.try_send(true)
+                            }
+                            Err(_) => { server_ok_tx.try_send(false) }
+                        }
+                    }
+                    Err(_) => { server_ok_tx.try_send(false) }
+                }
+            }
+            // ── client fiber: raw WS wire protocol (simulates a browser) ──
+            spawn {
+                match TcpStream.connect(SocketAddr.loopback(port)) {
+                    Ok(consume conn) => {
+                        consume c0 = conn
+                        ro req = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${test_client_key()}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                        ro _ = c0.write_all(req.bytes())
+
+                        mut acc []u8 = []u8.new()
+                        mut header_end = -1
+                        mut reading = true
+                        while reading && header_end < 0 {
+                            match c0.read_to_vec(4096) {
+                                Ok(chunk) => {
+                                    if chunk.len() == 0 { reading = false }
+                                    else { acc.append(chunk); header_end = find_crlfcrlf(acc) }
+                                }
+                                Err(_) => { reading = false }
+                            }
+                        }
+                        ro head_bytes []u8 = acc[0..header_end]
+                        ro head_str = unsafe { head_bytes.to_str_unchecked() }
+                        mut all_ok = head_str.contains("101 Switching Protocols")
+
+                        // `c0` is reused directly for every write/read below (by-reference
+                        // `mut s TcpStream` free-fn param, same shape as `servernet.nv`'s
+                        // own `read_request(s mut TcpStream)` — that precedent calls
+                        // `s.write_all(...)` again AFTER `read_request(s)` returns, proving
+                        // the param is a mutable BORROW, not a move). An earlier version of
+                        // this test instead threaded `c0 -> c1 -> ... -> c5` through a
+                        // `read_one_frame(consume stream TcpStream) -> (TcpStream, Frame)`
+                        // helper — writes on the RETURNED stream then silently failed
+                        // (`NetError`) even though the returned struct was bit-identical to
+                        // the one passed in. `[M-ws-consume-tcpstream-return-tuple-breaks]`
+                        // Never moving `c0` through a function boundary sidesteps it.
+
+                        // 1) single-frame masked Text "hello" -> expect unmasked echo "hello"
+                        ro f1 = Frame.new(true, OpCode.Text, "hello".bytes())
+                        ro _w1 = c0.write_all(f1.encode(true))
+                        ro echo1 = read_frame_inline(c0)
+                        all_ok = all_ok && echo1.payload() == "hello".bytes()
+
+                        // 2) fragmented masked Text "Hel" + "lo" -> expect unmasked echo "Hello"
+                        ro f2a = Frame.new(false, OpCode.Text, "Hel".bytes())
+                        ro f2b = Frame.new(true, OpCode.Continuation, "lo".bytes())
+                        ro _w2a = c0.write_all(f2a.encode(true))
+                        ro _w2b = c0.write_all(f2b.encode(true))
+                        ro echo2 = read_frame_inline(c0)
+                        all_ok = all_ok && echo2.payload() == "Hello".bytes()
+
+                        // 3) masked Binary -> expect unmasked echo
+                        ro f3 = Frame.new(true, OpCode.Binary, Vec[u8].of(9, 8, 7, 6))
+                        ro _w3 = c0.write_all(f3.encode(true))
+                        ro echo3 = read_frame_inline(c0)
+                        all_ok = all_ok && echo3.payload() == Vec[u8].of(9, 8, 7, 6)
+
+                        // 4) masked Ping -> expect automatic unmasked Pong with same payload
+                        ro f4 = Frame.new(true, OpCode.Ping, "keepalive".bytes())
+                        ro _w4 = c0.write_all(f4.encode(true))
+                        ro echo4 = read_frame_inline(c0)
+                        all_ok = all_ok && match echo4.opcode() { OpCode.Pong => true, _ => false }
+                        all_ok = all_ok && echo4.payload() == "keepalive".bytes()
+
+                        // 5) client-initiated close -> expect the close echoed back
+                        ro f5 = Frame.new(true, OpCode.Close, Vec[u8].of(0x03, 0xE8)) // code 1000
+                        ro _w5 = c0.write_all(f5.encode(true))
+                        ro echo5 = read_frame_inline(c0)
+                        all_ok = all_ok && match echo5.opcode() { OpCode.Close => true, _ => false }
+
+                        c0.close()
+                        client_ok_tx.try_send(all_ok)
+                    }
+                    Err(_) => { client_ok_tx.try_send(false) }
+                }
+            }
+        }
+        lst.close()
+        server_ok_tx.close()
+        client_ok_tx.close()
+        assert(server_ok_rx.try_recv() ?? false)
+        assert(client_ok_rx.try_recv() ?? false)
+    }
+}
+
+// Accumulate bytes off `s` until exactly one complete WS frame is buffered,
+// then decode it. `s` is a mutable BORROW (free-fn `mut` param, NOT
+// `consume`) — same shape as `servernet.nv`'s own `read_request(s mut
+// TcpStream)`, which the caller keeps using afterward (see the call-site
+// banner above for why this — not the consume-and-return-a-tuple form —
+// is the correct shape here). Test-only helper (client side of the smoke —
+// simulates a browser's raw frame reader; the SERVER side under test uses
+// the real `WebSocket.recv()`, not this).
+fn read_frame_inline(mut s TcpStream) Net -> Frame {
+    mut fbuf []u8 = []u8.new()
+    mut need = frame_len_hint(fbuf)
+    while need.is_some() {
+        match s.read_to_vec(4096) {
+            Ok(chunk) => {
+                if chunk.len() == 0 { need = None }
+                else { fbuf.append(chunk); need = frame_len_hint(fbuf) }
+            }
+            Err(_) => { need = None }
+        }
+    }
+    match Frame.decode(fbuf) {
+        Ok((f, _n)) => f
+        Err(_)      => Frame.new(true, OpCode.Close, []u8.new())
+    }
+}

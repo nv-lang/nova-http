@@ -10,7 +10,7 @@ test "frame: unmasked single-frame text 'Hello' (RFC 6455 §5.7 ex.1)" {
     ro (f, n) = Frame.decode(raw)!!
     assert(n == 7)
     assert(f.fin())
-    assert(match f.opcode() { Text => true, _ => false })
+    assert(match f.opcode() { OpCode.Text => true, _ => false })
     assert(f.payload() == "Hello".bytes())
 }
 
@@ -19,7 +19,7 @@ test "frame: masked single-frame text 'Hello' (RFC 6455 §5.7 ex.2)" {
     ro (f, n) = Frame.decode(raw)!!
     assert(n == 11)
     assert(f.fin())
-    assert(match f.opcode() { Text => true, _ => false })
+    assert(match f.opcode() { OpCode.Text => true, _ => false })
     assert(f.payload() == "Hello".bytes())
 }
 
@@ -28,7 +28,7 @@ test "frame: fragmented unmasked text 'Hel'+'lo' (RFC 6455 §5.7 ex.3+4)" {
     ro (f1, n1) = Frame.decode(raw1)!!
     assert(n1 == 5)
     assert(!f1.fin())
-    assert(match f1.opcode() { Text => true, _ => false })
+    assert(match f1.opcode() { OpCode.Text => true, _ => false })
     assert(f1.payload() == "Hel".bytes())
 
     ro raw2 = Vec[u8].of(0x80, 0x02, 0x6c, 0x6f)
@@ -108,12 +108,12 @@ test "frame: truncated payload -> BadFrame" {
 }
 
 test "frame: encode unmasked round-trips through decode" {
-    ro f = Frame.new(true, Text, "round-trip".bytes())
+    ro f = Frame.new(true, OpCode.Text, "round-trip".bytes())
     ro wire = f.encode(false)
     ro (f2, n) = Frame.decode(wire)!!
     assert(n == wire.len())
     assert(f2.payload() == "round-trip".bytes())
-    assert(match f2.opcode() { Text => true, _ => false })
+    assert(match f2.opcode() { OpCode.Text => true, _ => false })
 }
 
 test "frame: encode masked round-trips through decode (unmask restores payload)" {
