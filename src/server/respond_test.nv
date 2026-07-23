@@ -140,3 +140,96 @@ test "Result[R,E].into_response(): Err(HttpError) -> the error's own into_respon
     ro resp = maybe_greet(false).into_response()
     assert(resp.status_code() == 400)
 }
+
+// ── auto-JSON blanket `fn[T Serialize] T consume @into_response()` (owner-go
+// 2026-07-23, 222 §0в п.2; probe p1 form). Pins: (а) concrete impl still wins
+// over the blanket (D285), (б) Serialize-record → application/json
+// byte-exact, (в) bare scalar included, (г) existing Result/Json paths δ0
+// (covered by the tests above staying green unchanged).
+//
+// NB byte-exact scope (found by this wave, run-to-run flake isolated):
+// multi-field record JSON is byte-exact only UP TO KEY ORDER —
+// `format_object` (std/encoding/json.nv:849) walks the object
+// `HashMap[str, JsonValue]` in hash-iteration order and `JsonValue.object`'s
+// own doc says "Order keys не гарантируется" ({"name",...,"qty":...} vs
+// {"qty":...,"name":...} across runs of the SAME binary; generated C
+// byte-identical — NOT a codegen defect). std's own serde pins are
+// round-trip for exactly this reason (record_autoderive_test.nv). So: the
+// literal byte-exact pin lives on a SINGLE-field record (order-free), the
+// two-field record is pinned structurally + exact length (byte-set-exact).
+// Reported to integrator (ordered object emission would be a std change).
+
+test "auto-JSON pin (а): str keeps its CONCRETE text/plain impl — blanket does not steal it (D285)" {
+    ro resp = "hello".into_response()
+    assert(resp.status_code() == 200)
+    ro ct_ok = match resp.headers.get("Content-Type") {
+        Some(hv) => match hv.to_str() { Ok(s) => s.contains("text/plain"), Err(_) => false }
+        None     => false
+    }
+    assert(ct_ok)
+    assert(unsafe { resp.body.to_str_unchecked() } == "hello")
+}
+
+#impl(Serialize)
+type RespNote value { ro name str }
+
+test "auto-JSON pin (б1): single-field #impl(Serialize) record -> 200 application/json, body byte-exact" {
+    ro resp = RespNote{ name: "widget-a" }.into_response()
+    assert(resp.status_code() == 200)
+    ro ct_ok = match resp.headers.get("Content-Type") {
+        Some(hv) => match hv.to_str() { Ok(s) => s.contains("application/json"), Err(_) => false }
+        None     => false
+    }
+    assert(ct_ok)
+    assert(unsafe { resp.body.to_str_unchecked() } == "{\"name\":\"widget-a\"}")
+}
+
+test "auto-JSON pin (б2): two-field #impl(Serialize) record -> 200 application/json, byte-set-exact (key order unpinned, see NB above)" {
+    ro resp = RespWidget{ name: "widget-a", qty: 3 }.into_response()
+    assert(resp.status_code() == 200)
+    ro ct_ok = match resp.headers.get("Content-Type") {
+        Some(hv) => match hv.to_str() { Ok(s) => s.contains("application/json"), Err(_) => false }
+        None     => false
+    }
+    assert(ct_ok)
+    ro body = unsafe { resp.body.to_str_unchecked() }
+    assert(body.byte_len() == "{\"name\":\"widget-a\",\"qty\":3}".byte_len())
+    assert(body.starts_with("{"))
+    assert(body.ends_with("}"))
+    assert(body.contains("\"name\":\"widget-a\""))
+    assert(body.contains("\"qty\":3"))
+}
+
+fn maybe_count(ok bool) -> Result[int, HttpError] {
+    if ok { Ok(42) } else { Err(HttpError.protocol_error("nope")) }
+}
+
+fn maybe_widget(ok bool) -> Result[RespWidget, HttpError] {
+    if ok { Ok(RespWidget{ name: "w", qty: 1 }) } else { Err(HttpError.protocol_error("nope")) }
+}
+
+test "auto-JSON probe (в-alt): direct scalar 42.into_response() -> JSON `42`" {
+    ro resp = 42.into_response()
+    assert(resp.status_code() == 200)
+    assert(unsafe { resp.body.to_str_unchecked() } == "42")
+}
+
+test "auto-JSON probe (г-alt): Ok(record) without Json{} -> blanket via Result" {
+    ro resp = maybe_widget(true).into_response()
+    assert(resp.status_code() == 200)
+    ro body = unsafe { resp.body.to_str_unchecked() }
+    assert(body.byte_len() == "{\"name\":\"w\",\"qty\":1}".byte_len())
+    assert(body.contains("\"name\":\"w\""))
+    assert(body.contains("\"qty\":1"))
+}
+
+test "auto-JSON pin (в): bare scalar Ok(42) -> JSON `42` via the blanket (owner: scalars included)" {
+    ro resp = maybe_count(true).into_response()
+    assert(resp.status_code() == 200)
+    ro ct_ok = match resp.headers.get("Content-Type") {
+        Some(hv) => match hv.to_str() { Ok(s) => s.contains("application/json"), Err(_) => false }
+        None     => false
+    }
+    assert(ct_ok)
+    assert(unsafe { resp.body.to_str_unchecked() } == "42")
+}
