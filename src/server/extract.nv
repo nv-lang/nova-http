@@ -86,22 +86,22 @@ export type FromRequest protocol {
 // `Json[T]` lives in respond.nv, gets its `FromRequest` impl below) ────────
 
 /// `{name}` path-parameter(s), decoded into `T` (`#impl(Deserialize)`).
-/// NOT `value` — [M-generic-value-self-protocol-wrapper-mono], see the note
+/// `value` restored — [M-generic-value-self-protocol-wrapper-mono] CLOSED (ОКНО-3 2026-07-23)
 /// on `Json[T]` in respond.nv (same root cause, same fix).
 #stable(since = "0.1")
 // HOTFIX [M-crossmodule-samename-typecheck-bleed] (221.1 №28): временно PathParam —
 // имя Path коллидирует со std/fs Path во флагман-CU (кодоген генерит .data на чужой
 // структуре); ВЕРНУТЬ имя Path после фикса №28 (Axum-паритет имени).
-export type PathParam[T] { priv data T }
+export type PathParam[T] value { priv data T }
 /// The decoded value (property accessor, D117 — not a bare field).
 #stable(since = "0.1")
 export fn PathParam[T] @data() -> T => @data
 
 /// `?a=1&b=2` query-string, decoded into `T` (`#impl(Deserialize)`).
-/// NOT `value` — [M-generic-value-self-protocol-wrapper-mono], see the note
+/// `value` restored — [M-generic-value-self-protocol-wrapper-mono] CLOSED (ОКНО-3 2026-07-23)
 /// on `Json[T]` in respond.nv (same root cause, same fix).
 #stable(since = "0.1")
-export type Query[T] { priv data T }
+export type Query[T] value { priv data T }
 /// The decoded value (property accessor, D117 — not a bare field).
 #stable(since = "0.1")
 export fn Query[T] @data() -> T => @data
