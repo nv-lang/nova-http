@@ -1,0 +1,283 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Plan 222.13 — `polaris.auth` peer tests: Bearer/BasicAuth (Ф.1, incl.
+// NEGATIVE: missing header / wrong scheme / broken base64), `JwtClaims[T]`
+// over std Jwt (Ф.2 — fixture tokens GENERATED in-test via `Jwt.encode_hs256`,
+// std/crypto/jwt.nv; negatives: expired, nbf-in-future, tampered signature,
+// garbage token), cookie round-trip (CookieJar + `@set_cookie`), and the
+// sessions skeleton (store save/load/destroy + TTL eviction, `session_layer`
+// e2e on the 222.4 middleware core). E2E style mirrors extract_test.nv:
+// build a raw HTTP/1.1 request → `serve_once` → inspect the wire (no
+// mock-`ServerRequest` constructor exists). `get_req` (router_test.nv),
+// `resp_contains`/`status_line` (mux_test.nv) — same-module peers, reused.
+
+module http.server
+
+import http.{SetCookie, SameSite}
+import std.collections.hashmap.{HashMap}
+import std.crypto.jwt.{Jwt, JwtError}
+import std.encoding.base64.{Base64}
+import std.encoding.json.{JsonValue}
+import std.encoding.serde.{Deserialize}
+
+// ── helpers ────────────────────────────────────────────────────────────────
+
+fn get_req_h(path str, hname str, hval str) -> []u8 =>
+    "GET ${path} HTTP/1.1\r\nHost: x\r\n${hname}: ${hval}\r\n\r\n".bytes()
+
+// Typed claims record for Ф.2. `#serde(allow_unknown)` is REQUIRED for claims
+// types: a JWT payload always carries registered claims (exp/nbf/iat/iss/...)
+// beyond the fields T declares, and serde is strict-by-default (UnknownField,
+// 180.1 Ф.7) — without the opt-out every real token 401s (found live: the
+// "valid token" test failed with UnknownField("exp") until this line).
+#serde(allow_unknown)
+#impl(Deserialize)
+type UserClaims value { ro sub str }
+
+fn test_secret() -> []u8 => "test-secret-222-13".bytes()
+
+// Token with sub + exp (seconds, RFC 7519) signed by `secret`.
+fn make_token(secret []u8, sub str, exp_s f64) -> str {
+    mut m = HashMap[str, JsonValue].new()
+    m.insert("sub", JsonValue.Str(sub))
+    m.insert("exp", JsonValue.Num(exp_s))
+    Jwt.encode_hs256(secret, JsonValue.Object(m))
+}
+
+fn make_token_nbf(secret []u8, sub str, nbf_s f64) -> str {
+    mut m = HashMap[str, JsonValue].new()
+    m.insert("sub", JsonValue.Str(sub))
+    m.insert("nbf", JsonValue.Num(nbf_s))
+    Jwt.encode_hs256(secret, JsonValue.Object(m))
+}
+
+// ── Ф.1: Bearer ────────────────────────────────────────────────────────────
+
+fn bearer_echo_router() -> Router {
+    mut r = Router.new()
+    r.get("/who", handler_fn(|req| {
+        match Bearer.from_request(req) {
+            Ok(b)  => ServerResponse.text(200, "tok=${b.token()}")
+            Err(e) => e.into_response()
+        }
+    }))!!
+    r
+}
+
+test "Bearer: valid Authorization header -> token extracted" {
+    ro wire = serve_once(bearer_echo_router(), get_req_h("/who", "Authorization", "Bearer abc.def.ghi"))
+    assert(status_line(wire) == "HTTP/1.1 200 OK")
+    assert(resp_contains(wire, "tok=abc.def.ghi"))
+}
+
+test "Bearer: missing Authorization header -> 401" {
+    ro wire = serve_once(bearer_echo_router(), get_req("/who"))
+    assert(status_line(wire) == "HTTP/1.1 401 Unauthorized")
+}
+
+test "Bearer: wrong scheme (Basic) -> 401" {
+    ro wire = serve_once(bearer_echo_router(), get_req_h("/who", "Authorization", "Basic dXNlcjpwYXNz"))
+    assert(status_line(wire) == "HTTP/1.1 401 Unauthorized")
+}
+
+// ── Ф.1: BasicAuth ─────────────────────────────────────────────────────────
+
+fn basic_echo_router() -> Router {
+    mut r = Router.new()
+    r.get("/basic", handler_fn(|req| {
+        match BasicAuth.from_request(req) {
+            Ok(a)  => ServerResponse.text(200, "u=${a.user()} p=${a.pass()}")
+            Err(e) => e.into_response()
+        }
+    }))!!
+    r
+}
+
+test "BasicAuth: valid base64(user:pass) -> credentials split" {
+    ro b64 = Base64.encode("alice:s3cret".bytes())
+    ro wire = serve_once(basic_echo_router(), get_req_h("/basic", "Authorization", "Basic ${b64}"))
+    assert(status_line(wire) == "HTTP/1.1 200 OK")
+    assert(resp_contains(wire, "u=alice p=s3cret"))
+}
+
+test "BasicAuth: broken base64 -> 401" {
+    ro wire = serve_once(basic_echo_router(), get_req_h("/basic", "Authorization", "Basic !!!not-base64!!!"))
+    assert(status_line(wire) == "HTTP/1.1 401 Unauthorized")
+}
+
+test "BasicAuth: payload without ':' -> 401" {
+    ro b64 = Base64.encode("no-colon-here".bytes())
+    ro wire = serve_once(basic_echo_router(), get_req_h("/basic", "Authorization", "Basic ${b64}"))
+    assert(status_line(wire) == "HTTP/1.1 401 Unauthorized")
+}
+
+// ── Ф.2: JwtClaims[T] over std Jwt ─────────────────────────────────────────
+// Fixed clock: now = 1_500_000 s → now_ms = 1_500_000_000. Valid exp =
+// 2_000_000 s (future), expired exp = 1_000_000 s (past).
+
+fn jwt_router(now_ms u64) -> Router {
+    ro auth = JwtAuth.new(test_secret())
+    mut r = Router.new()
+    r.get("/me", handler_fn(|req| {
+        match auth.claims_at[UserClaims](req, now_ms) {
+            Ok(c)  => {
+                ro cl = c.claims()
+                ServerResponse.text(200, "sub=${cl.sub}")
+            }
+            Err(e) => e.into_response()
+        }
+    }))!!
+    r
+}
+
+test "JwtClaims: valid token (exp in future) -> typed claims" {
+    ro tok = make_token(test_secret(), "user-42", 2_000_000.0)
+    ro wire = serve_once(jwt_router(1_500_000_000), get_req_h("/me", "Authorization", "Bearer ${tok}"))
+    assert(status_line(wire) == "HTTP/1.1 200 OK")
+    assert(resp_contains(wire, "sub=user-42"))
+}
+
+// ── Ф.2: require_jwt middleware guard ──────────────────────────────────────
+
+fn guarded_router(now_ms u64) -> Router {
+    ro auth = JwtAuth.new(test_secret())
+    mut r = Router.new()
+    r.layer(require_jwt(auth, fn() -> u64 => now_ms))
+    r.get("/private", handler_fn(|req| ServerResponse.text(200, "in")))!!
+    r
+}
+
+test "require_jwt: valid token passes through to the handler" {
+    ro tok = make_token(test_secret(), "u", 2_000_000.0)
+    ro wire = serve_once(guarded_router(1_500_000_000), get_req_h("/private", "Authorization", "Bearer ${tok}"))
+    assert(status_line(wire) == "HTTP/1.1 200 OK")
+    assert(resp_contains(wire, "in"))
+}
+
+test "require_jwt: no token -> 401 + WWW-Authenticate: Bearer" {
+    ro wire = serve_once(guarded_router(1_500_000_000), get_req("/private"))
+    assert(status_line(wire) == "HTTP/1.1 401 Unauthorized")
+    assert(resp_contains(wire, "www-authenticate: Bearer"))
+}
+
+test "require_jwt: expired token -> 401" {
+    ro tok = make_token(test_secret(), "u", 1_000_000.0)
+    ro wire = serve_once(guarded_router(1_500_000_000), get_req_h("/private", "Authorization", "Bearer ${tok}"))
+    assert(status_line(wire) == "HTTP/1.1 401 Unauthorized")
+}
+
+// ── CookieJar + Set-Cookie round-trip ──────────────────────────────────────
+
+test "CookieJar: request cookies parsed, by-name lookup" {
+    mut r = Router.new()
+    r.get("/jar", handler_fn(|req| {
+        match CookieJar.from_request(req) {
+            Ok(jar) => {
+                ro a = match jar.get("a") { Some(v) => v, None => "?" }
+                ro b = match jar.get("b") { Some(v) => v, None => "?" }
+                ServerResponse.text(200, "n=${jar.len()} a=${a} b=${b}")
+            }
+            Err(e) => e.into_response()
+        }
+    }))!!
+    ro wire = serve_once(r, get_req_h("/jar", "Cookie", "a=1; b=two"))
+    assert(status_line(wire) == "HTTP/1.1 200 OK")
+    assert(resp_contains(wire, "n=2 a=1 b=two"))
+}
+
+test "CookieJar: no Cookie header -> empty jar (not an error)" {
+    mut r = Router.new()
+    r.get("/jar", handler_fn(|req| {
+        match CookieJar.from_request(req) {
+            Ok(jar) => ServerResponse.text(200, "n=${jar.len()}")
+            Err(e)  => e.into_response()
+        }
+    }))!!
+    ro wire = serve_once(r, get_req("/jar"))
+    assert(resp_contains(wire, "n=0"))
+}
+
+test "set_cookie: Set-Cookie header serialized onto the response wire" {
+    mut r = Router.new()
+    r.get("/set", handler_fn(|req| {
+        ro c = SetCookie.parse("sid=xyz; Path=/; Max-Age=60; Secure; HttpOnly; SameSite=Lax")!!
+        mut resp = ServerResponse.text(200, "ok")
+        resp.set_cookie(c)
+        resp
+    }))!!
+    ro wire = serve_once(r, get_req("/set"))
+    assert(status_line(wire) == "HTTP/1.1 200 OK")
+    assert(resp_contains(wire, "set-cookie: sid=xyz"))
+    assert(resp_contains(wire, "Secure"))
+    assert(resp_contains(wire, "HttpOnly"))
+    assert(resp_contains(wire, "SameSite=Lax"))
+}
+
+// ── Ф.3: sessions — store unit tests ───────────────────────────────────────
+
+test "MemorySessionStore: save/load round-trip within TTL" {
+    mut st = MemorySessionStore.new(10_000)     // 10s TTL
+    mut d = SessionData.new()
+    d.set("user", "alice")
+    st.save("s1", d, 1_000)!!
+    match st.load("s1", 5_000)!! {
+        Some(got) => assert(got.get("user") == Some("alice"))
+        None      => assert(false)
+    }
+}
+
+test "MemorySessionStore: expired entry -> None (lazy TTL eviction)" {
+    mut st = MemorySessionStore.new(10_000)
+    st.save("s1", SessionData.new(), 1_000)!!    // expires at 11_000
+    assert(match st.load("s1", 11_000)!! { None => true, Some(_) => false })
+    // and it was evicted, not just hidden: an earlier clock still sees nothing
+    assert(match st.load("s1", 2_000)!! { None => true, Some(_) => false })
+}
+
+test "MemorySessionStore: destroy removes the session" {
+    mut st = MemorySessionStore.new(10_000)
+    st.save("s1", SessionData.new(), 1_000)!!
+    st.destroy("s1")!!
+    assert(match st.load("s1", 2_000)!! { None => true, Some(_) => false })
+}
+
+test "SessionData: set replaces an existing key" {
+    mut d = SessionData.new()
+    d.set("k", "v1")
+    d.set("k", "v2")
+    assert(d.len() == 1)
+    assert(d.get("k") == Some("v2"))
+}
+
+// ── Ф.3: session_layer middleware e2e ──────────────────────────────────────
+
+fn session_router() -> Router {
+    ro store = MemorySessionStore.new(60_000)
+    ro cfg = SessionConfig.new().with_cookie_name("sess")
+    mut r = Router.new()
+    r.layer(session_layer(store, cfg, fn() -> u64 => 1_000, fn() -> str => "gen-1"))
+    r.get("/s", handler_fn(|req| {
+        match req.param("session_id") {
+            Some(sid) => ServerResponse.text(200, "sid=${sid}")
+            None      => ServerResponse.text(200, "sid=?")
+        }
+    }))!!
+    r
+}
+
+test "session_layer: no cookie -> id generated, injected, Set-Cookie with secure defaults" {
+    ro wire = serve_once(session_router(), get_req("/s"))
+    assert(status_line(wire) == "HTTP/1.1 200 OK")
+    assert(resp_contains(wire, "sid=gen-1"))
+    assert(resp_contains(wire, "set-cookie: sess=gen-1"))
+    // plan §4 safe defaults must be on the wire
+    assert(resp_contains(wire, "Secure"))
+    assert(resp_contains(wire, "HttpOnly"))
+    assert(resp_contains(wire, "SameSite=Lax"))
+}
+
+test "session_layer: existing cookie -> its id injected, no new Set-Cookie" {
+    ro wire = serve_once(session_router(), get_req_h("/s", "Cookie", "sess=have-7"))
+    assert(status_line(wire) == "HTTP/1.1 200 OK")
+    assert(resp_contains(wire, "sid=have-7"))
+    assert(!resp_contains(wire, "set-cookie"))
+}

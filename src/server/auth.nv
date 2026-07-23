@@ -62,6 +62,12 @@ import std.encoding.base64.{Base64}
 import std.encoding.json.{JsonValue}
 import std.encoding.serde.{Deserialize, JsonDeserializer}
 import std.runtime.sync.{Mutex, MutexGuard}
+// Not referenced HERE — pulls `time.duration` into this CU so the checker can
+// annotate `Timestamp.now()` inside std jwt.nv's `validate_hs256` (compiled as
+// part of this CU via the `std.crypto.jwt` import above; without this the
+// package build ICEs: emit_c.rs:55932 "[P67-LEGACY] Path call return type
+// unknown for method=now").
+import std.time.duration.{Timestamp}
 
 // ── shared 401 helpers ─────────────────────────────────────────────────────
 
@@ -201,6 +207,12 @@ fn jwt_check_time(claims JsonValue, now_ms u64) -> Result[(), HttpError] {
 /// Turbofish at call sites: `auth.claims_at[MyClaims](req, now_ms)` (the
 /// working `@json_as[T]` shape). Every failure class → 401 `HttpError`
 /// (`IntoResponse` gives the typed reply for free).
+///
+/// `T` MUST opt out of serde's strict-by-default field checking with
+/// `#serde(allow_unknown)`: a JWT payload always carries registered claims
+/// (exp/nbf/iat/iss/... — RFC 7519 §4.1) beyond what `T` declares, so a
+/// strict `T` rejects EVERY real token with `UnknownField` → 401
+/// (verified live in auth_test.nv's claims fixture).
 #stable(since = "0.1")
 export fn JwtAuth @claims_at[T Deserialize](req ServerRequest, now_ms u64) -> Result[JwtClaims[T], HttpError] {
     ro bearer = Bearer.from_request(req)?
@@ -374,16 +386,21 @@ export fn MemorySessionStore mut @load(id str, now_ms u64) -> Result[Option[Sess
         Some(e) => {
             if now_ms >= e.expires_ms {
                 ro _ = @map.remove(id)   // lazy TTL eviction
-                Ok(None)
+                Ok(none_session())
             } else {
                 Ok(Some(e.data))
             }
         }
-        None => Ok(None)
+        None => Ok(none_session())
     }
     g.unlock()
     out
 }
+
+// Bare `None` in the branchy `Ok(None)` positions above monomorphizes to
+// `Option[int]` in emitted C (same defect class cookie.nv works around with
+// `none_cookie_str`/`none_cookie_int`) — a typed helper pins the instantiation.
+fn none_session() -> Option[SessionData] => None
 
 #impl(SessionStore)
 export fn MemorySessionStore mut @save(id str, data SessionData, now_ms u64) -> Result[(), HttpError] {
@@ -436,14 +453,6 @@ export fn SessionConfig @cookie_name() -> str => @cookie_name
 #stable(since = "0.1")
 export fn SessionConfig @ttl_ms() -> u64 => @ttl_ms
 
-// Build the session Set-Cookie per config policy.
-fn session_set_cookie(cfg SessionConfig, sid str) -> SetCookie =>
-    {
-        name: cfg.cookie_name, value: sid, domain: None, path: Some("/"),
-        max_age: Some((cfg.ttl_ms / 1000) as int),
-        secure: cfg.secure, http_only: cfg.http_only, same_site: cfg.same_site,
-    }
-
 // Read the session id off the request's Cookie header (None on absent /
 // malformed header — a malformed Cookie header must not 500 a session lookup).
 fn session_id_of(req ServerRequest, cookie_name str) -> Option[str] {
@@ -453,21 +462,34 @@ fn session_id_of(req ServerRequest, cookie_name str) -> Option[str] {
                 for c in cs {
                     if c.name == cookie_name { return Some(c.value) }
                 }
-                None
+                none_str()
             }
-            Err(_) => None
+            Err(_) => none_str()
         }
-        None => None
+        None => none_str()
     }
 }
 
+// Typed None pins the Option instantiation (same defect class + same shape as
+// `none_cookie_str` in cookie.nv / `none_session` above).
+fn none_str() -> Option[str] => None
+
 // session_layer body — hoisted top-level fn, ONE capture level per closure
 // ([M-16], same shape as jwt_guard_handler above / mark_handler in
-// middleware_test.nv).
-fn session_handler(store MemorySessionStore, cfg SessionConfig, now_fn fn() -> u64,
+// middleware_test.nv). Takes the config UNPACKED into scalars, NOT the
+// `SessionConfig` value: capturing a value-STRUCT param in the closure env
+// emits mismatched value/pointer C (env field declared by value, body emits
+// `*cfg` indirection + ptr-assign — the same live "value/pointer mismatch"
+// family extract_test.nv's banner cites; scalars/str/enum capture cleanly).
+// (params deliberately NOT named after SetCookie fields: a field-SHORTHAND in
+// a record literal inside the closure is missed by closure capture analysis —
+// `use of undeclared identifier` in emitted C; explicit `field: name` with
+// distinct names captures fine.)
+fn session_handler(store MemorySessionStore, cookie_name str, ttl_s int, sec bool,
+                   honly bool, ssite SameSite, now_fn fn() -> u64,
                    id_gen fn() -> str, next Handler) -> Handler =>
     handler_fn(|req| {
-        match session_id_of(req, cfg.cookie_name()) {
+        match session_id_of(req, cookie_name) {
             Some(sid) => {
                 // Existing session cookie: expose the id to the handler via
                 // the params channel (same [](str,str) channel path params use).
@@ -488,7 +510,11 @@ fn session_handler(store MemorySessionStore, cfg SessionConfig, now_fn fn() -> u
                 ps.push(("session_id", sid))
                 r2.params(ps)
                 mut resp = next.handle(r2)
-                resp.set_cookie(session_set_cookie(cfg, sid))
+                ro cookie = SetCookie {
+                    name: cookie_name, value: sid, domain: none_str(), path: Some("/"),
+                    max_age: Some(ttl_s), secure: sec, http_only: honly, same_site: ssite,
+                }
+                resp.set_cookie(cookie)
                 resp
             }
         }
@@ -504,5 +530,13 @@ fn session_handler(store MemorySessionStore, cfg SessionConfig, now_fn fn() -> u
 /// session-id entropy — its strength is the caller's responsibility.
 #stable(since = "0.1")
 export fn session_layer(store MemorySessionStore, cfg SessionConfig, now_fn fn() -> u64,
-                        id_gen fn() -> str) -> Middleware =>
-    Middleware.new(fn(next Handler) -> Handler => session_handler(store, cfg, now_fn, id_gen, next))
+                        id_gen fn() -> str) -> Middleware {
+    // Unpack OUTSIDE the closures (see session_handler note).
+    ro cookie_name = cfg.cookie_name
+    ro ttl_s = (cfg.ttl_ms / 1000) as int
+    ro sec = cfg.secure
+    ro honly = cfg.http_only
+    ro ssite = cfg.same_site
+    Middleware.new(fn(next Handler) -> Handler =>
+        session_handler(store, cookie_name, ttl_s, sec, honly, ssite, now_fn, id_gen, next))
+}
