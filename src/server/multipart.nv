@@ -50,16 +50,20 @@ export type Part value {
 /// The part's `name` (`Content-Disposition: form-data; name="..."`).
 #stable(since = "0.1")
 export fn Part @name() -> str => @name
+
 /// The part's `filename`, if present (`Some` ⇒ this part is a file upload).
 #stable(since = "0.1")
 export fn Part @filename() -> Option[str] => @filename
+
 /// The part's own `Content-Type` header, if present.
 #stable(since = "0.1")
 export fn Part @content_type() -> Option[str] => @content_type
+
 /// The part's raw body bytes (`Content-Transfer-Encoding: base64` already
 /// decoded, plan §4).
 #stable(since = "0.1")
 export fn Part @bytes() -> []u8 => @data
+
 /// The part's body decoded as UTF-8 text. Invalid UTF-8 → typed `Protocol` error.
 #stable(since = "0.1")
 export fn Part @text() -> Result[str, HttpError] {
@@ -130,6 +134,7 @@ export fn MultipartLimits.new() -> MultipartLimits => {
 /// Max number of parts.
 #stable(since = "0.1")
 export fn MultipartLimits @max_parts() -> int => @max_parts
+
 /// Mutating fleeting property (D117 AMEND-2).
 #stable(since = "0.1")
 export fn MultipartLimits mut @max_parts(v int) -> @ { @max_parts = v }
@@ -137,6 +142,7 @@ export fn MultipartLimits mut @max_parts(v int) -> @ { @max_parts = v }
 /// Max bytes for any single part's (decoded) body.
 #stable(since = "0.1")
 export fn MultipartLimits @max_part_size() -> int => @max_part_size
+
 /// Mutating fleeting property (D117 AMEND-2).
 #stable(since = "0.1")
 export fn MultipartLimits mut @max_part_size(v int) -> @ { @max_part_size = v }
@@ -144,6 +150,7 @@ export fn MultipartLimits mut @max_part_size(v int) -> @ { @max_part_size = v }
 /// Max cumulative bytes across all (decoded) part bodies.
 #stable(since = "0.1")
 export fn MultipartLimits @max_total() -> int => @max_total
+
 /// Mutating fleeting property (D117 AMEND-2).
 #stable(since = "0.1")
 export fn MultipartLimits mut @max_total(v int) -> @ { @max_total = v }
