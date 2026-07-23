@@ -12,12 +12,12 @@
 
 module http.server
 
-import http.{SetCookie, SameSite}
+import http.{SetCookie}
 import std.collections.hashmap.{HashMap}
-import std.crypto.jwt.{Jwt, JwtError}
+import std.crypto.jwt.{Jwt}
 import std.encoding.base64.{Base64}
 import std.encoding.json.{JsonValue}
-import std.encoding.serde.{Deserialize}
+
 
 // ── helpers ────────────────────────────────────────────────────────────────
 

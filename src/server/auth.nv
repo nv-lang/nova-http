@@ -55,13 +55,13 @@
 
 module http.server
 
-import http.{HttpError, ErrorKind, StatusCode, Cookie, SetCookie, SameSite}
+import http.{HttpError, StatusCode, Cookie, SetCookie, SameSite}
 import std.collections.hashmap.{HashMap}
 import std.crypto.jwt.{Jwt, JwtError}
 import std.encoding.base64.{Base64}
 import std.encoding.json.{JsonValue}
 import std.encoding.serde.{Deserialize, JsonDeserializer}
-import std.runtime.sync.{Mutex, MutexGuard}
+import std.runtime.sync.{Mutex}
 // Not referenced HERE — pulls `time.duration` into this CU so the checker can
 // annotate `Timestamp.now()` inside std jwt.nv's `validate_hs256` (compiled as
 // part of this CU via the `std.crypto.jwt` import above; without this the
