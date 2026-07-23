@@ -164,6 +164,25 @@ Two mandatory steps, in order:
    4019173).
 2. **`nova test src`** — the full test suite over the C-codegen pipeline.
 
+## Testing handlers without sockets
+
+A handler is just a function — no socket required. Nova's architecture lets
+you test `Handler` behavior directly by invoking `dispatch` in a test, passing
+a synthetic request. Unlike frameworks that require mock transports or
+heavyweight `TestClient` stubs (FastAPI, for example, markets its `TestClient`
+as an optional external tool), this pattern is built in: request dispatch is
+a pure function call. To test a route's behavior without binding ports, call
+`serve_once()` with a router and raw HTTP bytes — you get back the full wire
+response, parse it inline.
+
+```nova
+mut r = Router.new()
+r.get("/hello", fn(req ServerRequest) -> ServerResponse => 
+    ServerResponse.text(200, "hello"))!!
+ro wire = serve_once(r, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n".bytes())
+assert(status_line(wire) == "HTTP/1.1 200 OK")
+```
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
