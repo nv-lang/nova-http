@@ -488,15 +488,15 @@ export fn Router @dispatch(req ServerRequest) -> ServerResponse {
             rq.params(m.params)
             ro reqm = rq.method().str()
             match m.methods.find_handler(reqm) {
-                Some(h) => h.handle(rq)
+                Some(h) => h(rq)
                 None => match m.methods.fallback() {
-                    Some(h) => h.handle(rq)
+                    Some(h) => h(rq)
                     None    => method_not_allowed(m.methods.allowed_methods())
                 }
             }
         }
         None => match @fallback {
-            Some(h) => h.handle(rq)
+            Some(h) => h(rq)
             None    => ServerResponse.text(404, "404 page not found")
         }
     }

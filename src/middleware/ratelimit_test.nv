@@ -7,7 +7,7 @@
 module middleware.ratelimit_test
 
 import http.middleware.ratelimit.{RateLimit, ratelimit}
-import http.server.{Router, route_once, handler_fn, ServerResponse}
+import http.server.{Router, route_once, ServerResponse}
 import std.testing.handlers as th
 
 fn req_from(ip str) -> []u8 {
@@ -29,7 +29,7 @@ fn hdr(resp ServerResponse, name str) -> str {
 fn routed(cfg RateLimit) Time -> Router {
     mut r = Router.new()
     r.layer(ratelimit(cfg))
-    r.get("/x", handler_fn(|_req| ServerResponse.text(200, "ok")))!!
+    r.get("/x", fn(_req ServerRequest) -> ServerResponse => ServerResponse.text(200, "ok"))!!
     r
 }
 
@@ -84,8 +84,8 @@ test "ratelimit: one shared table covers all routes of the router" {
     with Time = th.fixed_ms(0) {
         mut r = Router.new()
         r.layer(ratelimit(RateLimit.new(2, 1.0)))
-        r.get("/a", handler_fn(|_req| ServerResponse.text(200, "a")))!!
-        r.get("/b", handler_fn(|_req| ServerResponse.text(200, "b")))!!
+        r.get("/a", fn(_req ServerRequest) -> ServerResponse => ServerResponse.text(200, "a"))!!
+        r.get("/b", fn(_req ServerRequest) -> ServerResponse => ServerResponse.text(200, "b"))!!
         assert(route_once(r, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n".bytes()).status_code() == 200)
         assert(route_once(r, "GET /b HTTP/1.1\r\nHost: x\r\n\r\n".bytes()).status_code() == 200)
         assert(route_once(r, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n".bytes()).status_code() == 429)

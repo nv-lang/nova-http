@@ -121,7 +121,7 @@ test "MultipartLimits: conservative defaults (256 parts / 8 MiB part / 32 MiB to
 
 test "Multipart.from_request: decodes a real multipart/form-data POST body" {
     mut r = Router.new()
-    r.post("/upload", handler_fn(|req| {
+    r.post("/upload", fn(req ServerRequest) -> ServerResponse {
         match Multipart.from_request(req) {
             Ok(mp) => {
                 ro title = mp.field("title")!!
@@ -130,7 +130,7 @@ test "Multipart.from_request: decodes a real multipart/form-data POST body" {
             }
             Err(e) => e.into_response()
         }
-    }))!!
+    })!!
     ro wire = serve_once(r, post_multipart_req("/upload", "XBOUNDARY", two_part_body("XBOUNDARY")))
     ro s = unsafe { wire.to_str_unchecked() }
     assert(s.contains("title=Hello World file=a.txt"))
@@ -138,12 +138,12 @@ test "Multipart.from_request: decodes a real multipart/form-data POST body" {
 
 test "Multipart.from_request: non-multipart Content-Type -> typed Protocol error (400)" {
     mut r = Router.new()
-    r.post("/upload", handler_fn(|req| {
+    r.post("/upload", fn(req ServerRequest) -> ServerResponse {
         match Multipart.from_request(req) {
             Ok(_)  => ServerResponse.text(200, "unexpected-ok")
             Err(e) => e.into_response()
         }
-    }))!!
+    })!!
     ro wire = serve_once(r, "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello".bytes())
     ro s = unsafe { wire.to_str_unchecked() }
     assert(s.contains("HTTP/1.1 400"))
@@ -151,12 +151,12 @@ test "Multipart.from_request: non-multipart Content-Type -> typed Protocol error
 
 test "Multipart.from_request: multipart Content-Type without boundary -> typed Protocol error (400)" {
     mut r = Router.new()
-    r.post("/upload", handler_fn(|req| {
+    r.post("/upload", fn(req ServerRequest) -> ServerResponse {
         match Multipart.from_request(req) {
             Ok(_)  => ServerResponse.text(200, "unexpected-ok")
             Err(e) => e.into_response()
         }
-    }))!!
+    })!!
     ro wire = serve_once(r, "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data\r\nContent-Length: 0\r\n\r\n".bytes())
     ro s = unsafe { wire.to_str_unchecked() }
     assert(s.contains("HTTP/1.1 400"))

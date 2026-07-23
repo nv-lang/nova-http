@@ -6,7 +6,7 @@
 module middleware.compress_test
 
 import http.middleware.compress.{Compression, compression}
-import http.server.{Router, route_once, handler_fn, ServerResponse, StreamBody}
+import http.server.{Router, route_once, ServerResponse, StreamBody}
 import compress.{gzip_decode, CompressLevel}
 
 // ~2600 bytes of highly-compressible text (above the 1024 default threshold).
@@ -44,7 +44,7 @@ fn routed_resp(cfg Compression, resp ServerResponse) -> Router {
     mut r = Router.new()
     r.layer(compression(cfg))
     ro rr = resp
-    r.get("/x", handler_fn(|_req| rr))!!
+    r.get("/x", fn(_req ServerRequest) -> ServerResponse => rr)!!
     r
 }
 

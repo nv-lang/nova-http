@@ -7,7 +7,7 @@
 module middleware.cors_test
 
 import http.middleware.cors.{Cors, cors}
-import http.server.{Router, route_once, handler_fn, ServerResponse}
+import http.server.{Router, route_once, ServerResponse}
 
 // Raw HTTP/1.1 request with extra headers (peer of router_test.nv's get_req,
 // which this module cannot see — different module).
@@ -33,7 +33,7 @@ fn hdr(resp ServerResponse, name str) -> str {
 fn routed(c Cors) -> Router {
     mut r = Router.new()
     r.layer(cors(c))
-    r.get("/x", handler_fn(|_req| ServerResponse.text(200, "ok")))!!
+    r.get("/x", fn(_req ServerRequest) -> ServerResponse => ServerResponse.text(200, "ok"))!!
     r
 }
 

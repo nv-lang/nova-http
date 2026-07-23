@@ -24,7 +24,7 @@
 
 module http.static
 
-import http.server.{Handler, handler_fn, ServerRequest, ServerResponse}
+import http.server.{Handler, ServerRequest, ServerResponse}
 import std.fs.{ReadFs}
 import std.io.{IoError, ErrorKind}
 
@@ -49,9 +49,10 @@ export fn Static mut @index(name str) -> @ { @index = name }
 export fn Static mut @cache_control(v str) -> @ { @cache_control = v }
 
 /// Serve `path` (relative, POSIX `/`) from `fs` for `req` — the core
-/// request→response function; wire it with `handler_fn(|req| ...)` (or use
-/// `static_handler` below). Pure for `EmbeddedDir`; carries `Fs` (ambient
-/// default) when mono'd against `DirFs`.
+/// request→response function; wire it with a closure-full handler
+/// (`fn(req ServerRequest) -> ServerResponse => serve_path(...)`, auto-lifts
+/// into `Handler`) or use `static_handler` below. Pure for `EmbeddedDir`;
+/// carries `Fs` (ambient default) when mono'd against `DirFs`.
 #stable(since = "0.1")
 export fn serve_path[F ReadFs](fs F, cfg Static, path str, req ServerRequest) -> ServerResponse {
     ro rel0 = if path.starts_with("/") { path[1..path.byte_len()] } else { path }
@@ -72,10 +73,11 @@ export fn serve_path[F ReadFs](fs F, cfg Static, path str, req ServerRequest) ->
 #stable(since = "0.1")
 export fn static_handler[F ReadFs](fs F, cfg Static, param str) -> Handler {
     // Param → local copies before capture ([M-16]-family, cors.nv precedent).
+    // Closure-full + auto-lift into `Handler` in return position (D55).
     ro f = fs
     ro c = cfg
     ro p = param
-    handler_fn(|req| serve_path(f, c, req.param(p) ?? "", req))
+    fn(req ServerRequest) -> ServerResponse => serve_path(f, c, req.param(p) ?? "", req)
 }
 
 // ── internals ───────────────────────────────────────────────────────────────

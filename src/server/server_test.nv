@@ -43,10 +43,10 @@ test "ServerResponse.header(): repeated call on the SAME mut binding accumulates
 
 test "Router dispatch: path params attach via mutating @params" {
     mut router = Router.new()
-    router.get("/users/{id}", handler_fn(|req| {
+    router.get("/users/{id}", fn(req ServerRequest) -> ServerResponse {
         ro uid = req.param("id") ?? "?"
         ServerResponse.text(200, "user ${uid}")
-    }))!!
+    })!!
     ro req = "GET /users/77 HTTP/1.1\r\nHost: x\r\n\r\n".bytes()
     ro wire []u8 = serve_once(router, req)
     ro s = unsafe { wire.to_str_unchecked() }

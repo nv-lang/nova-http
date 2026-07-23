@@ -25,19 +25,19 @@
 module rt.background_tasks_smoke
 
 import std.net.{TcpListener, TcpStream, SocketAddr, real_net}
-import ../../server.{Router, ServerResponse, handler_fn, BackgroundTasks}
+import ../../server.{Router, ServerResponse, BackgroundTasks}
 import ../../servernet.{handle_connection}
 
 fn routes(ran_tx ChanWriter[bool]) -> Router {
     mut r = Router.new()
-    r.get("/notify", handler_fn(|req| {
+    r.get("/notify", fn(req ServerRequest) -> ServerResponse {
         ro tx = ran_tx
         mut bg = BackgroundTasks.new()
         bg.add(|| { tx.try_send(true) })
         mut resp = ServerResponse.text(200, "queued")
         resp.background(bg)
         resp
-    }))!!
+    })!!
     r
 }
 

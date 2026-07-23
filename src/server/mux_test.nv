@@ -11,15 +11,15 @@ module http.server
 // Build a small router used across the cases.
 fn routes() -> Router {
     mut r = Router.new()
-    r.get("/health", handler_fn(|req| ServerResponse.text(200, "ok")))!!
-    r.get("/users/{id}", handler_fn(|req| {
+    r.get("/health", fn(req ServerRequest) -> ServerResponse => ServerResponse.text(200, "ok"))!!
+    r.get("/users/{id}", fn(req ServerRequest) -> ServerResponse {
         ro uid = req.param("id") ?? "?"
         ServerResponse.text(200, "user ${uid}")
-    }))!!
-    r.post("/echo", handler_fn(|req| {
+    })!!
+    r.post("/echo", fn(req ServerRequest) -> ServerResponse {
         ServerResponse.bytes(200, "application/octet-stream", req.body_bytes())
-    }))!!
-    r.fallback(handler_fn(|req| ServerResponse.text(404, "nope")))
+    })!!
+    r.fallback(fn(req ServerRequest) -> ServerResponse => ServerResponse.text(404, "nope"))
     r
 }
 

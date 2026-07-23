@@ -50,8 +50,9 @@ import std.encoding.serde.{Deserialize, DeError, JsonDeserializer}
 // nova main `ca8026cf0`): the arg-type/closure-return inference block that
 // produces this error runs against `fn_decl` — codegen's OWN overload
 // pick for the call site — which here diverges from the checker's (correct)
-// pick: an EXISTING call passing a `Handler` VALUE (built via
-// `handler_fn(|req| ...)`, itself a `Call` expr, not a bare closure) gets
+// pick: an EXISTING call passing a `Handler` VALUE (built, pre-newtype-
+// migration, via the then-extant `handler_fn(|req| ...)` constructor — a
+// `Call` expr, not a bare closure) gets
 // matched against the NEW `fn() -> R` overload's `TypeRef::Func` shape by
 // this codegen block, whose own closure-detection
 // (`ExprKind::ClosureLight` match at emit_c.rs:39624) only handles the arg

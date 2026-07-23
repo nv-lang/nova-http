@@ -12,8 +12,12 @@
 //
 // CORE scope (plaintext HTTP/1.1): in-memory request body (buffered by the conn
 // driver), Content-Length framing, `Handler` returns a value `ServerResponse`.
-// Handler is a concrete closure newtype (`Handler.of(f)`), the Go-`HandlerFunc`
-// form the plan names as the fallback for `impl Handler` (Q27).
+// Handler is a newtype over the fn type (`type Handler fn(ServerRequest) ->
+// ServerResponse`, D52/D55 ОКНО-5 2026-07-23): a bare fn/closure auto-lifts
+// into it at any Handler-expecting position, and a Handler VALUE is called
+// directly (`h(req)`) — Go `http.HandlerFunc` shape. The former `handler_fn`
+// constructor and `@handle` method were removed with the newtype-over-fn
+// migration (222.3 §5а, owner decision 2026-07-23).
 //
 // Streaming RESPONSE bodies (`[M-178-server-streaming]`, Plan 178 followup) —
 // DONE (Plan 116/M-178-server-streaming force-impl): `StreamBody`/`stream_body`
@@ -351,21 +355,20 @@ export fn ServerResponse mut @body(data []u8) -> @ {
 #stable(since = "0.1")
 export fn ServerResponse @status_code() -> int => @status
 
-// ── Handler (concrete closure newtype — Go HandlerFunc, Q27 fallback) ─────────
+// ── Handler (newtype over the fn type — Go HandlerFunc, D52/D55) ──────────────
 
-/// A request handler: a function `ServerRequest -> ServerResponse`. CORE uses this
-/// concrete closure newtype (the plan's `impl Handler` fallback) so handlers store
-/// in `ServeMux` routes without existential boxing.
+/// A request handler: a newtype over `fn(ServerRequest) -> ServerResponse`
+/// (D52 form). A bare function or closure auto-lifts into `Handler` wherever
+/// one is expected (D55 obvious single-wrapper coercion) — registration reads
+/// `r.get("/x", fn(req ServerRequest) -> ServerResponse { ... })`, no wrapper
+/// call. A `Handler` value is invoked DIRECTLY: `h(req)` (call-through; the
+/// one meaningful operation over a function forwards, Go `http.HandlerFunc`
+/// precedent — 222.3 §5а). NB (probed 2026-07-23): closure-light `|req| ...`
+/// against a newtype-over-fn expectation mis-codegens its param as `nova_int`
+/// — spell handlers closure-FULL (`fn(req ServerRequest) -> ServerResponse`),
+/// same known limitation middleware_test.nv documents for bare fn-types.
 #stable(since = "0.1")
-export type Handler value { priv f fn(ServerRequest) -> ServerResponse }
-
-/// Wrap a closure as a `Handler`.
-#stable(since = "0.1")
-export fn handler_fn(f fn(ServerRequest) -> ServerResponse) -> Handler => { f }
-
-/// Invoke the handler.
-#stable(since = "0.1")
-export fn Handler @handle(req ServerRequest) -> ServerResponse => (@f)(req)
+export type Handler fn(ServerRequest) -> ServerResponse
 
 // ── serve_once: the pure request→response driver (mock-testable, no sockets) ──
 //
