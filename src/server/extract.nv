@@ -1,0 +1,329 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: extract.nv — `FromRequest` protocol + typed extractors (Plan
+// 222.3, `polaris.extract`). Peer of `server.nv`/`server_router.nv`/
+// `respond.nv` in the SAME module (`http.server`) — folder-module peers
+// compile in sorted order (D78); this file's name sorts AFTER all three
+// (`extract` > `respond`, `> server`, `> server_router`) so `Router`
+// (server_router.nv, needed by the arity-overload registrations below) and
+// `IntoResponse`/`Json[T]` (respond.nv, needed because `Json[T]` gets its
+// `FromRequest` impl HERE) are both already declared — same ordering
+// discipline `server_router.nv`'s own banner documents, though (per that
+// banner's own distinction) the hazard it warns about is specifically
+// struct-EMBEDDING by value forcing C-struct completeness; nothing declared
+// here embeds `Router`/`ServerRequest` by value inside a NEW struct (`Path`/
+// `Query`/`Bytes`/`Text`/`Headers` all wrap a value/generic `T`), so this
+// ordering is precautionary consistency, not a hard requirement verified
+// against a real forward-decl failure.
+//
+// Extractors reuse serde AS THE DESERIALIZE ENGINE (plan §4, "0 lines of
+// Rust") — `ParamsDeserializer`/`QueryDeserializer` are new `Deserializer`
+// SOURCES over `[](str, str)` (path params) / a raw query string, driving
+// the SAME compiler-synthesized `T.deserialize(d)` that JSON bodies use
+// (`JsonDeserializer`, std/encoding/serde/json.nv — same protocol, different
+// backend). Real serde API (serde.nv:124-165, verified not guessed):
+// `@enter_field(key) -> Result[Self, DeError]` navigates BY NAME,
+// `@deser_int()`/`@deser_str()`/… reads BY TYPE at the current cursor.
+
+module http.server
+
+import http.{HttpError, HeaderMap}
+import std.encoding.json.{JsonValue}
+import std.encoding.serde.{Deserialize, DeError, JsonDeserializer}
+
+// ── FromRequest protocol ───────────────────────────────────────────────────
+
+/// Extract a typed value from a request. ALWAYS synchronous — unlike Axum's
+/// `async fn from_request`, the body is already buffered
+/// (`ServerRequest.body_bytes()`), so there is no await point here (plan §1).
+#stable(since = "0.1")
+export type FromRequest protocol {
+    .from_request(req ServerRequest) -> Result[Self, HttpError]
+}
+
+// ── Extractor wrapper types (value-record, single field + property accessor —
+// `Json[T]` lives in respond.nv, gets its `FromRequest` impl below) ────────
+
+/// `{name}` path-parameter(s), decoded into `T` (`#impl(Deserialize)`).
+/// NOT `value` — [M-generic-value-self-protocol-wrapper-mono], see the note
+/// on `Json[T]` in respond.nv (same root cause, same fix).
+#stable(since = "0.1")
+export type Path[T] { priv data T }
+/// The decoded value (property accessor, D117 — not a bare field).
+#stable(since = "0.1")
+export fn Path[T] @data() -> T => @data
+
+/// `?a=1&b=2` query-string, decoded into `T` (`#impl(Deserialize)`).
+/// NOT `value` — [M-generic-value-self-protocol-wrapper-mono], see the note
+/// on `Json[T]` in respond.nv (same root cause, same fix).
+#stable(since = "0.1")
+export type Query[T] { priv data T }
+/// The decoded value (property accessor, D117 — not a bare field).
+#stable(since = "0.1")
+export fn Query[T] @data() -> T => @data
+
+/// The raw request body, unparsed.
+#stable(since = "0.1")
+export type Bytes value { priv data []u8 }
+/// The raw bytes (property accessor, D117 — not a bare field).
+#stable(since = "0.1")
+export fn Bytes @data() -> []u8 => @data
+
+/// The request body as UTF-8 text.
+#stable(since = "0.1")
+export type Text value { priv data str }
+/// The decoded text (property accessor, D117 — not a bare field).
+#stable(since = "0.1")
+export fn Text @data() -> str => @data
+
+/// The request's headers.
+#stable(since = "0.1")
+export type Headers value { priv data HeaderMap }
+/// The header map (property accessor, D117 — not a bare field).
+#stable(since = "0.1")
+export fn Headers @data() -> HeaderMap => @data
+
+// ── flat key/value Deserializer engine (shared by Params/QueryDeserializer —
+// both are the SAME "flat string pairs + one scalar cursor" shape, only how
+// `pairs` gets built differs: raw `[](str,str)` for path params vs percent-
+// decoded query-string split for query) ───────────────────────────────────
+
+fn flat_find(pairs [](str, str), key str) -> Option[str] {
+    for (k, v) in pairs {
+        if k == key { return Some(v) }
+    }
+    None
+}
+
+// A scalar read (`deser_int`/`deser_str`/…) with NO cursor set means `T`
+// itself is a bare scalar (not a record) — e.g. `Path[int]` with no named
+// field to enter first. NOT supported (documented simplification, plan §4
+// scope is record-shaped `T`; a bare-scalar single dynamic path segment would
+// need positional, not by-name, binding — different design question, out of
+// Ф.1-Ф.4 scope): surfaces as a clear `DeError`, not a silent wrong value.
+fn flat_need_cur(cur Option[str]) -> Result[str, DeError] {
+    match cur {
+        Some(s) => Ok(s)
+        None    => Err(DeError.new(Custom("scalar deserialize requires entering a named field first (bare-scalar Path[T]/Query[T] over multiple params is not supported — use a record)")))
+    }
+}
+
+fn flat_deser_bool(cur Option[str]) -> Result[bool, DeError] {
+    ro s = flat_need_cur(cur)?
+    match s {
+        "true"  => Ok(true)
+        "false" => Ok(false)
+        _       => Err(DeError.unexpected("bool", "str"))
+    }
+}
+fn flat_deser_int(cur Option[str]) -> Result[int, DeError] {
+    ro s = flat_need_cur(cur)?
+    match s.to_int() {
+        Ok(n)  => Ok(n)
+        Err(_) => Err(DeError.unexpected("int", "str"))
+    }
+}
+fn flat_deser_uint(cur Option[str]) -> Result[u64, DeError] {
+    ro s = flat_need_cur(cur)?
+    match s.to_u64() {
+        Ok(n)  => Ok(n)
+        Err(_) => Err(DeError.unexpected("uint", "str"))
+    }
+}
+fn flat_deser_float(cur Option[str]) -> Result[f64, DeError] {
+    ro s = flat_need_cur(cur)?
+    match s.to_f64() {
+        Ok(n)  => Ok(n)
+        Err(_) => Err(DeError.unexpected("float", "str"))
+    }
+}
+
+// ── ParamsDeserializer — over `[](str, str)` (Router path-params) ─────────
+
+/// Flat `Deserializer` source over path-params (`ServerRequest.params()`).
+#stable(since = "0.1")
+export type ParamsDeserializer value { priv pairs [](str, str), priv cur Option[str] }
+
+/// Start at the root (no scalar entered yet — call `@enter_field` first).
+#stable(since = "0.1")
+export fn ParamsDeserializer.at(pairs [](str, str)) -> ParamsDeserializer => { pairs, cur: None }
+
+#stable(since = "0.1")
+export fn ParamsDeserializer mut @deser_bool()  -> Result[bool, DeError]  => flat_deser_bool(@cur)
+#stable(since = "0.1")
+export fn ParamsDeserializer mut @deser_int()   -> Result[int, DeError]   => flat_deser_int(@cur)
+#stable(since = "0.1")
+export fn ParamsDeserializer mut @deser_uint()  -> Result[u64, DeError]   => flat_deser_uint(@cur)
+#stable(since = "0.1")
+export fn ParamsDeserializer mut @deser_float() -> Result[f64, DeError]   => flat_deser_float(@cur)
+#stable(since = "0.1")
+export fn ParamsDeserializer mut @deser_str()   -> Result[str, DeError]  => flat_need_cur(@cur)
+#stable(since = "0.1")
+export fn ParamsDeserializer mut @deser_bytes() -> Result[[]u8, DeError] {
+    ro s = flat_need_cur(@cur)?
+    Ok(s.bytes())
+}
+#stable(since = "0.1")
+export fn ParamsDeserializer mut @is_null() -> Result[bool, DeError] => Ok(@cur.is_none())
+#stable(since = "0.1")
+export fn ParamsDeserializer mut @is_str()  -> Result[bool, DeError] => Ok(true)
+
+#stable(since = "0.1")
+export fn ParamsDeserializer mut @enter_field(key str) -> Result[ParamsDeserializer, DeError] {
+    match flat_find(@pairs, key) {
+        Some(v) => Ok({ @pairs, cur: Some(v) })
+        None    => Err(DeError.new(MissingField(key)))
+    }
+}
+#stable(since = "0.1")
+export fn ParamsDeserializer mut @enter_field_or_null(key str) -> Result[ParamsDeserializer, DeError] =>
+    Ok({ @pairs, cur: flat_find(@pairs, key) })
+#stable(since = "0.1")
+export fn ParamsDeserializer mut @has_field(key str) -> Result[bool, DeError] =>
+    Ok(match flat_find(@pairs, key) { Some(_) => true, None => false })
+
+// seq/map access — a flat cursor has no real nested structure; a present
+// scalar counts as a length-1 "sequence" (best-effort, not full repeated-key
+// support — documented simplification, not required by plan Ф.1-Ф.4).
+#stable(since = "0.1")
+export fn ParamsDeserializer mut @seq_len() -> Result[int, DeError] =>
+    Ok(match @cur { Some(_) => 1, None => 0 })
+#stable(since = "0.1")
+export fn ParamsDeserializer mut @enter_index(i int) -> Result[ParamsDeserializer, DeError] {
+    if i == 0 && @cur.is_some() { Ok(@) } else { Err(DeError.new(Other("sequence index out of range"))) }
+}
+#stable(since = "0.1")
+export fn ParamsDeserializer mut @map_keys() -> Result[[]str, DeError] {
+    mut out []str = []str.new()
+    for (k, _) in @pairs { out.push(k) }
+    Ok(out)
+}
+#stable(since = "0.1")
+export fn ParamsDeserializer mut @enter_key(key str) -> Result[ParamsDeserializer, DeError] => @enter_field(key)
+
+// ── QueryDeserializer — over a raw query string (percent-decode + '&'/'=' split,
+// reusing `parse_query` already defined in server.nv, SAME module) ────────
+
+/// Flat `Deserializer` source over `?a=1&b=2` (`ServerRequest.query()`).
+#stable(since = "0.1")
+export type QueryDeserializer value { priv pairs [](str, str), priv cur Option[str] }
+
+/// Start at the root (no scalar entered yet — call `@enter_field` first).
+#stable(since = "0.1")
+export fn QueryDeserializer.at(query str) -> QueryDeserializer => { pairs: parse_query(query), cur: None }
+
+#stable(since = "0.1")
+export fn QueryDeserializer mut @deser_bool()  -> Result[bool, DeError]  => flat_deser_bool(@cur)
+#stable(since = "0.1")
+export fn QueryDeserializer mut @deser_int()   -> Result[int, DeError]   => flat_deser_int(@cur)
+#stable(since = "0.1")
+export fn QueryDeserializer mut @deser_uint()  -> Result[u64, DeError]   => flat_deser_uint(@cur)
+#stable(since = "0.1")
+export fn QueryDeserializer mut @deser_float() -> Result[f64, DeError]   => flat_deser_float(@cur)
+#stable(since = "0.1")
+export fn QueryDeserializer mut @deser_str()   -> Result[str, DeError]  => flat_need_cur(@cur)
+#stable(since = "0.1")
+export fn QueryDeserializer mut @deser_bytes() -> Result[[]u8, DeError] {
+    ro s = flat_need_cur(@cur)?
+    Ok(s.bytes())
+}
+#stable(since = "0.1")
+export fn QueryDeserializer mut @is_null() -> Result[bool, DeError] => Ok(@cur.is_none())
+#stable(since = "0.1")
+export fn QueryDeserializer mut @is_str()  -> Result[bool, DeError] => Ok(true)
+
+#stable(since = "0.1")
+export fn QueryDeserializer mut @enter_field(key str) -> Result[QueryDeserializer, DeError] {
+    match flat_find(@pairs, key) {
+        Some(v) => Ok({ @pairs, cur: Some(v) })
+        None    => Err(DeError.new(MissingField(key)))
+    }
+}
+#stable(since = "0.1")
+export fn QueryDeserializer mut @enter_field_or_null(key str) -> Result[QueryDeserializer, DeError] =>
+    Ok({ @pairs, cur: flat_find(@pairs, key) })
+#stable(since = "0.1")
+export fn QueryDeserializer mut @has_field(key str) -> Result[bool, DeError] =>
+    Ok(match flat_find(@pairs, key) { Some(_) => true, None => false })
+
+#stable(since = "0.1")
+export fn QueryDeserializer mut @seq_len() -> Result[int, DeError] =>
+    Ok(match @cur { Some(_) => 1, None => 0 })
+#stable(since = "0.1")
+export fn QueryDeserializer mut @enter_index(i int) -> Result[QueryDeserializer, DeError] {
+    if i == 0 && @cur.is_some() { Ok(@) } else { Err(DeError.new(Other("sequence index out of range"))) }
+}
+#stable(since = "0.1")
+export fn QueryDeserializer mut @map_keys() -> Result[[]str, DeError] {
+    mut out []str = []str.new()
+    for (k, _) in @pairs { out.push(k) }
+    Ok(out)
+}
+#stable(since = "0.1")
+export fn QueryDeserializer mut @enter_key(key str) -> Result[QueryDeserializer, DeError] => @enter_field(key)
+
+// ── FromRequest impls ──────────────────────────────────────────────────────
+
+/// `Json[T]` — decode the whole body as JSON. INLINED (mirrors
+/// `json_decode_bytes[T]`'s own body, std/encoding/serde/json.nv) rather than
+/// delegating to that free function: forwarding a bounded `[T Deserialize]`
+/// param from ONE generic fn straight into ANOTHER generic fn with the same
+/// bound is a known checker limitation ([M-176-io-forward-bounded-generic],
+/// already documented + worked around the SAME way by
+/// `http.serdejson.Response consume @json_as[T]()`). Uses `JsonValue.try_from`
+/// (not the namespace-static `Json.parse`) to avoid a name CLASH with this
+/// module's own `Json[T]` extractor/response type sharing the bare name `Json`.
+#impl(FromRequest)
+export fn Json[T Deserialize].from_request(req ServerRequest) -> Result[Json[T], HttpError] {
+    match req.body_bytes().to_str() {
+        Ok(s) => match JsonValue.try_from(s) {
+            Ok(v) => {
+                mut d = JsonDeserializer.at(v, 0, 128)
+                match T.deserialize(d) {
+                    Ok(x)  => Ok(json(x))
+                    Err(e) => Err(HttpError.decode_error(e.to_str()))
+                }
+            }
+            Err(_) => Err(HttpError.decode_error("invalid JSON syntax"))
+        }
+        Err(_) => Err(HttpError.decode_error("request body is not valid UTF-8"))
+    }
+}
+
+/// `Path[T]` — decode the matched `{name}` path params into `T`.
+#impl(FromRequest)
+export fn Path[T Deserialize].from_request(req ServerRequest) -> Result[Path[T], HttpError] {
+    mut d = ParamsDeserializer.at(req.params)
+    match T.deserialize(d) {
+        Ok(v)  => Ok(Path{ data: v })
+        Err(e) => Err(HttpError.decode_error(e.to_str()))
+    }
+}
+
+/// `Query[T]` — decode the `?...` query string into `T`.
+#impl(FromRequest)
+export fn Query[T Deserialize].from_request(req ServerRequest) -> Result[Query[T], HttpError] {
+    mut d = QueryDeserializer.at(req.query)
+    match T.deserialize(d) {
+        Ok(v)  => Ok(Query{ data: v })
+        Err(e) => Err(HttpError.decode_error(e.to_str()))
+    }
+}
+
+/// `Bytes` — the raw body, no decode at all (never fails).
+#impl(FromRequest)
+export fn Bytes.from_request(req ServerRequest) -> Result[Bytes, HttpError] =>
+    Ok(Bytes{ data: req.body_bytes() })
+
+/// `Text` — the body as UTF-8 (fails on invalid UTF-8).
+#impl(FromRequest)
+export fn Text.from_request(req ServerRequest) -> Result[Text, HttpError] {
+    match req.body_bytes().to_str() {
+        Ok(s)  => Ok(Text{ data: s })
+        Err(_) => Err(HttpError.protocol_error("request body is not valid UTF-8"))
+    }
+}
+
+/// `Headers` — the request's header map (never fails).
+#impl(FromRequest)
+export fn Headers.from_request(req ServerRequest) -> Result[Headers, HttpError] =>
+    Ok(Headers{ data: req.headers })

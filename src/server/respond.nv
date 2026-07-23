@@ -88,8 +88,30 @@ export fn ServerResponse.redirect(status StatusCode, location str) -> ServerResp
 
 /// A JSON request/response body wrapper — `json(v).into_response()` on
 /// the way out, `Json[T].from_request(req)` (extract.nv) on the way in.
+///
+/// NOT `value` (deviates from plan §2's literal `Json[T] value {...}`) —
+/// [M-generic-value-self-protocol-wrapper-mono] (found this wave, minimal
+/// repro below): a GENERIC `value`-kind type conforming to a protocol whose
+/// method has NO method-level generic param and returns `Result[Self, E]` (or
+/// `Option[Self]`) makes the forward-decl pass emit an invalid C struct
+/// instantiated on the BARE typevar name itself (`NovaValue_Json____Nova_T_p`
+/// — literal "T", never substituted) alongside the correctly-monomorphized
+/// concrete ones — `unknown type name`, CC-FAIL. Reproduces with a 12-line
+/// minimal case unrelated to Json/HttpError (`type Wrap[T] value {...}` +
+/// `type P protocol { .m(x int) -> Result[Self, E] }` + `fn Wrap[T
+/// Equal].m(...) -> Result[Wrap[T], E]`); reproduces with `Option[Self]` too
+/// (not Result-specific). Two workarounds confirmed: (a) give the protocol
+/// method its OWN method-level generic param (`.m[D](...)`, mirrors
+/// `Deserialize.deserialize[D Deserializer]`'s shape — but that changes
+/// `FromRequest`'s signature, not authorized by the plan); (b) drop `value`
+/// (this type becomes a normal heap/GC'd reference type — the one applied
+/// here, smallest surface change, no protocol-signature deviation). Does NOT
+/// affect NON-generic conformers (`Bytes`/`Text`/`Headers` in extract.nv stay
+/// `value` — confirmed unaffected). Report to integrator for
+/// `docs/plans/backlog-followups.md` registration + plan 222.3/222.5
+/// §2-amendment (this worktree does not touch the nova repo).
 #stable(since = "0.1")
-export type Json[T] value { priv data T }
+export type Json[T] { priv data T }
 
 /// The wrapped value (property accessor, D117 — not a bare field).
 #stable(since = "0.1")
