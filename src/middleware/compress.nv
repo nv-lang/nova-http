@@ -80,7 +80,11 @@ fn compress_apply(cfg Compression, next Handler, req ServerRequest) -> ServerRes
     match gzip_encode(resp.body, cfg.level) {
         Ok(gz) => {
             if gz.len() >= resp.body.len() { return resp }   // not worth it
-            mut out = resp.with_body(gz)
+            // [M-fluent-value-init-local-deref] (221.1 №36): init mut-локали из
+            // fluent-сеттера на value-типе — пятый непокрытый deref-сайт семьи
+            // №9/№10; statement-форма до фикса:
+            mut out = resp
+            out.body(gz)
             out.header("Content-Encoding", "gzip")
             out
         }
