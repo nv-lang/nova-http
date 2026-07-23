@@ -34,7 +34,7 @@ export type Message enum
     | Ping([]u8)
     | Pong([]u8)
 
-fn default_max_message_size() -> int => 16 * 1024 * 1024 // 16 MiB — конс. дефолт (plan §4)
+const DEFAULT_MAX_MESSAGE_SIZE int = 16 * 1024 * 1024 // 16 MiB — конс. дефолт (plan §4)
 
 /// A live WebSocket connection (server-side). MUST-CONSUME — `@close()` is
 /// the only way to discharge it (D133).
@@ -49,7 +49,7 @@ export type WebSocket consume {
 /// Wrap an already-upgraded `TcpStream` (default 16 MiB message limit).
 #stable(since = "0.1")
 export fn WebSocket.new(consume stream TcpStream) -> WebSocket =>
-    { stream, max_message_size: default_max_message_size(), buf: []u8.new(), closed: false }
+    { stream, max_message_size: DEFAULT_MAX_MESSAGE_SIZE, buf: []u8.new(), closed: false }
 
 /// Wrap an already-upgraded `TcpStream` with an explicit message-size limit
 /// (DoS guard, plan §4 — "лимит размера сообщения обязателен").
