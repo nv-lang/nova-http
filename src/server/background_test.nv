@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Plan 222.16 — `BackgroundTasks` peer tests: execution order (FIFO),
+// «after the response» timing (explicit checkpoint — pure/mock, no
+// sockets: the live after-write wiring is `servernet.handle_connection`,
+// covered separately by a loopback smoke test), and panic-isolation
+// (one failing task doesn't stop the rest, doesn't crash the process, and
+// gets logged).
+//
+// [M-crossmodule-samename-typecheck-bleed] (221.1 №28): no extra types
+// declared here that could collide by NAME with another module's type in
+// the same CU — this file only exercises `BackgroundTasks` (already
+// checked unique across nova-http + its dependencies).
+//
+// Live compiler gotcha (documented in background.nv's banner): every
+// `@sink(...)` callback below uses closure-FULL syntax with an explicit
+// `str` param type (`fn(line str) { ... }`), NOT closure-light (`|line|
+// {...}`) — two closure-light literals with the same param name feeding
+// the same `fn(str) -> ()` slot in one CU mis-inferred the second one's
+// C parameter as `nova_int` (CC-FAIL on `.push`), repro'd while writing
+// this file. Zero-arg task closures (`fn() -> ()`) don't hit this —
+// closure-light `|| { ... }` is used for those, proven fine (no param to
+// mis-infer).
+
+module http.server
+
+test "drain(): tasks run in FIFO order (execution order, not queue order)" {
+    mut order []int = []
+    mut bg = BackgroundTasks.new()
+    bg.add(|| { order.push(1) })
+    bg.add(|| { order.push(2) })
+    bg.add(|| { order.push(3) })
+    assert(bg.task_count() == 3)
+    bg.drain()
+    assert(order.len() == 3)
+    assert(order[0] == 1)
+    assert(order[1] == 2)
+    assert(order[2] == 3)
+}
+
+test "drain(): tasks only run after the explicit checkpoint (\"response sent\")" {
+    // Stand-in for "handler returns a response, server writes it to the
+    // socket, THEN drains" — servernet.handle_connection is the live wire-
+    // up (loopback smoke elsewhere); here the checkpoint is a plain flag
+    // the task must NOT have touched before `drain()` is called.
+    mut responded = false
+    mut ran_before_response = false
+    mut ran_after_response = false
+    mut bg = BackgroundTasks.new()
+    bg.add(|| {
+        if !responded { ran_before_response = true }
+        ran_after_response = true
+    })
+    // "send the response" — nothing has drained yet.
+    responded = true
+    assert(!ran_before_response)
+    assert(!ran_after_response)
+    // "after the response": drain runs the queued task now.
+    bg.drain()
+    assert(!ran_before_response)
+    assert(ran_after_response)
+}
+
+test "drain(): a panicking task doesn't stop the rest and doesn't crash" {
+    mut order []int = []
+    mut logs []str = []
+    mut bg = BackgroundTasks.new()
+    bg.sink(fn(line str) { logs.push(line) })
+    bg.add(|| { order.push(1) })
+    bg.add(|| { panic("boom") })
+    bg.add(|| { order.push(3) })
+    bg.drain()
+    // 1st and 3rd ran; 2nd's panic didn't take out the 3rd, and the
+    // process is still here to assert on it.
+    assert(order.len() == 2)
+    assert(order[0] == 1)
+    assert(order[1] == 3)
+    assert(logs.len() == 1)
+    assert(logs[0].find("boom").is_some())
+}
+
+test "drain(): a throwing task is isolated the same way as a panicking one" {
+    mut order []int = []
+    mut logs []str = []
+    mut bg = BackgroundTasks.new()
+    bg.sink(fn(line str) { logs.push(line) })
+    bg.add(|| { order.push(1) })
+    bg.add(|| { throw "typed failure" })
+    bg.add(|| { order.push(3) })
+    bg.drain()
+    assert(order.len() == 2)
+    assert(order[0] == 1)
+    assert(order[1] == 3)
+    assert(logs.len() == 1)
+    assert(logs[0].find("typed failure").is_some())
+}
+
+test "drain(): multiple failures each get logged, order preserved across them" {
+    mut order []int = []
+    mut logs []str = []
+    mut bg = BackgroundTasks.new()
+    bg.sink(fn(line str) { logs.push(line) })
+    bg.add(|| { panic("first") })
+    bg.add(|| { order.push(1) })
+    bg.add(|| { panic("second") })
+    bg.add(|| { order.push(2) })
+    bg.drain()
+    assert(order.len() == 2)
+    assert(order[0] == 1)
+    assert(order[1] == 2)
+    assert(logs.len() == 2)
+    assert(logs[0].find("first").is_some())
+    assert(logs[1].find("second").is_some())
+}
+
+test "drain(): empty collector is a no-op" {
+    mut bg = BackgroundTasks.new()
+    assert(bg.task_count() == 0)
+    bg.drain()
+}
+
+test "add(): fluent chain returns the same collector" {
+    mut order []int = []
+    mut bg = BackgroundTasks.new()
+    bg.add(|| { order.push(1) }).add(|| { order.push(2) })
+    assert(bg.task_count() == 2)
+    bg.drain()
+    assert(order.len() == 2)
+    assert(order[0] == 1)
+    assert(order[1] == 2)
+}
+
+// ── ServerResponse round-trip (FastAPI `response.background`-analog) ─────────
+
+test "ServerResponse.background()/take_background(): round-trips the collector" {
+    mut ran = false
+    mut bg = BackgroundTasks.new()
+    bg.add(|| { ran = true })
+    mut resp = ServerResponse.text(200, "ok")
+    resp.background(bg)
+    match resp.take_background() {
+        Some(tasks) => {
+            mut t = tasks
+            t.drain()
+        }
+        None => assert(false)
+    }
+    assert(ran)
+}
+
+test "ServerResponse without .background(): take_background() is None" {
+    ro resp = ServerResponse.text(200, "ok")
+    assert(resp.take_background().is_none())
+}
