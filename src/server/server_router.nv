@@ -338,21 +338,44 @@ fn Router mut @insert_segs(segs []str, path str, mr MethodRouter) -> Result[(), 
     }
 }
 
+// NB (strict-effects package gate, 222 §9): these five sugar methods build
+// the `MethodRouter` INLINE (not via the free-fn constructors `get(h)`/
+// `post(h)`/… declared above) — the strict-effects capability walk checks
+// callee effects against ALL same-name free-fn overloads in the CU
+// (types/mod.rs `check_callee_effects`, documented false-positive corner:
+// "проверяем эффекты у всех overloads"), and in any CU that also loads
+// `http.client` the client's `get(url str) Http`/`post(url, body) Http`/…
+// shadow-match by name → bogus E_UNDECLARED_TRANSITIVE_EFFECT `Http` here.
+// Same-name-bleed defect family as [M-crossmodule-samename-typecheck-bleed];
+// reported to integrator (this worktree does not touch the nova repo). The
+// free-fn constructors themselves stay exported — user call-sites that never
+// import `http.client` are unaffected.
+
 /// Register a single `GET` handler at `path` (sugar over `@route(path, get(h))`).
 #stable(since = "0.1")
-export fn Router mut @get(path str, h Handler) -> Result[(), HttpError] => @route(path, get(h))
+export fn Router mut @get(path str, h Handler) -> Result[(), HttpError] {
+    mut mr = MethodRouter.new(); mr.get(h); @route(path, mr)
+}
 /// Register a single `POST` handler at `path`.
 #stable(since = "0.1")
-export fn Router mut @post(path str, h Handler) -> Result[(), HttpError] => @route(path, post(h))
+export fn Router mut @post(path str, h Handler) -> Result[(), HttpError] {
+    mut mr = MethodRouter.new(); mr.post(h); @route(path, mr)
+}
 /// Register a single `PUT` handler at `path`.
 #stable(since = "0.1")
-export fn Router mut @put(path str, h Handler) -> Result[(), HttpError] => @route(path, put(h))
+export fn Router mut @put(path str, h Handler) -> Result[(), HttpError] {
+    mut mr = MethodRouter.new(); mr.put(h); @route(path, mr)
+}
 /// Register a single `DELETE` handler at `path`.
 #stable(since = "0.1")
-export fn Router mut @delete(path str, h Handler) -> Result[(), HttpError] => @route(path, delete(h))
+export fn Router mut @delete(path str, h Handler) -> Result[(), HttpError] {
+    mut mr = MethodRouter.new(); mr.delete(h); @route(path, mr)
+}
 /// Register a single `PATCH` handler at `path`.
 #stable(since = "0.1")
-export fn Router mut @patch(path str, h Handler) -> Result[(), HttpError] => @route(path, patch(h))
+export fn Router mut @patch(path str, h Handler) -> Result[(), HttpError] {
+    mut mr = MethodRouter.new(); mr.patch(h); @route(path, mr)
+}
 
 /// Merge `sub`'s route tree under `prefix` (Axum-style nesting/grouping).
 /// `sub`'s own routes were already conflict-free at ITS OWN registration time;

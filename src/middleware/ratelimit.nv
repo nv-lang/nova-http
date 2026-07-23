@@ -70,7 +70,10 @@ export fn ratelimit(cfg RateLimit) Time -> Middleware => cfg.middleware()
 // ── internals ───────────────────────────────────────────────────────────────
 
 // Params → local copies before capture ([M-16]-family, cors.nv precedent).
-fn rl_handler(cfg RateLimit, buckets HashMap[str, TokenBucket], next Handler) -> Handler {
+// `Time` row: the returned handler-closure calls `rl_apply` (Time) — the
+// strict-effects capability walk attributes closure-body calls to the
+// enclosing named fn's row (package strict gate, 222 §9).
+fn rl_handler(cfg RateLimit, buckets HashMap[str, TokenBucket], next Handler) Time -> Handler {
     ro c = cfg
     ro b = buckets
     handler_fn(|req| rl_apply(c, b, next, req))

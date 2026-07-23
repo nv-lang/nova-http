@@ -30,7 +30,7 @@ fn hdr(resp ServerResponse, name str) -> str {
     }
 }
 
-fn routed(cfg Log) -> Router {
+fn routed(cfg Log) Time -> Router {
     mut r = Router.new()
     r.layer(logger(cfg))
     r.get("/x", handler_fn(|_req| ServerResponse.text(200, "ok")))!!
