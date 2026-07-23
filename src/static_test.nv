@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Plan 222.12 Ф.3 — `http.static` pin tests on `EmbeddedDir` (deterministic,
+// no FS — plan §5's explicit gate shape): 200+ETag+Accept-Ranges, mime by
+// extension, index resolution, 404, If-None-Match → 304 (list / W/ / *),
+// single Range → 206 (a-b, a-, -n), 416 + `bytes */len`, malformed-range →
+// full 200, If-Range mismatch → full 200.
+
+module http.static_test
+
+import http.static.{Static, serve_path, static_handler}
+import http.server.{Router, route_once, handler_fn, ServerRequest, ServerResponse}
+
+// Sorted by path — `EmbeddedDir.new` contract (entries sorted, unique).
+fn fixture() -> EmbeddedDir =>
+    EmbeddedDir.new([
+        EmbeddedEntry { path: "a.txt", data: "hello world".bytes() },       // 11 bytes
+        EmbeddedEntry { path: "docs/guide.md", data: "# guide".bytes() },
+        EmbeddedEntry { path: "index.html", data: "<h1>hi</h1>".bytes() },
+    ])
+
+fn routed() -> Router {
+    mut r = Router.new()
+    r.get("/files/{*path}", static_handler(fixture(), Static.new(), "path"))!!
+    r
+}
+
+fn get_req(path str, headers [](str, str)) -> []u8 {
+    consume sb = StringBuilder.new()
+    sb.cap(128)
+    sb.append("GET ${path} HTTP/1.1\r\nHost: x\r\n")
+    for (k, v) in headers {
+        sb.append("${k}: ${v}\r\n")
+    }
+    sb.append("\r\n")
+    sb.into_str().bytes()
+}
+
+fn hdr(resp ServerResponse, name str) -> str {
+    match resp.headers.get(name) {
+        Some(hv) => match hv.to_str() { Ok(s) => s, Err(_) => "" }
+        None     => ""
+    }
+}
+
+fn body_str(resp ServerResponse) -> str => unsafe { resp.body.to_str_unchecked() }
+
+test "static: 200 with mime, ETag, Accept-Ranges" {
+    ro resp = route_once(routed(), get_req("/files/a.txt", []))
+    assert(resp.status_code() == 200)
+    assert(body_str(resp) == "hello world")
+    assert(hdr(resp, "content-type") == "text/plain; charset=utf-8")
+    assert(hdr(resp, "etag") != "")
+    assert(hdr(resp, "accept-ranges") == "bytes")
+}
+
+test "static: nested path + markdown mime" {
+    ro resp = route_once(routed(), get_req("/files/docs/guide.md", []))
+    assert(resp.status_code() == 200)
+    assert(body_str(resp) == "# guide")
+    assert(hdr(resp, "content-type") == "text/markdown; charset=utf-8")
+}
+
+test "static: empty path serves the index file as text/html" {
+    // `serve_path` directly: the routed form can't produce an empty {*path}.
+    ro resp = serve_path(fixture(), Static.new(), "", ServerRequest_stub())
+    assert(resp.status_code() == 200)
+    assert(body_str(resp) == "<h1>hi</h1>")
+    assert(hdr(resp, "content-type") == "text/html; charset=utf-8")
+}
+
+test "static: missing file -> 404; ..-escape key -> 404" {
+    ro r404 = route_once(routed(), get_req("/files/missing.txt", []))
+    assert(r404.status_code() == 404)
+    ro resc = serve_path(fixture(), Static.new(), "../secret", ServerRequest_stub())
+    assert(resc.status_code() == 404)
+}
+
+test "static: If-None-Match with the current ETag -> 304, empty body, ETag kept" {
+    ro first = route_once(routed(), get_req("/files/a.txt", []))
+    ro etag = hdr(first, "etag")
+    assert(etag != "")
+    ro second = route_once(routed(), get_req("/files/a.txt", [("If-None-Match", etag)]))
+    assert(second.status_code() == 304)
+    assert(second.body.len() == 0)
+    assert(hdr(second, "etag") == etag)
+}
+
+test "static: If-None-Match tolerates lists, W/ prefix and *" {
+    ro first = route_once(routed(), get_req("/files/a.txt", []))
+    ro etag = hdr(first, "etag")
+    ro listed = route_once(routed(), get_req("/files/a.txt", [("If-None-Match", "\"zzz\", W/${etag}")]))
+    assert(listed.status_code() == 304)
+    ro star = route_once(routed(), get_req("/files/a.txt", [("If-None-Match", "*")]))
+    assert(star.status_code() == 304)
+    ro miss = route_once(routed(), get_req("/files/a.txt", [("If-None-Match", "\"zzz\"")]))
+    assert(miss.status_code() == 200)
+}
+
+test "static: Range bytes=0-4 -> 206 'hello' + Content-Range" {
+    ro resp = route_once(routed(), get_req("/files/a.txt", [("Range", "bytes=0-4")]))
+    assert(resp.status_code() == 206)
+    assert(body_str(resp) == "hello")
+    assert(hdr(resp, "content-range") == "bytes 0-4/11")
+}
+
+test "static: open-ended and suffix ranges" {
+    ro tail = route_once(routed(), get_req("/files/a.txt", [("Range", "bytes=6-")]))
+    assert(tail.status_code() == 206)
+    assert(body_str(tail) == "world")
+    assert(hdr(tail, "content-range") == "bytes 6-10/11")
+    ro sfx = route_once(routed(), get_req("/files/a.txt", [("Range", "bytes=-5")]))
+    assert(sfx.status_code() == 206)
+    assert(body_str(sfx) == "world")
+    assert(hdr(sfx, "content-range") == "bytes 6-10/11")
+}
+
+test "static: end clamped to size-1; start past EOF -> 416 with bytes */len" {
+    ro clamp = route_once(routed(), get_req("/files/a.txt", [("Range", "bytes=6-999")]))
+    assert(clamp.status_code() == 206)
+    assert(body_str(clamp) == "world")
+    ro unsat = route_once(routed(), get_req("/files/a.txt", [("Range", "bytes=99-")]))
+    assert(unsat.status_code() == 416)
+    assert(hdr(unsat, "content-range") == "bytes */11")
+}
+
+test "static: malformed / multi-range headers are ignored -> full 200 (Go rule)" {
+    ro bad = route_once(routed(), get_req("/files/a.txt", [("Range", "bytes=abc")]))
+    assert(bad.status_code() == 200)
+    assert(body_str(bad) == "hello world")
+    ro multi = route_once(routed(), get_req("/files/a.txt", [("Range", "bytes=0-1,3-4")]))
+    assert(multi.status_code() == 200)
+}
+
+test "static: If-Range with a stale ETag -> full 200; with the current one -> 206" {
+    ro first = route_once(routed(), get_req("/files/a.txt", []))
+    ro etag = hdr(first, "etag")
+    ro stale = route_once(routed(), get_req("/files/a.txt",
+        [("Range", "bytes=0-4"), ("If-Range", "\"stale\"")]))
+    assert(stale.status_code() == 200)
+    ro fresh = route_once(routed(), get_req("/files/a.txt",
+        [("Range", "bytes=0-4"), ("If-Range", etag)]))
+    assert(fresh.status_code() == 206)
+}
+
+test "static: cache_control config lands on 200" {
+    mut cfg = Static.new()
+    cfg.cache_control("public, max-age=60")
+    ro resp = serve_path(fixture(), cfg, "a.txt", ServerRequest_stub())
+    assert(hdr(resp, "cache-control") == "public, max-age=60")
+}
+
+// Minimal ServerRequest for direct serve_path calls (no conditional headers).
+// Built by parsing a real GET through the shared wire parser — keeps this
+// module free of ServerRequest construction details.
+fn ServerRequest_stub() -> ServerRequest {
+    mut r = Router.new()
+    // route_once path would need a Router; parse via a capturing handler instead.
+    mut captured Option[ServerRequest] = None
+    r.get("/probe", handler_fn(|req| { captured = Some(req); ServerResponse.empty(200) }))!!
+    ro _ = route_once(r, "GET /probe HTTP/1.1\r\nHost: x\r\n\r\n".bytes())
+    match captured {
+        Some(req) => req
+        None      => panic("stub request not captured")
+    }
+}
