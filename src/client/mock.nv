@@ -114,7 +114,7 @@ export fn MockHttp @on(method str, path str, resp MockResponse) -> MockHttp {
 export fn MockHttp @build() -> Effect[Http] {
     ro routes = @routes
     effect Http {
-        send(host, port, secure, request) {
+        send(host, port, secure, request) -> Result[str, HttpError] {
             mock_dispatch(routes, request)
         }
     }

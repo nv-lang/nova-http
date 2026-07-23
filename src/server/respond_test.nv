@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Plan 222.5 — `IntoResponse` + typed-status `ServerResponse` constructors:
+// peer tests (mock-`ServerRequest` not needed — pure constructors, plan §8).
+
+module http.server
+
+import std.encoding.serde.{Serialize, Deserialize}
+
+#impl(Serialize + Deserialize)
+// RespWidget (не Widget): одноимённый тип живёт в serdejson/typed_json_test.nv —
+// кросс-модульная коллизия в CU ломает тайпчек, см. [M-crossmodule-samename-typecheck-bleed] (221.1 №28)
+type RespWidget value { ro name str, ro qty int }
+
+// ── str : IntoResponse ─────────────────────────────────────────────────────
+
+test "str.into_response(): 200 text/plain with the string as body" {
+    ro resp = "hello".into_response()
+    assert(resp.status_code() == 200)
+    ro ct = resp.headers.get("Content-Type")
+    assert(match ct { Some(_) => true, None => false })
+    assert(unsafe { resp.body.to_str_unchecked() } == "hello")
+}
+
+// ── StatusCode : IntoResponse ──────────────────────────────────────────────
+
+test "StatusCode.into_response(): bodyless response at that status" {
+    ro resp = StatusCode.not_found().into_response()
+    assert(resp.status_code() == 404)
+    assert(resp.body.len() == 0)
+}
+
+// ── ServerResponse : IntoResponse (identity) ───────────────────────────────
+
+test "ServerResponse.into_response(): identity passthrough" {
+    ro built = ServerResponse.text(StatusCode.created(), "made it")
+    ro resp = built.into_response()
+    assert(resp.status_code() == 201)
+    assert(unsafe { resp.body.to_str_unchecked() } == "made it")
+}
+
+// ── StatusCode-typed constructors (§4 chinit "статус голым int") ──────────
+
+test "ServerResponse.text(StatusCode, str): matches the bare-int form's status" {
+    ro resp = ServerResponse.text(StatusCode.ok(), "typed")
+    assert(resp.status_code() == 200)
+    assert(unsafe { resp.body.to_str_unchecked() } == "typed")
+}
+
+test "ServerResponse.empty(StatusCode): bodyless at the typed status" {
+    ro resp = ServerResponse.empty(StatusCode.no_content())
+    assert(resp.status_code() == 204)
+    assert(resp.body.len() == 0)
+}
+
+test "ServerResponse.redirect(StatusCode, location): Location header set" {
+    ro resp = ServerResponse.redirect(StatusCode.found(), "/elsewhere")
+    assert(resp.status_code() == 302)
+    ro loc = resp.headers.get("Location")
+    assert(match loc { Some(_) => true, None => false })
+}
+
+// ── Json[T Serialize] : IntoResponse + ServerResponse.json[T] ─────────────
+
+test "Json[T].into_response(): 200 application/json with the encoded body" {
+    ro resp = json(RespWidget{ name: "gizmo", qty: 3 }).into_response()
+    assert(resp.status_code() == 200)
+    ro ct = resp.headers.get("Content-Type")
+    ro ct_ok = match ct {
+        Some(hv) => match hv.to_str() { Ok(s) => s.contains("application/json"), Err(_) => false }
+        None     => false
+    }
+    assert(ct_ok)
+    ro body = unsafe { resp.body.to_str_unchecked() }
+    assert(body.contains("gizmo"))
+    assert(body.contains("3"))
+}
+
+test "ServerResponse.json[T](status, v): one-call typed JSON response at a chosen status" {
+    ro resp = ServerResponse.json(StatusCode.created(), RespWidget{ name: "widget", qty: 7 })
+    assert(resp.status_code() == 201)
+    ro body = unsafe { resp.body.to_str_unchecked() }
+    assert(body.contains("widget"))
+}
+
+test "Json[T].data(): property accessor returns the wrapped value" {
+    ro j = json(RespWidget{ name: "x", qty: 1 })
+    assert(j.data().name == "x")
+    assert(j.data().qty == 1)
+}
+
+// ── HttpError : IntoResponse (§5.2 kind→status + structured JSON body) ────
+
+test "HttpError.into_response(): Protocol kind -> 400 with structured error body" {
+    ro resp = HttpError.protocol_error("bad request shape").into_response()
+    assert(resp.status_code() == 400)
+    ro body = unsafe { resp.body.to_str_unchecked() }
+    assert(body.contains("\"error\""))
+    assert(body.contains("\"message\""))
+    assert(body.contains("protocol"))
+}
+
+test "HttpError.into_response(): BodyTooLarge -> 413" {
+    ro resp = HttpError.body_too_large().into_response()
+    assert(resp.status_code() == 413)
+}
+
+test "HttpError.into_response(): Status(c) echoes the embedded status code" {
+    ro resp = HttpError.new(Status(StatusCode.forbidden())).into_response()
+    assert(resp.status_code() == 403)
+}
+
+// NB: `ErrorKind.Other(str)` qualified explicitly — bare `Other("...")` here
+// resolves (wrongly) to `Method.Other(str)` instead (SAME variant name + SAME
+// `str` payload shape as `ErrorKind.Other`, both types visible in this module
+// via `http.{Method, ..., ErrorKind}`-style imports elsewhere in the package);
+// construction-site context resolution picks the wrong enum despite
+// `HttpError.new(kind ErrorKind)`'s parameter type being unambiguous. Same bug
+// CLASS as the already-documented `ErrSource.Net` vs `TlsError.Net` collision
+// (error.nv banner, "M-178" — codegen `debt_find_variant_ctx`), a still-open
+// corner for THIS enum pair — reported to integrator, not filed as a new
+// marker here (this worktree does not touch the nova repo).
+test "HttpError.into_response(): Other(_) -> 500 (catch-all)" {
+    ro resp = HttpError.new(ErrorKind.Other("unexpected")).into_response()
+    assert(resp.status_code() == 500)
+}
+
+// ── blanket Result[R IntoResponse, E IntoResponse] : IntoResponse ─────────
+
+fn maybe_greet(ok bool) -> Result[str, HttpError] {
+    if ok { Ok("hi") } else { Err(HttpError.protocol_error("nope")) }
+}
+
+test "Result[R,E].into_response(): Ok(str) -> the str's own into_response()" {
+    ro resp = maybe_greet(true).into_response()
+    assert(resp.status_code() == 200)
+    assert(unsafe { resp.body.to_str_unchecked() } == "hi")
+}
+
+test "Result[R,E].into_response(): Err(HttpError) -> the error's own into_response()" {
+    ro resp = maybe_greet(false).into_response()
+    assert(resp.status_code() == 400)
+}
