@@ -37,6 +37,8 @@
 module http.servernet
 
 import std.time.duration
+import std.io.{stdout, Io, real_io}
+import ../server.{MultipartLimits}
 
 /// What `serve_connection()` answers with when the handler callback panics
 /// mid-request (owner decision 2026-07-23) — SCAFFOLDING ONLY as of this
@@ -72,6 +74,23 @@ export type ServerPolicy value {
     idle_deadline         Duration
     max_body_bytes        int
     panic_response        HandlerPanicResponse
+    // Recover-500 (Plan 222 final-plumbing task 2): failure-log sink for a
+    // handler panic caught by `serve_connection`'s Stop-supervision — SAME
+    // [M-16]-family de-collision as `BackgroundTasks.emit`/`Log`'s own field
+    // (background.nv banner): a fn-typed field sharing its NAME with an
+    // identically-named `-> @` setter method resolves the call as "read the
+    // field, try to call the RESULT" instead of "call the setter" (CC-FAIL).
+    // Field named `panic_emit` (not `panic_sink`) so `@panic_sink(f)` (the
+    // setter, below) stays unambiguous — same recipe, same reason.
+    panic_emit            fn(str) -> ()
+    // Multipart-parsing guardrails (`[M-222.11-multipart-limits-not-wired-to-
+    // serverpolicy]`, Plan 222 final-plumbing task 3): stored here so
+    // `http.serve.serve_router` can read `@multipart_limits()` and thread it
+    // down to `Multipart.from_request` — see `MultipartLimits`'s own
+    // doc-comment (`server/multipart.nv`) and `ServerRequest.multipart_limits`
+    // (`server.nv`) for why the channel runs THROUGH `ServerRequest` rather
+    // than a direct import (module-cycle avoidance).
+    multipart_limits      MultipartLimits
 }
 
 /// Defaults:
@@ -115,6 +134,16 @@ export fn ServerPolicy.new() -> ServerPolicy => {
     idle_deadline: 60.to_seconds(),
     max_body_bytes: 1048576,
     panic_response: HandlerPanicResponse.InternalError500,
+    panic_emit: fn(line str) -> () { with Io = real_io() { default_panic_sink(line) } },
+    multipart_limits: MultipartLimits.new(),
+}
+
+// Default failure sink for a caught handler panic: stdout via the ambient
+// `Io` effect (same recipe as `background.nv`'s own `default_sink` —
+// `real_io` is `#default_handler`, std/io/console.nv).
+fn default_panic_sink(line str) Io -> () {
+    mut out = stdout()
+    ro _ = out.write("${line}\n".bytes())
 }
 
 /// Max connections handled concurrently; over budget → admission reject
@@ -177,3 +206,48 @@ export fn ServerPolicy mut @max_body_bytes(n int) -> @ { @max_body_bytes = n }
 export fn ServerPolicy @panic_response() -> HandlerPanicResponse => @panic_response
 #stable(since = "0.1")
 export fn ServerPolicy mut @panic_response(v HandlerPanicResponse) -> @ { @panic_response = v }
+
+/// Redirect the recover-500 failure-log line (default: stdout via the
+/// ambient `Io` effect). Setter named `@panic_sink` (not `@panic_emit`) —
+/// see the `panic_emit` field's own doc-comment for why the names differ.
+#stable(since = "0.1")
+export fn ServerPolicy mut @panic_sink(f fn(str) -> ()) -> @ { @panic_emit = f }
+
+/// Max number of `multipart/form-data` parts a request may carry — see
+/// `MultipartLimits.max_parts` (`server/multipart.nv`).
+#stable(since = "0.1")
+export fn ServerPolicy @max_multipart_parts() -> int => @multipart_limits.max_parts()
+#stable(since = "0.1")
+export fn ServerPolicy mut @max_multipart_parts(n int) -> @ {
+    mut lim = @multipart_limits
+    ro _ = lim.max_parts(n)
+    @multipart_limits = lim
+}
+
+/// Max bytes for any single multipart part's (decoded) body — see
+/// `MultipartLimits.max_part_size`.
+#stable(since = "0.1")
+export fn ServerPolicy @max_multipart_part_size() -> int => @multipart_limits.max_part_size()
+#stable(since = "0.1")
+export fn ServerPolicy mut @max_multipart_part_size(n int) -> @ {
+    mut lim = @multipart_limits
+    ro _ = lim.max_part_size(n)
+    @multipart_limits = lim
+}
+
+/// Max cumulative bytes across all multipart part bodies — see
+/// `MultipartLimits.max_total`.
+#stable(since = "0.1")
+export fn ServerPolicy @max_multipart_total_bytes() -> int => @multipart_limits.max_total()
+#stable(since = "0.1")
+export fn ServerPolicy mut @max_multipart_total_bytes(n int) -> @ {
+    mut lim = @multipart_limits
+    ro _ = lim.max_total(n)
+    @multipart_limits = lim
+}
+
+/// The whole `MultipartLimits` snapshot — read by `http.serve.serve_router`
+/// to thread through to `Multipart.from_request` (see `ServerRequest.
+/// multipart_limits`, `server.nv`, for the full channel).
+#stable(since = "0.1")
+export fn ServerPolicy @multipart_limits() -> MultipartLimits => @multipart_limits

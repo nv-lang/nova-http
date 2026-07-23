@@ -58,6 +58,165 @@ import std.time.duration
 import ../server.{ServerResponse, serialize_response}
 import ../server.{serialize_response_head, encode_chunk, encode_chunk_end}
 
+// ── ws-hijack + recover-500: run one request's handler UNDER Stop-
+//    supervision, INSIDE the write (Plan 222 final-plumbing tasks 1+2,
+//    `[M-ws-on_upgrade-hijack-not-wired]` + `[M-servemux-recover-500]`) ────
+//
+// Composition, no new runtime primitive for the recover-500 half: SAME
+// Stop-supervision shape as `BackgroundTasks.@drain()` (server/background.nv,
+// D416) — a `supervised { spawn { ... } }` scope with a custom `Supervisor`
+// handler whose `on_child_fail` returns `Decision.Stop` (the failure is
+// contained, does NOT propagate, does NOT crash the process).
+//
+// WHY THE HANDLER CALL + UPGRADE CHECK + WIRE WRITE ALL HAPPEN **INSIDE**
+// THE SPAWN (not: run the handler in a spawn, bring the `ServerResponse`
+// back out, THEN decide/write) — found empirically while wiring this:
+// `ServerResponse` embeds THREE closure-bearing `Option[...]` fields
+// (`stream: Option[StreamBody]`, `background: Option[BackgroundTasks]`,
+// `upgrade: Option[fn(TcpStream) Net -> ()]`) — the M:N share-ness checker
+// cannot prove ANY of them safe to alias across a spawned-fiber boundary via
+// a captured `mut` outer variable (`[E_CONCURRENT_MUT_CAPTURE] ...
+// ServerResponse is poisoned at ServerResponse.stream::Some.0 (T): an
+// unresolved type name T` — reproduces identically whether captured as
+// `Option[ServerResponse]` or bare `ServerResponse`; a `Channel[ServerResponse]`
+// fails EARLIER still, at codegen — `E_CHANNEL_UNSOUND_ELEM_TYPE`,
+// `ServerResponse`'s C struct isn't pointer-sized, `Channel[T]`'s runtime
+// backing is a single `nova_int`-sized slot, `nova_rt/channels.h`). A
+// payload-less enum (`ConnStep` below) WITH an explicit type annotation on
+// the captured local DOES cross the boundary safely (probed in isolation:
+// `mut step ConnStep = ConnStep.StepX` inside a nested `supervised { spawn
+// consume shs = s.share() { step = ... } }` — no annotation → a SEPARATE
+// `E_CONCURRENT_MUT_CAPTURE` variant, "type is unknown at the capture site",
+// since the checker's syntactic type-sketch pass doesn't recognize a bare
+// enum-variant constructor `Step.A` as a `Named{Type}` ctor pattern the way
+// it does `Type.new(...)`/literals — WITH the annotation, both variants
+// disappear). So: `resp` is produced and consumed by the SAME fiber (never
+// crosses out), and only the outcome DISCRIMINATOR crosses back — same
+// `s.share()` cross-fiber-lend recipe `policy.nv`'s own `read_attempt`
+// already proves for a plain read. Both gaps: report to integrator for
+// `docs/plans/backlog-followups.md` (this worktree does not touch the nova
+// repo).
+//
+// D437 caveat (owner-requested normative anchor, spec/decisions/08-runtime.md):
+// the runtime's own uncaught-panic diagnostic is "message + throw-site +
+// propagation trace" — but that full format is ONLY ever printed by the
+// runtime's own top-level unhandled-abort path
+// (`nova_throw_site_dump`/`effects.h`); there is NO Nova-level accessor that
+// exposes the throw-site/trace to a `Supervisor.on_child_fail` handler (`err
+// any` only yields the message via `.try_as[str]()`, confirmed against
+// `effects.h`/`fibers.h`'s own C source — `nova_throw_site_set`/
+// `_nova_throw_site` are C-internal, no extern binding anywhere in `std/`).
+// `BackgroundTasks.@drain()` hits the exact same wall and logs message-only
+// — this fn does the same, honestly, rather than fabricate a "site".
+type ConnStep enum
+    | StepKeepAlive // wrote OK, both sides agreed to continue the connection
+    | StepClose     // wrote OK (or nothing to write), connection ends here
+    | StepCloseErr  // a write failed — connection ends here, propagate NetError
+
+// Read+dispatch already happened (`read_one_request`, caller) — this runs
+// `handler(raw)` UNDER Stop-supervision, checks the result for a ws-hijack
+// (`@take_upgrade()`), and writes the response, ALL inside the same spawned
+// fiber (see banner above for why). On a caught panic/throw, logs
+// `"handler panic: <message>"` via `policy`'s own sink
+// (`policy.panic_emit`/`@panic_sink`) and answers per `policy.panic_response()`:
+// `InternalError500` -> writes a 500 (in THIS, the un-panicked caller fiber —
+// the spawn already exited), `Close` -> writes nothing.
+fn run_request(s mut TcpStream, handler fn([]u8) -> ServerResponse, raw []u8, policy ServerPolicy, keep_alive bool) Net Time -> ConnStep {
+    // `failed`/`reason` captured by `on_child_fail` below — legal (checked:
+    // `nova check src --strict-effects` is clean, no E_CONCURRENT_MUT_CAPTURE
+    // for either), and NOT a coincidence of the type being `bool`/`str`: the
+    // M:N mut-capture race-checker only fires for `spawn`/`parallel for`/
+    // `detach` BODIES (its own error text says so verbatim); `on_child_fail`
+    // is a `Supervisor` EFFECT-HANDLER closure, not one of those three — per
+    // D416 §2 (spec/decisions/06-concurrency.md, normative): "on_child_fail
+    // исполняется на drive-потоке scope'а (drain-цикл
+    // nova_supervised_run_impl), по одному падению за раз" — it runs
+    // SERIALLY on the SAME drive thread/fiber that owns the `supervised{}`
+    // scope, never migrates, never runs concurrently with anything —
+    // structurally outside the race-checker's scope, same reason
+    // `BackgroundTasks.@drain()` (server/background.nv, ALREADY shipped)
+    // captures the identical `mut failed`/`mut reason` shape with no
+    // workaround needed.
+    mut failed = false
+    mut reason = ""
+    mut step ConnStep = ConnStep.StepCloseErr
+    with Supervisor = effect Supervisor {
+        on_child_fail(idx, err) -> Decision {
+            failed = true
+            if let Some(msg) = err.try_as[str]() {
+                reason = msg
+            } else {
+                reason = "non-string handler error"
+            }
+            return Decision.Stop
+        }
+    } {
+        supervised {
+            spawn consume shs = s.share() {
+                mut resp = handler(raw)
+                match resp.take_upgrade() {
+                    // ws-hijack (task 1): write the 101 bytes, then hand the
+                    // LIVE (shared) socket to the hook instead of the normal
+                    // keep-alive continuation/close. `hook(shs)` moves `shs`
+                    // for good (`TcpStream` has its own `@cleanup`, D188 — no
+                    // double-close risk; `s`, the ORIGINAL, is untouched here
+                    // and still gets its own `@close()` from the caller's
+                    // trailing cleanup — rc-aware, so that is a harmless
+                    // decrement, not a real double-close, per `TcpStream.
+                    // @share()`'s own doc-comment). `supervised { spawn { ... }
+                    // }` (not `detach`) BLOCKS until `hook` returns — exactly
+                    // right: `run_request`/`serve_connection` legitimately
+                    // don't have anything else to do with this connection
+                    // until the whole WebSocket session ends (fiber-per-
+                    // connection model, same as every other blocking `Net`
+                    // call already in this driver).
+                    Some(hook) => {
+                        resp.header("Connection", "Upgrade")
+                        match write_response_keepalive(shs, resp) {
+                            Ok(_)  => { hook(shs); step = ConnStep.StepClose }
+                            Err(_) => { step = ConnStep.StepCloseErr }
+                        }
+                    }
+                    None => {
+                        resp.header("Connection", if keep_alive { "keep-alive" } else { "close" })
+                        match write_response_keepalive(shs, resp) {
+                            Ok(_)  => { step = if keep_alive { ConnStep.StepKeepAlive } else { ConnStep.StepClose } }
+                            Err(_) => { step = ConnStep.StepCloseErr }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if failed {
+        (policy.panic_emit)("handler panic: ${reason}")
+        match policy.panic_response() {
+            // `InternalError500`: the panic was cleanly caught BEFORE any
+            // response bytes went out (the whole handler call + write
+            // happens inside the SAME Stop-supervised spawn above, so a
+            // panic mid-handler never left a partial/corrupted response on
+            // the wire) — a well-formed `500` is exactly as safe to keep the
+            // connection alive after as any other response, so this honors
+            // the SAME `keep_alive` decision (`read_one_request`/
+            // `should_keep_alive`, policy.nv) every other response does: the
+            // server stays up AND, if both sides agreed to keep-alive, this
+            // SAME connection goes on to serve the next request (recover-500
+            // task 2's own acceptance shape — "connection stays alive for
+            // the NEXT request", not just "a NEW connection can still be
+            // admitted").
+            HandlerPanicResponse.InternalError500 => {
+                mut resp500 = ServerResponse.text(500, "500 internal server error")
+                resp500.header("Connection", if keep_alive { "keep-alive" } else { "close" })
+                ro _ = write_response_keepalive(s, resp500)
+                if keep_alive { ConnStep.StepKeepAlive } else { ConnStep.StepClose }
+            }
+            HandlerPanicResponse.Close => ConnStep.StepClose
+        }
+    } else {
+        step
+    }
+}
+
 // ── Non-consuming response write (keep-alive: the stream survives to serve
 //    the NEXT request on success) — mirrors `handle_connection`'s own
 //    fixed/streaming split (`write_streaming`/`write_stream_chunks`), but
@@ -134,11 +293,16 @@ export fn serve_connection(consume stream TcpStream, handler fn([]u8) -> ServerR
         match read_one_request(s, policy, served_count) {
             Ready(raw, keep_alive) => {
                 served_count += 1
-                mut resp = handler(raw)
-                resp.header("Connection", if keep_alive { "keep-alive" } else { "close" })
-                match write_response_keepalive(s, resp) {
-                    Ok(_)  => { keep_going = keep_alive }
-                    Err(e) => { keep_going = false; final_result = Err(e) }
+                // ws-hijack (task 1) + recover-500 (task 2): `run_request`
+                // (above) runs `handler(raw)` under Stop-supervision, checks
+                // `@take_upgrade()`, and writes the response — ALL inside its
+                // own spawned fiber (see that fn's own banner for why the
+                // response value never crosses back out here, only the
+                // `ConnStep` discriminator does).
+                match run_request(s, handler, raw, policy, keep_alive) {
+                    StepKeepAlive => { keep_going = true }
+                    StepClose     => { keep_going = false }
+                    StepCloseErr  => { keep_going = false; final_result = Err(NetError.Closed) }
                 }
             }
             EarlyResponse(resp0) => {
