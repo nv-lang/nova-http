@@ -7,7 +7,9 @@ module http.server
 import std.encoding.serde.{Serialize, Deserialize}
 
 #impl(Serialize + Deserialize)
-type Widget value { ro name str, ro qty int }
+// RespWidget (не Widget): одноимённый тип живёт в serdejson/typed_json_test.nv —
+// кросс-модульная коллизия в CU ломает тайпчек, см. [M-crossmodule-samename-typecheck-bleed] (221.1 №28)
+type RespWidget value { ro name str, ro qty int }
 
 // ── str : IntoResponse ─────────────────────────────────────────────────────
 
@@ -60,7 +62,7 @@ test "ServerResponse.redirect(StatusCode, location): Location header set" {
 // ── Json[T Serialize] : IntoResponse + ServerResponse.json[T] ─────────────
 
 test "Json[T].into_response(): 200 application/json with the encoded body" {
-    ro resp = json(Widget{ name: "gizmo", qty: 3 }).into_response()
+    ro resp = json(RespWidget{ name: "gizmo", qty: 3 }).into_response()
     assert(resp.status_code() == 200)
     ro ct = resp.headers.get("Content-Type")
     ro ct_ok = match ct {
@@ -74,14 +76,14 @@ test "Json[T].into_response(): 200 application/json with the encoded body" {
 }
 
 test "ServerResponse.json[T](status, v): one-call typed JSON response at a chosen status" {
-    ro resp = ServerResponse.json(StatusCode.created(), Widget{ name: "widget", qty: 7 })
+    ro resp = ServerResponse.json(StatusCode.created(), RespWidget{ name: "widget", qty: 7 })
     assert(resp.status_code() == 201)
     ro body = unsafe { resp.body.to_str_unchecked() }
     assert(body.contains("widget"))
 }
 
 test "Json[T].data(): property accessor returns the wrapped value" {
-    ro j = json(Widget{ name: "x", qty: 1 })
+    ro j = json(RespWidget{ name: "x", qty: 1 })
     assert(j.data().name == "x")
     assert(j.data().qty == 1)
 }

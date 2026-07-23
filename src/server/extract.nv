@@ -145,7 +145,7 @@ export type ParamsDeserializer value { priv pairs [](str, str), priv cur Option[
 
 /// Start at the root (no scalar entered yet — call `@enter_field` first).
 #stable(since = "0.1")
-export fn ParamsDeserializer.at(pairs [](str, str)) -> ParamsDeserializer => { pairs, cur: None }
+export fn ParamsDeserializer.new(pairs [](str, str)) -> ParamsDeserializer => { pairs, cur: None }
 
 #stable(since = "0.1")
 export fn ParamsDeserializer mut @deser_bool()  -> Result[bool, DeError]  => flat_deser_bool(@cur)
@@ -209,7 +209,7 @@ export type QueryDeserializer value { priv pairs [](str, str), priv cur Option[s
 
 /// Start at the root (no scalar entered yet — call `@enter_field` first).
 #stable(since = "0.1")
-export fn QueryDeserializer.at(query str) -> QueryDeserializer => { pairs: parse_query(query), cur: None }
+export fn QueryDeserializer.new(query str) -> QueryDeserializer => { pairs: parse_query(query), cur: None }
 
 #stable(since = "0.1")
 export fn QueryDeserializer mut @deser_bool()  -> Result[bool, DeError]  => flat_deser_bool(@cur)
@@ -277,7 +277,7 @@ export fn Json[T Deserialize].from_request(req ServerRequest) -> Result[Json[T],
     match req.body_bytes().to_str() {
         Ok(s) => match JsonValue.try_from(s) {
             Ok(v) => {
-                mut d = JsonDeserializer.at(v, 0, 128)
+                mut d = JsonDeserializer.new(v, 0, 128)
                 match T.deserialize(d) {
                     Ok(x)  => Ok(json(x))
                     Err(e) => Err(HttpError.decode_error(e.to_str()))
@@ -292,7 +292,7 @@ export fn Json[T Deserialize].from_request(req ServerRequest) -> Result[Json[T],
 /// `Path[T]` — decode the matched `{name}` path params into `T`.
 #impl(FromRequest)
 export fn Path[T Deserialize].from_request(req ServerRequest) -> Result[Path[T], HttpError] {
-    mut d = ParamsDeserializer.at(req.params)
+    mut d = ParamsDeserializer.new(req.params)
     match T.deserialize(d) {
         Ok(v)  => Ok(Path{ data: v })
         Err(e) => Err(HttpError.decode_error(e.to_str()))
@@ -302,7 +302,7 @@ export fn Path[T Deserialize].from_request(req ServerRequest) -> Result[Path[T],
 /// `Query[T]` — decode the `?...` query string into `T`.
 #impl(FromRequest)
 export fn Query[T Deserialize].from_request(req ServerRequest) -> Result[Query[T], HttpError] {
-    mut d = QueryDeserializer.at(req.query)
+    mut d = QueryDeserializer.new(req.query)
     match T.deserialize(d) {
         Ok(v)  => Ok(Query{ data: v })
         Err(e) => Err(HttpError.decode_error(e.to_str()))

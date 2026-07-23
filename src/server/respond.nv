@@ -44,7 +44,7 @@ import std.encoding.serde.{Serialize, SerError, json_encode}
 /// `-> Result[Json[User], HttpError]` instead of hand-assembling `ServerResponse`.
 #stable(since = "0.1")
 export type IntoResponse protocol {
-    @into_response() -> ServerResponse
+    consume @into_response() -> ServerResponse
 }
 
 // ── StatusCode-typed constructors (§4 — chinit «статус голым int»: adds a
@@ -165,19 +165,19 @@ fn server_json_encode_error(e SerError) -> ServerResponse =>
 
 /// Identity — a handler that already built its `ServerResponse` passes through.
 #impl(IntoResponse)
-export fn ServerResponse @into_response() -> ServerResponse => @
+export fn ServerResponse consume @into_response() -> ServerResponse => @
 
 /// A bare `str` becomes a `200 OK` `text/plain` response.
 #impl(IntoResponse)
-export fn str @into_response() -> ServerResponse => ServerResponse.text(StatusCode.ok(), @)
+export fn str consume @into_response() -> ServerResponse => ServerResponse.text(StatusCode.ok(), @)
 
 /// A bare `StatusCode` becomes a bodyless response at that status.
 #impl(IntoResponse)
-export fn StatusCode @into_response() -> ServerResponse => ServerResponse.empty(@)
+export fn StatusCode consume @into_response() -> ServerResponse => ServerResponse.empty(@)
 
 /// `Json[T Serialize]` becomes a `200 OK` `application/json` response.
 #impl(IntoResponse)
-export fn Json[T Serialize] @into_response() -> ServerResponse =>
+export fn Json[T Serialize] consume @into_response() -> ServerResponse =>
     ServerResponse.json(StatusCode.ok(), @data())
 
 /// Structured error body — `{"error": "<kind>", "message": "<detail>"}`, status
@@ -225,7 +225,7 @@ fn http_error_status(kind ErrorKind) -> StatusCode {
 
 /// `HttpError` → a typed status (by `kind`) + a structured JSON error body.
 #impl(IntoResponse)
-export fn HttpError @into_response() -> ServerResponse =>
+export fn HttpError consume @into_response() -> ServerResponse =>
     ServerResponse.json(http_error_status(@kind), HttpErrorBody{ error: http_error_kind_name(@kind), message: @to_str() })
 
 /// BLANKET — `Result[R IntoResponse, E IntoResponse]` : `IntoResponse`. Gives
@@ -234,7 +234,7 @@ export fn HttpError @into_response() -> ServerResponse =>
 /// `Option`/`Result` `Debug`/`Display` blanket precedent (std/prelude/
 /// protocols.nv `fn Result[T Display, E Display] @display(...)`).
 #impl(IntoResponse)
-export fn Result[R IntoResponse, E IntoResponse] @into_response() -> ServerResponse {
+export fn Result[R IntoResponse, E IntoResponse] consume @into_response() -> ServerResponse {
     match @ {
         Ok(r)  => r.into_response()
         Err(e) => e.into_response()

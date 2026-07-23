@@ -58,7 +58,7 @@ fn post_text_req(path str, body str) -> []u8 =>
 // ── Ф.1: ParamsDeserializer / QueryDeserializer — pure parser tests ───────
 
 test "ParamsDeserializer: enter_field + deser_int/deser_str round-trip" {
-    mut d = ParamsDeserializer.at([("id", "42"), ("name", "gizmo")])
+    mut d = ParamsDeserializer.new([("id", "42"), ("name", "gizmo")])
     ro d1 = d.enter_field("id")!!
     mut d1m = d1
     assert(d1m.deser_int()!! == 42)
@@ -68,26 +68,26 @@ test "ParamsDeserializer: enter_field + deser_int/deser_str round-trip" {
 }
 
 test "ParamsDeserializer: enter_field on a missing key -> MissingField error" {
-    mut d = ParamsDeserializer.at([("id", "42")])
+    mut d = ParamsDeserializer.new([("id", "42")])
     ro r = d.enter_field("missing")
     assert(match r { Err(_) => true, Ok(_) => false })
 }
 
 test "ParamsDeserializer: has_field reflects presence" {
-    mut d = ParamsDeserializer.at([("id", "42")])
+    mut d = ParamsDeserializer.new([("id", "42")])
     assert(d.has_field("id")!! == true)
     assert(d.has_field("nope")!! == false)
 }
 
 test "ParamsDeserializer: enter_field_or_null -> null cursor for a missing key" {
-    mut d = ParamsDeserializer.at([("id", "42")])
+    mut d = ParamsDeserializer.new([("id", "42")])
     ro sub = d.enter_field_or_null("missing")!!
     mut subm = sub
     assert(subm.is_null()!! == true)
 }
 
 test "QueryDeserializer: percent-decode + '&'/'=' split, then enter_field + deser" {
-    mut d = QueryDeserializer.at("q=hello%20world&limit=10")
+    mut d = QueryDeserializer.new("q=hello%20world&limit=10")
     ro d1 = d.enter_field("q")!!
     mut d1m = d1
     assert(d1m.deser_str()!! == "hello world")
@@ -97,7 +97,7 @@ test "QueryDeserializer: percent-decode + '&'/'=' split, then enter_field + dese
 }
 
 test "QueryDeserializer: empty query string -> no fields present" {
-    mut d = QueryDeserializer.at("")
+    mut d = QueryDeserializer.new("")
     assert(d.has_field("anything")!! == false)
 }
 

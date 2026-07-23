@@ -40,7 +40,7 @@ export fn json_decode_body[T Deserialize](body []u8) -> Result[T, HttpError] {
     match body.to_str() {
         Ok(s) => match Json.parse(s) {
             Ok(v) => {
-                mut d = JsonDeserializer.at(v, 0, 128)
+                mut d = JsonDeserializer.new(v, 0, 128)
                 match T.deserialize(d) {
                     Ok(x)  => Ok(x)
                     Err(e) => Err(HttpError.decode_error(e.to_str()))
@@ -69,7 +69,7 @@ export fn Response consume @json_as[T Deserialize]() -> Result[T, HttpError] {
     match body.to_str() {
         Ok(s) => match Json.parse(s) {
             Ok(v) => {
-                mut d = JsonDeserializer.at(v, 0, 128)
+                mut d = JsonDeserializer.new(v, 0, 128)
                 match T.deserialize(d) {
                     Ok(x)  => Ok(x)
                     Err(e) => Err(HttpError.decode_error(e.to_str()))
