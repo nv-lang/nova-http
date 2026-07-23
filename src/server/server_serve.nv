@@ -48,3 +48,46 @@ module http.server
 /// in `http.serve`.
 #stable(since = "0.1")
 export fn router_callback(router Router) -> fn([]u8) -> ServerResponse => |raw| route_once(router, raw)
+
+/// Same as `router_callback`, but closes over a `MultipartLimits` snapshot
+/// (`[M-222.11-multipart-limits-not-wired-to-serverpolicy]`) instead of
+/// `route_once`'s implicit default — `http.serve.serve_router` is the one
+/// caller that has a `ServerPolicy` (and therefore `policy.multipart_limits()`)
+/// available to pass here; see `route_once_with_multipart_limits`'s own
+/// doc-comment (`server.nv`) for the full channel.
+#stable(since = "0.1")
+export fn router_callback_with_limits(router Router, limits MultipartLimits) -> fn([]u8) -> ServerResponse {
+    // Destructure `limits` into three PLAIN `int`s BEFORE building the
+    // closure, and DO NOT capture the `MultipartLimits` record itself —
+    // `[M-closure-capture-value-struct-ptr-abi-mismatch]` (found wiring this
+    // fn): a multi-field `value` record parameter is passed BY POINTER at
+    // the C ABI level (`NovaValue_MultipartLimits* limits`, matching every
+    // OTHER fn taking `MultipartLimits` in this package —
+    // `parse_multipart_body`/`route_once_with_multipart_limits`), but
+    // CAPTURING that same parameter into a closure's env struct declares the
+    // env field BY VALUE (`NovaValue_MultipartLimits _nv_fv_..._limits`,
+    // no `*`) — the generated capture-assignment then stores a pointer into
+    // a value-typed field (CC-FAIL "assigning ... from incompatible type
+    // ... dereference with *"), and the lambda body's own read-back,
+    // needing to pass `limits` onward to a fn expecting the pointer ABI,
+    // tries to re-derive a pointer from what is now a plain value
+    // (`(&((*limits)))` — CC-FAIL "indirection requires pointer operand").
+    // Reproduces regardless of closure-light vs closure-full syntax (both
+    // lower through the SAME env-struct capture codegen). Three bare `int`s
+    // (word-sized, unambiguous by-value capture, same shape `background.nv`'s
+    // own `bool`/`str` captures already prove safe) sidestep the whole class
+    // — reconstructed into a fresh `MultipartLimits` INSIDE the closure,
+    // where it is a plain local, never captured. Report to integrator for
+    // `docs/plans/backlog-followups.md` (this worktree does not touch the
+    // nova repo).
+    ro max_parts = limits.max_parts()
+    ro max_part_size = limits.max_part_size()
+    ro max_total = limits.max_total()
+    fn(raw []u8) -> ServerResponse {
+        mut lim = MultipartLimits.new()
+        lim.max_parts(max_parts)
+        lim.max_part_size(max_part_size)
+        lim.max_total(max_total)
+        route_once_with_multipart_limits(router, raw, lim)
+    }
+}

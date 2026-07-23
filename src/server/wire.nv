@@ -62,7 +62,7 @@ fn parse_request(raw []u8) -> Result[ServerRequest, HttpError] {
 
     // [](str, str).new() в expression-позиции не парсится — типизированный локал.
     ro params [](str, str) = []
-    Ok({ method, target, path, query, version, headers: hm, params, body })
+    Ok({ method, target, path, query, version, headers: hm, params, body, multipart_limits: MultipartLimits.new() })
 }
 
 fn parse_request_line(line []u8) -> Result[(Method, str, str, str, Version), HttpError] {

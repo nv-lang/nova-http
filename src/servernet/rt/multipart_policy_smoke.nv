@@ -1,0 +1,128 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Plan 222 final-plumbing task 3 — LIVE-socket proof that `ServerPolicy`'s
+// multipart-limit knobs (`[M-222.11-multipart-limits-not-wired-to-
+// serverpolicy]`) actually reach `Multipart.from_request` through the FULL
+// `serve_router` path (not just the pure/mock `route_once_with_multipart_
+// limits`/`ServerRequest.multipart_limits` unit coverage already in
+// `../../server/multipart_test.nv`): a real multipart POST over a loopback
+// socket, `ServerPolicy.new().max_multipart_part_size(n)` set BELOW the
+// part's actual size -> `413`; the SAME reduced policy with a part that
+// FITS -> `200` (proves the limit is actually threaded through, not just
+// "always rejects" — the default `MultipartLimits.new()` part cap is 8 MiB,
+// so a positive control needs the SAME reduced policy, not the default).
+//
+// EXPECT_TIMEOUT_MS-marked (standalone per test-conventions.md — binds a
+// real loopback port, same discipline as this folder's other smokes).
+//
+// EXPECT_TIMEOUT_MS 30000
+
+module rt.multipart_policy_smoke
+
+import std.net.{TcpListener, TcpStream, SocketAddr, real_net}
+import ../../server.{Router, ServerRequest, ServerResponse, Multipart}
+import ../../servernet.{ServerPolicy}
+import ../../serve.{serve_router}
+
+fn upload_routes() -> Router {
+    mut r = Router.new()
+    r.post("/upload", fn(req ServerRequest) -> ServerResponse {
+        match Multipart.from_request(req) {
+            Ok(mp) => {
+                ro p = mp.field("big")
+                ro n = match p { Some(part) => part.bytes().len(), None => -1 }
+                ServerResponse.text(200, "part_bytes=${n}")
+            }
+            Err(e) => e.into_response()
+        }
+    })!!
+    r
+}
+
+fn multipart_body(boundary str, part_data str) -> []u8 =>
+    ("--${boundary}\r\nContent-Disposition: form-data; name=\"big\"\r\n\r\n${part_data}\r\n--${boundary}--\r\n").bytes()
+
+fn post_multipart_req(path str, boundary str, body []u8) -> []u8 {
+    mut buf = WriteBuffer.new()
+    buf.write_str("POST ${path} HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data; boundary=${boundary}\r\nContent-Length: ${body.len()}\r\n\r\n")
+    buf.write_bytes(body)
+    buf.into_bytes()
+}
+
+test "serve_router(): multipart part over ServerPolicy.max_multipart_part_size -> 413 (full serve path)" {
+    with Net = real_net() {
+        ro (port_tx, port_rx) = Channel.new(1)
+        ro (got_tx, got_rx) = Channel.new(1)
+        with Fail[TimeoutError] = |_e| {} {
+            supervised(timeout: 3.to_seconds()) {
+                spawn {
+                    consume lst = match TcpListener.bind(SocketAddr.loopback(0)) {
+                        Ok(consume l)  => l
+                        Err(_) => { ro _ = port_tx.try_send(0 as u16); return }
+                    }
+                    ro _ = port_tx.try_send(lst.local_port())
+                    serve_router(lst, upload_routes(), ServerPolicy.new().max_multipart_part_size(5))
+                }
+                spawn {
+                    ro port = match port_rx.recv() { Some(p) => p, None => 0 as u16 }
+                    match TcpStream.connect(SocketAddr.loopback(port)) {
+                        Ok(consume conn) => {
+                            consume cli = conn
+                            ro body = multipart_body("XBOUNDARY", "0123456789") // 10 bytes > 5-byte cap
+                            ro _ = cli.write_all(post_multipart_req("/upload", "XBOUNDARY", body))
+                            match cli.read_to_vec(4096) {
+                                Ok(chunk) => { ro _ = got_tx.try_send(chunk) }
+                                Err(_)    => ()
+                            }
+                            cli.close()
+                        }
+                        Err(_) => ()
+                    }
+                }
+            }
+        }
+        got_tx.close()
+        ro got = got_rx.try_recv() ?? []u8.new()
+        ro s = unsafe { got.to_str_unchecked() }
+        assert(s.contains("413"))
+    }
+}
+
+test "serve_router(): multipart part within the SAME reduced ServerPolicy.max_multipart_part_size -> 200 (proves the value is actually threaded, not just always-reject)" {
+    with Net = real_net() {
+        ro (port_tx, port_rx) = Channel.new(1)
+        ro (got_tx, got_rx) = Channel.new(1)
+        with Fail[TimeoutError] = |_e| {} {
+            supervised(timeout: 3.to_seconds()) {
+                spawn {
+                    consume lst = match TcpListener.bind(SocketAddr.loopback(0)) {
+                        Ok(consume l)  => l
+                        Err(_) => { ro _ = port_tx.try_send(0 as u16); return }
+                    }
+                    ro _ = port_tx.try_send(lst.local_port())
+                    serve_router(lst, upload_routes(), ServerPolicy.new().max_multipart_part_size(5))
+                }
+                spawn {
+                    ro port = match port_rx.recv() { Some(p) => p, None => 0 as u16 }
+                    match TcpStream.connect(SocketAddr.loopback(port)) {
+                        Ok(consume conn) => {
+                            consume cli = conn
+                            ro body = multipart_body("XBOUNDARY", "hi") // 2 bytes <= 5-byte cap
+                            ro _ = cli.write_all(post_multipart_req("/upload", "XBOUNDARY", body))
+                            match cli.read_to_vec(4096) {
+                                Ok(chunk) => { ro _ = got_tx.try_send(chunk) }
+                                Err(_)    => ()
+                            }
+                            cli.close()
+                        }
+                        Err(_) => ()
+                    }
+                }
+            }
+        }
+        got_tx.close()
+        ro got = got_rx.try_recv() ?? []u8.new()
+        ro s = unsafe { got.to_str_unchecked() }
+        assert(s.contains("HTTP/1.1 200 OK"))
+        assert(s.contains("part_bytes=2"))
+    }
+}

@@ -24,7 +24,7 @@
 module http.serve
 
 import std.net.{TcpListener, TcpStream, NetError}
-import ../server.{Router, router_callback}
+import ../server.{Router, router_callback, router_callback_with_limits}
 import ../servernet.{handle_connection, serve, ServerPolicy}
 
 /// `http.servernet.handle_connection`, but taking a `Router` directly (thin
@@ -37,9 +37,13 @@ export fn handle_connection_router(consume stream TcpStream, router Router) Net 
 
 /// `http.servernet.serve`, but taking a `Router` directly (thin sugar) — the
 /// common case: a full accept loop with keep-alive/deadlines/body-cap/
-/// chunked-decode/admission-control (`ServerPolicy`), routed through
-/// `router`.
+/// chunked-decode/admission-control/multipart-limits (`ServerPolicy`), routed
+/// through `router`. Uses `router_callback_with_limits` (not plain
+/// `router_callback`) so `policy.multipart_limits()`
+/// (`[M-222.11-multipart-limits-not-wired-to-serverpolicy]`) actually reaches
+/// `Multipart.from_request` — see that fn's own doc-comment (`server.nv`)
+/// for the full channel.
 #stable(since = "0.1")
 export fn serve_router(consume listener TcpListener, router Router, policy ServerPolicy) Net Time Detach {
-    serve(listener, router_callback(router), policy)
+    serve(listener, router_callback_with_limits(router, policy.multipart_limits()), policy)
 }
