@@ -96,7 +96,7 @@
 module http.server
 
 import std.concurrency.supervisor as sup
-import std.io.{stdout, Io}
+import std.io.{stdout, Io, real_io}
 
 /// FastAPI `BackgroundTasks`-аналог: коллектор задач `fn() -> ()`,
 /// исполняемых ПОСЛЕ отправки ответа клиенту (не задерживают латентность
@@ -113,7 +113,7 @@ export type BackgroundTasks value {
 /// overrides — tests inject a capturing closure instead of stdout-scraping).
 #stable(since = "0.1")
 export fn BackgroundTasks.new() -> BackgroundTasks =>
-    { tasks: [], emit: fn(line str) -> () => default_sink(line) }
+    { tasks: [], emit: fn(line str) -> () { with Io = real_io() { default_sink(line) } } }
 
 /// Queue a task — FIFO order preserved (fluent chain, D117: mutate-in-place
 /// + `-> @`, mirrors `ServerResponse mut @header`/`Cors mut @allow_origin`).

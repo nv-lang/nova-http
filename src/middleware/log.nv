@@ -27,7 +27,7 @@
 module middleware.log
 
 import http.server.{Handler, handler_fn, Middleware, ServerRequest, ServerResponse}
-import std.io.{stdout, Io}
+import std.io.{stdout, Io, real_io}
 import std.runtime.sync.{AtomicInt}
 import std.time.duration
 
@@ -50,7 +50,7 @@ export type Log value {
 /// Default config: request-id on, real-ip off, lines to stdout (`Io` default).
 #stable(since = "0.1")
 export fn Log.new() -> Log =>
-    { emit: fn(line str) -> () => default_sink(line), request_id: true, real_ip: false,
+    { emit: fn(line str) -> () { with Io = real_io() { default_sink(line) } }, request_id: true, real_ip: false,
       counter: AtomicInt.new(0) }
 
 // Default sink: stdout via the ambient `Io` effect (`real_io` is
