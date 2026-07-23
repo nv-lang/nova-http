@@ -1,0 +1,93 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Plan 222.12 Ф.5 — `http.middleware.ratelimit` pin tests. Fully
+// deterministic: bucket refill runs on the mocked `Time`
+// (`with Time = th.fixed_ms(...)` — std/concurrency/rate_limiter_test.nv
+// recipe applied to the HTTP layer). Mock-first: `route_once`, no sockets.
+
+module middleware.ratelimit_test
+
+import http.middleware.ratelimit.{RateLimit, ratelimit}
+import http.server.{Router, route_once, handler_fn, ServerResponse}
+import std.testing.handlers as th
+
+fn req_from(ip str) -> []u8 {
+    consume sb = StringBuilder.new()
+    sb.cap(96)
+    sb.append("GET /x HTTP/1.1\r\nHost: x\r\n")
+    if ip != "" { sb.append("X-Forwarded-For: ${ip}\r\n") }
+    sb.append("\r\n")
+    sb.into_str().bytes()
+}
+
+fn hdr(resp ServerResponse, name str) -> str {
+    match resp.headers.get(name) {
+        Some(hv) => match hv.to_str() { Ok(s) => s, Err(_) => "" }
+        None     => ""
+    }
+}
+
+fn routed(cfg RateLimit) Time -> Router {
+    mut r = Router.new()
+    r.layer(ratelimit(cfg))
+    r.get("/x", handler_fn(|_req| ServerResponse.text(200, "ok")))!!
+    r
+}
+
+test "ratelimit: burst within capacity passes, next request -> 429 + Retry-After" {
+    with Time = th.fixed_ms(0) {
+        ro r = routed(RateLimit.new(2, 1.0))
+        assert(route_once(r, req_from("")).status_code() == 200)
+        assert(route_once(r, req_from("")).status_code() == 200)
+        ro third = route_once(r, req_from(""))
+        assert(third.status_code() == 429)
+        assert(hdr(third, "retry-after") == "1")
+    }
+}
+
+test "ratelimit: refill over mocked time re-admits" {
+    ro r = with Time = th.fixed_ms(0) { routed(RateLimit.new(1, 1.0)) }
+    with Time = th.fixed_ms(0) {
+        assert(route_once(r, req_from("")).status_code() == 200)
+        assert(route_once(r, req_from("")).status_code() == 429)
+    }
+    // 1.1s later: one token refilled.
+    with Time = th.fixed_ms(1100) {
+        assert(route_once(r, req_from("")).status_code() == 200)
+        assert(route_once(r, req_from("")).status_code() == 429)
+    }
+}
+
+test "ratelimit: per_client keys buckets by first X-Forwarded-For hop" {
+    with Time = th.fixed_ms(0) {
+        mut cfg = RateLimit.new(1, 1.0)
+        cfg.per_client(true)
+        ro r = routed(cfg)
+        assert(route_once(r, req_from("1.1.1.1")).status_code() == 200)
+        assert(route_once(r, req_from("1.1.1.1")).status_code() == 429)   // 1.1.1.1 exhausted
+        assert(route_once(r, req_from("2.2.2.2, 10.0.0.1")).status_code() == 200) // other client unaffected
+        assert(route_once(r, req_from("2.2.2.2")).status_code() == 429)   // same first hop = same bucket
+        assert(route_once(r, req_from("")).status_code() == 200)          // headerless "" bucket independent
+    }
+}
+
+test "ratelimit: Retry-After is ceil(1/per_sec)" {
+    with Time = th.fixed_ms(0) {
+        ro r = routed(RateLimit.new(1, 0.4))
+        assert(route_once(r, req_from("")).status_code() == 200)
+        ro limited = route_once(r, req_from(""))
+        assert(limited.status_code() == 429)
+        assert(hdr(limited, "retry-after") == "3")   // 1/0.4 = 2.5 -> ceil 3
+    }
+}
+
+test "ratelimit: one shared table covers all routes of the router" {
+    with Time = th.fixed_ms(0) {
+        mut r = Router.new()
+        r.layer(ratelimit(RateLimit.new(2, 1.0)))
+        r.get("/a", handler_fn(|_req| ServerResponse.text(200, "a")))!!
+        r.get("/b", handler_fn(|_req| ServerResponse.text(200, "b")))!!
+        assert(route_once(r, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n".bytes()).status_code() == 200)
+        assert(route_once(r, "GET /b HTTP/1.1\r\nHost: x\r\n\r\n".bytes()).status_code() == 200)
+        assert(route_once(r, "GET /a HTTP/1.1\r\nHost: x\r\n\r\n".bytes()).status_code() == 429)
+    }
+}

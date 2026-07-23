@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: middleware/cors.nv — `http.middleware.cors` (Plan 222.12 Ф.1).
+// Semantics: tower-http `CorsLayer` (RFC preflight); form: chi-style
+// `Middleware` (222.4 core, src/server/middleware.nv).
+//
+// Coverage: preflight `OPTIONS` (+`Access-Control-Request-Method`) is answered
+// 204 by the middleware itself WITHOUT calling `next`; simple (non-preflight)
+// requests pass through and get `Access-Control-Allow-Origin`/`-Credentials`/
+// `-Expose-Headers` decoration; `Vary` is set so caches never mix per-origin
+// answers (preflight gets the full triple, simple responses get `origin`).
+//
+// RFC trap (plan Ф.1): `Access-Control-Allow-Origin: *` combined with
+// `Access-Control-Allow-Credentials: true` is FORBIDDEN by the spec —
+// `@middleware()` panics on that config (tower-http does exactly this;
+// D325: a panic marks a caller BUG, and this combination is always one).
+// Consequence: an origin echoed into `Allow-Origin` is ALWAYS a value from
+// the caller-authored allowlist (trusted), never raw network input — the
+// only mirrored-from-request values are the preflight `Allow-Methods`/
+// `-Headers` wildcard echoes, and those pass `safe_value` (CR/LF/NUL/
+// non-latin1 reject) before being set, so the panicking `resp.header`
+// setter can never trip on hostile input.
+//
+// Closure discipline ([M-16], middleware.nv/middleware_test.nv precedent):
+// the `Middleware.new(...)` closure calls the TOP-LEVEL `cors_handler`, so
+// every closure captures only from its own direct enclosing scope (no
+// grandparent reach-through).
+
+module middleware.cors
+
+import http.server.{Handler, handler_fn, Middleware, ServerRequest, ServerResponse}
+import std.text
+
+/// CORS policy (fluent config; finish with `@middleware()`).
+/// `Cors.new()` = strict default: nothing allowed (tower-http `CorsLayer::new()`);
+/// `Cors.permissive()` = any origin/methods/headers, no credentials.
+#stable(since = "0.1")
+export type Cors value {
+    priv origins      []str
+    priv any_origin   bool
+    priv methods      []str
+    priv any_methods  bool
+    priv headers      []str
+    priv any_headers  bool
+    priv expose       []str
+    priv credentials  bool
+    priv max_age_secs int      // -1 = unset
+}
+
+/// Strict default: no origin allowed until configured.
+#stable(since = "0.1")
+export fn Cors.new() -> Cors =>
+    { origins: []str.new(), any_origin: false, methods: []str.new(), any_methods: false,
+      headers: []str.new(), any_headers: false, expose: []str.new(), credentials: false,
+      max_age_secs: -1 }
+
+/// Permissive: any origin, any methods, any headers, NO credentials
+/// (tower-http `CorsLayer::permissive()` shape).
+#stable(since = "0.1")
+export fn Cors.permissive() -> Cors {
+    mut c = Cors.new()
+    c.allow_any_origin().allow_any_methods().allow_any_headers()
+    c
+}
+
+/// Allow one exact origin (scheme://host[:port]); repeat to build the list. Chainable (D409).
+#stable(since = "0.1")
+export fn Cors mut @allow_origin(origin str) -> @ { @origins.push(origin) }
+
+/// Allow ANY origin (`Access-Control-Allow-Origin: *`). Incompatible with credentials.
+#stable(since = "0.1")
+export fn Cors mut @allow_any_origin() -> @ { @any_origin = true }
+
+/// Allow one method on preflight (`GET`/`POST`/…); repeat for more.
+#stable(since = "0.1")
+export fn Cors mut @allow_method(method str) -> @ { @methods.push(method) }
+
+/// Allow ANY method on preflight.
+#stable(since = "0.1")
+export fn Cors mut @allow_any_methods() -> @ { @any_methods = true }
+
+/// Allow one request header on preflight; repeat for more.
+#stable(since = "0.1")
+export fn Cors mut @allow_header(name str) -> @ { @headers.push(name) }
+
+/// Allow ANY request headers on preflight (mirrors `Access-Control-Request-Headers`).
+#stable(since = "0.1")
+export fn Cors mut @allow_any_headers() -> @ { @any_headers = true }
+
+/// Expose one response header to the browser (`Access-Control-Expose-Headers`).
+#stable(since = "0.1")
+export fn Cors mut @expose_header(name str) -> @ { @expose.push(name) }
+
+/// Allow credentialed requests (`Access-Control-Allow-Credentials: true`).
+/// Incompatible with `allow_any_origin` (spec-forbidden — `@middleware` panics).
+#stable(since = "0.1")
+export fn Cors mut @credentials(on bool) -> @ { @credentials = on }
+
+/// Preflight cache lifetime (`Access-Control-Max-Age`), seconds.
+#stable(since = "0.1")
+export fn Cors mut @max_age(secs int) -> @ { @max_age_secs = secs }
+
+/// Build the middleware. Panics on the spec-forbidden `*`+credentials combo
+/// (caller-authored config bug, D325).
+#stable(since = "0.1")
+export fn Cors @middleware() -> Middleware {
+    if @any_origin && @credentials {
+        panic("cors: Access-Control-Allow-Origin '*' cannot be combined with credentials (spec-forbidden)")
+    }
+    ro cfg = @
+    Middleware.new(fn(next Handler) -> Handler => cors_handler(cfg, next))
+}
+
+/// Convenience: `cors(Cors.permissive())` → ready `Middleware`.
+#stable(since = "0.1")
+export fn cors(cfg Cors) -> Middleware => cfg.middleware()
+
+// ── internals ───────────────────────────────────────────────────────────────
+
+// Top-level (not nested in `@middleware`) so the `handler_fn` closure captures
+// `cfg`/`next` from its DIRECT enclosing scope only ([M-16] discipline).
+//
+// [M-16]-family workaround (cited, not re-diagnosed; same file-local
+// discipline as middleware_test.nv): capturing the struct PARAM `cfg`
+// directly mis-codegens (param arrives as `NovaValue_Cors*`, the closure env
+// stores it as a value field, the body then dereferences the value —
+// CC-FAIL `indirection requires pointer operand`). Copying to a LOCAL first
+// (`ro c = cfg`) makes the capture a plain value capture, which codegens
+// correctly (repro: revert the copy, `nova test src/middleware`).
+fn cors_handler(cfg Cors, next Handler) -> Handler {
+    ro c = cfg
+    handler_fn(|req| cors_apply(c, next, req))
+}
+
+fn cors_apply(cfg Cors, next Handler, req ServerRequest) -> ServerResponse {
+    ro origin = req.header("origin") ?? ""
+    if origin == "" { return next.handle(req) }        // not a CORS request
+    // `req.method() == Method.Options` mis-codegens for the payload-carrying
+    // `Method` enum (`->tag` emitted on a `nova_int` — CC-FAIL; workaround:
+    // compare the canonical `@str()` form; repro: swap back, `nova test
+    // src/middleware`).
+    ro preflight = req.method().str() == "OPTIONS" && req.header("access-control-request-method").is_some()
+    if preflight {
+        preflight_response(cfg, req, origin)
+    } else {
+        decorate_simple(cfg, next.handle(req), origin)
+    }
+}
+
+fn Cors @origin_allowed(origin str) -> bool {
+    if @any_origin { return true }
+    for o in @origins {
+        if o == origin { return true }
+    }
+    false
+}
+
+// `*` only ever without credentials (`@middleware` panics otherwise); an echo
+// is always a trusted allowlist entry (see file banner).
+fn Cors @allow_origin_value(origin str) -> str =>
+    if @any_origin { "*" } else { origin }
+
+// Simple (non-preflight) response decoration. `Vary: origin` is appended even
+// for a disallowed origin — the answer still depends on the Origin header.
+fn decorate_simple(cfg Cors, resp0 ServerResponse, origin str) -> ServerResponse {
+    mut resp = resp0
+    resp.header("Vary", vary_value(resp, "origin"))
+    if cfg.origin_allowed(origin) {
+        resp.header("Access-Control-Allow-Origin", cfg.allow_origin_value(origin))
+        if cfg.credentials { resp.header("Access-Control-Allow-Credentials", "true") }
+        if cfg.expose.len() > 0 { resp.header("Access-Control-Expose-Headers", cfg.expose.join(", ")) }
+    }
+    resp
+}
+
+// Preflight: answered by the middleware itself, `next` is never called
+// (tower-http behavior; the wrapped route's own 405 fallback never shows).
+// A disallowed origin still gets 204 — just WITHOUT the allow-headers, which
+// is what makes the browser block it.
+fn preflight_response(cfg Cors, req ServerRequest, origin str) -> ServerResponse {
+    mut resp = ServerResponse.empty(204)
+    resp.header("Vary", "origin, access-control-request-method, access-control-request-headers")
+    if cfg.origin_allowed(origin) {
+        resp.header("Access-Control-Allow-Origin", cfg.allow_origin_value(origin))
+        if cfg.credentials { resp.header("Access-Control-Allow-Credentials", "true") }
+        ro mv = cfg.methods_value(req)
+        if mv != "" { resp.header("Access-Control-Allow-Methods", mv) }
+        ro hv = cfg.headers_value(req)
+        if hv != "" { resp.header("Access-Control-Allow-Headers", hv) }
+        if cfg.max_age_secs >= 0 { resp.header("Access-Control-Max-Age", "${cfg.max_age_secs}") }
+    }
+    resp
+}
+
+// `Allow-Methods` value: wildcard `*` is spec-invalid WITH credentials → echo
+// the requested method instead (tower-http rule); explicit list joins as-is.
+fn Cors @methods_value(req ServerRequest) -> str {
+    if @any_methods {
+        if @credentials { safe_mirror(req.header("access-control-request-method") ?? "") } else { "*" }
+    } else {
+        @methods.join(", ")
+    }
+}
+
+// `Allow-Headers` value: wildcard mirrors `Access-Control-Request-Headers`
+// (with credentials `*` would be taken literally by browsers — mirror is
+// always used here, same tower-http `AllowHeaders::mirror_request` shape).
+fn Cors @headers_value(req ServerRequest) -> str {
+    if @any_headers {
+        safe_mirror(req.header("access-control-request-headers") ?? "")
+    } else {
+        @headers.join(", ")
+    }
+}
+
+// Mirror an UNTRUSTED request-header value into a response header: reject
+// CR/LF/NUL/non-latin1 (would panic the total `resp.header` setter) → "".
+fn safe_mirror(s str) -> str {
+    for c in s.chars() {
+        ro cp = c as int
+        if cp == 0x0D || cp == 0x0A || cp == 0x00 || cp > 0xFF { return "" }
+    }
+    s
+}
+
+// Existing `Vary` (if any) + `, token` — HeaderMap set-semantics keeps one line.
+fn vary_value(resp ServerResponse, token str) -> str {
+    match resp.headers.get("vary") {
+        Some(hv) => {
+            ro prev = match hv.to_str() { Ok(s) => s, Err(_) => "" }
+            if prev == "" { token } else { "${prev}, ${token}" }
+        }
+        None => token
+    }
+}

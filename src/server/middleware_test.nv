@@ -165,6 +165,20 @@ test "middleware: MethodRouter's per-route 405 fallback IS wrapped by layers" {
     assert(resp_contains(wire, "x-order: A"))
 }
 
+// Plan 222.12 Ф.1 amendment: with layers present, the DEFAULT 405 (no custom
+// fallback) is materialized at registration and wrapped too — middleware that
+// must see every method on a registered route (CORS preflight `OPTIONS`)
+// depends on it. Wire shape (405 + Allow) stays identical to the dispatch path.
+test "middleware: default 405 (no custom fallback) IS wrapped when layers exist" {
+    mut r = Router.new()
+    r.layer(mark("A"))
+    r.get("/only-get", base_ok())!!
+    ro wire = serve_once(r, post_req("/only-get"))
+    assert(status_line(wire) == "HTTP/1.1 405 Method Not Allowed")
+    assert(resp_contains(wire, "allow: GET"))
+    assert(resp_contains(wire, "x-order: A"))
+}
+
 test "middleware: Router's global 404 fallback is NOT wrapped by layers" {
     mut r = Router.new()
     r.layer(mark("A"))

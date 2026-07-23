@@ -1,0 +1,120 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: middleware/ratelimit.nv — `http.middleware.ratelimit` (Plan
+// 222.12 Ф.5). Semantics: chi `middleware.Throttle` / `tower::limit`; the
+// token bucket itself is the READY `std/concurrency/rate_limiter.nv`
+// (`TokenBucket` — plan's explicit "обёртка, не реализация"). Form:
+// chi-style `Middleware` (222.4).
+//
+// Time: `TokenBucket` runs on the `Time` effect (`Monotonic` refill) —
+// ambient default in prod, `with Time = th.fixed_ms(...)` in tests makes
+// refill fully deterministic (rate_limiter's own AI-first design carried
+// through to the HTTP layer).
+//
+// State sharing: `TokenBucket` and `HashMap` are heap records (no `value` —
+// IoCapture-precedent "the same instance is mutated"), so every
+// closure/copy aliases ONE bucket table; a config built once and layered
+// once limits the route set globally. Keying: default is ONE global bucket
+// (chi Throttle shape); `per_client(true)` keys buckets by the first
+// `X-Forwarded-For` hop (same trust caveat as middleware/log.nv `RealIP` —
+// only meaningful behind a proxy that overwrites the header; absent header
+// → the "" bucket).
+//
+// Known simplification (documented, matches the wrapped module): the bucket
+// is NOT lock-protected — `@acquire` is a read-modify-write over fiber
+// preempt points, so under true M:N parallelism two fibers can in principle
+// both witness the last token. chi guards this with a mutex; our std
+// rate_limiter ships without one, and the wrapper stays honest to it (an
+// over-admission of ±1 token under contention throttles, not corrupts).
+//
+// 429 answers carry `Retry-After: ceil(1/refill_per_sec)` seconds — the
+// earliest moment a single token can exist again.
+
+module middleware.ratelimit
+
+import http.server.{Handler, handler_fn, Middleware, ServerRequest, ServerResponse}
+import std.concurrency.rate_limiter.{TokenBucket}
+import std.collections.hashmap.{HashMap}
+
+/// Rate-limit config (fluent; finish with `@middleware()`).
+/// `capacity` = burst size, `per_sec` = sustained refill rate.
+#stable(since = "0.1")
+export type RateLimit value {
+    priv capacity   int
+    priv per_sec    f64
+    priv per_client bool
+}
+
+/// `capacity` tokens of burst, refilled at `per_sec` tokens/second.
+#stable(since = "0.1")
+export fn RateLimit.new(capacity int, per_sec f64) -> RateLimit =>
+    { capacity, per_sec, per_client: false }
+
+/// Key buckets by the first `X-Forwarded-For` hop instead of one global
+/// bucket (default OFF; trust caveat in the file banner).
+#stable(since = "0.1")
+export fn RateLimit mut @per_client(on bool) -> @ { @per_client = on }
+
+/// Build the middleware. `Time` row: the shared bucket table is created here
+/// (ambient default in prod; a test builds under `th.fixed_ms`).
+#stable(since = "0.1")
+export fn RateLimit @middleware() Time -> Middleware {
+    ro cfg = @
+    ro buckets = HashMap[str, TokenBucket].new()
+    Middleware.new(fn(next Handler) -> Handler => rl_handler(cfg, buckets, next))
+}
+
+/// Convenience: `ratelimit(RateLimit.new(100, 50.0))` → ready `Middleware`.
+#stable(since = "0.1")
+export fn ratelimit(cfg RateLimit) Time -> Middleware => cfg.middleware()
+
+// ── internals ───────────────────────────────────────────────────────────────
+
+// Params → local copies before capture ([M-16]-family, cors.nv precedent).
+fn rl_handler(cfg RateLimit, buckets HashMap[str, TokenBucket], next Handler) -> Handler {
+    ro c = cfg
+    ro b = buckets
+    handler_fn(|req| rl_apply(c, b, next, req))
+}
+
+fn rl_apply(cfg RateLimit, buckets0 HashMap[str, TokenBucket], next Handler, req ServerRequest) Time -> ServerResponse {
+    ro key = if cfg.per_client { client_key(req) } else { "" }
+    mut buckets = buckets0
+    mut bucket = match buckets.get(key) {
+        Some(b) => b
+        None    => {
+            ro b = TokenBucket.new(cfg.capacity as i64, cfg.per_sec)
+            ro _ = buckets.insert(key, b)
+            b
+        }
+    }
+    if bucket.acquire() {
+        next.handle(req)
+    } else {
+        mut resp = ServerResponse.text(429, "429 too many requests")
+        resp.header("Retry-After", "${retry_after_secs(cfg.per_sec)}")
+        resp
+    }
+}
+
+// First X-Forwarded-For hop, trimmed ("" when absent).
+fn client_key(req ServerRequest) -> str {
+    match req.header("x-forwarded-for") {
+        Some(xff) => {
+            ro first = match xff.find(",") {
+                Some(i) => xff[0..i]
+                None    => xff
+            }
+            first.trim_ascii()
+        }
+        None => ""
+    }
+}
+
+// ceil(1/per_sec), at least 1 second.
+fn retry_after_secs(per_sec f64) -> int {
+    if per_sec <= 0.0 { return 1 }
+    ro s = 1.0 / per_sec
+    ro n = s as int
+    ro up = if (n as f64) < s { n + 1 } else { n }
+    if up < 1 { 1 } else { up }
+}

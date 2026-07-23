@@ -1,0 +1,247 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: static.nv — `http.static` static-file serving (Plan 222.12 Ф.3).
+// Semantics: Go stdlib `http.FileServer` (the reference the plan pins for the
+// subtle ETag/304/Range corners) + tower-http `ServeDir`; source of bytes is
+// the `ReadFs` protocol (std/fs/readfs.nv, 210 Ф.6б) — `EmbeddedDir` for
+// prod/tests (pure), `DirFs` for dev live-reload (`Fs` effect; `real_fs` is
+// `#default_handler`, so the mono'd handler body still fits the pure
+// `Handler` row — same ambient-default tolerance as `Time` in
+// middleware/log.nv).
+//
+// Implemented (Go `serveContent` subset, adapted to a ReadFs that has no
+// mtime): strong content ETag (crc32+len — cheap, deterministic),
+// `If-None-Match` → 304 (list + `W/`-prefix tolerant, `*`), single `Range` →
+// 206/416 (`If-Range` ETag guard; malformed → ignored → 200 full, Go's own
+// rule), mime by extension, index file for directory paths.
+// NOT here: `If-Modified-Since`/`Last-Modified` (ReadFs carries no mtime —
+// ETag subsumes it), multi-range/multipart (Go serves it; rare, deferred
+// with the rest of 222.12 follow-ups), HEAD auto-answer (method routing is
+// the Router's job).
+//
+// `..`-escape: `DirFs` rejects it internally (boundary-check, readfs.nv);
+// `EmbeddedDir` is an exact-key map — a `../` key simply doesn't exist. Both
+// arrive at 404 without extra logic here.
+
+module http.static
+
+import http.server.{Handler, handler_fn, ServerRequest, ServerResponse}
+import std.fs.{ReadFs}
+import std.io.{IoError, ErrorKind}
+
+/// Static-serving config (fluent). Defaults: index = "index.html", no
+/// Cache-Control header.
+#stable(since = "0.1")
+export type Static value {
+    priv index         str
+    priv cache_control str
+}
+
+/// Default config.
+#stable(since = "0.1")
+export fn Static.new() -> Static => { index: "index.html", cache_control: "" }
+
+/// Index file appended to "" / trailing-`/` paths (default `index.html`).
+#stable(since = "0.1")
+export fn Static mut @index(name str) -> @ { @index = name }
+
+/// `Cache-Control` header value for 200/206 answers ("" = none).
+#stable(since = "0.1")
+export fn Static mut @cache_control(v str) -> @ { @cache_control = v }
+
+/// Serve `path` (relative, POSIX `/`) from `fs` for `req` — the core
+/// request→response function; wire it with `handler_fn(|req| ...)` (or use
+/// `static_handler` below). Pure for `EmbeddedDir`; carries `Fs` (ambient
+/// default) when mono'd against `DirFs`.
+#stable(since = "0.1")
+export fn serve_path[F ReadFs](fs F, cfg Static, path str, req ServerRequest) -> ServerResponse {
+    ro rel0 = if path.starts_with("/") { path[1..path.byte_len()] } else { path }
+    ro rel = if rel0 == "" || rel0.ends_with("/") { "${rel0}${cfg.index}" } else { rel0 }
+    match fs.read_file(rel) {
+        Ok(data) => file_response(cfg, rel, data, req)
+        Err(e)   => match e.kind {
+            // PermissionDenied = DirFs escape-reject → 404, never leak the boundary.
+            ErrorKind.NotFound         => ServerResponse.text(404, "404 not found")
+            ErrorKind.PermissionDenied => ServerResponse.text(404, "404 not found")
+            _                          => ServerResponse.text(500, "500 internal error")
+        }
+    }
+}
+
+/// Ready `Handler`: serves the route's `{*param}` catch-all from `fs`
+/// (`r.get("/assets/{*path}", static_handler(fs, Static.new(), "path"))`).
+#stable(since = "0.1")
+export fn static_handler[F ReadFs](fs F, cfg Static, param str) -> Handler {
+    // Param → local copies before capture ([M-16]-family, cors.nv precedent).
+    ro f = fs
+    ro c = cfg
+    ro p = param
+    handler_fn(|req| serve_path(f, c, req.param(p) ?? "", req))
+}
+
+// ── internals ───────────────────────────────────────────────────────────────
+
+fn file_response(cfg Static, rel str, data []u8, req ServerRequest) -> ServerResponse {
+    ro etag = etag_of(data)
+    // If-None-Match wins over Range (RFC 9110 §13.2.2 evaluation order).
+    if inm_matches(req.header("if-none-match") ?? "", etag) {
+        mut resp = ServerResponse.empty(304)
+        resp.header("ETag", etag)
+        return resp
+    }
+    ro ct = content_type_for(rel)
+    ro size = data.len()
+    // Single-range handling (Go rules: malformed → ignore; unsatisfiable → 416).
+    ro range_raw = req.header("range") ?? ""
+    ro use_range = range_raw != "" && if_range_ok(req.header("if-range") ?? "", etag)
+    if use_range {
+        ro (kind, start, endi) = parse_range(range_raw, size)
+        if kind == 2 {
+            mut resp = ServerResponse.empty(416)
+            resp.header("Content-Range", "bytes */${size}")
+            return resp
+        }
+        if kind == 1 {
+            mut resp = ServerResponse.bytes(206, ct, data[start..endi + 1])
+            resp.header("ETag", etag)
+            resp.header("Accept-Ranges", "bytes")
+            resp.header("Content-Range", "bytes ${start}-${endi}/${size}")
+            if cfg.cache_control != "" { resp.header("Cache-Control", cfg.cache_control) }
+            return resp
+        }
+        // kind == 0: malformed → fall through to the full 200.
+    }
+    mut resp = ServerResponse.bytes(200, ct, data)
+    resp.header("ETag", etag)
+    resp.header("Accept-Ranges", "bytes")
+    if cfg.cache_control != "" { resp.header("Cache-Control", cfg.cache_control) }
+    resp
+}
+
+// Strong content ETag: `"len(hex)-crc32(hex)"`. Content-derived (not
+// mtime-derived) → identical bytes get identical tags on every host.
+// CRC-32 is INLINE (bitwise IEEE 802.3, no table): `std.checksums.crc32`
+// type-checks from this package but its body is not EMITTED into an
+// external-package CU (lld: undefined `nova_fn_crc32` — same package-CU
+// emission gap as `println`, see middleware/log.nv; worked around locally).
+fn etag_of(data []u8) -> str => "\"${hex_int(data.len())}-${hex_int(crc32_of(data) as int)}\""
+
+fn crc32_of(data []u8) -> u32 {
+    mut crc u32 = 0xFFFFFFFF
+    for b in data {
+        crc = crc ^ (b as u32)
+        mut k = 0
+        while k < 8 {
+            crc = if (crc & 1) == 1 { (crc >> 1) ^ 0xEDB88320 } else { crc >> 1 }
+            k += 1
+        }
+    }
+    crc ^ 0xFFFFFFFF
+}
+
+// `If-None-Match`: `*` or any listed entity-tag equal to `etag`
+// (`W/`-prefix stripped — weak comparison is fine for 304, RFC 9110 §8.8.3.2).
+fn inm_matches(inm str, etag str) -> bool {
+    if inm == "" { return false }
+    for part in inm.split(",") {
+        ro tok = part.trim_ascii()
+        if tok == "*" { return true }
+        ro bare = if tok.starts_with("W/") { tok[2..tok.byte_len()] } else { tok }
+        if bare == etag { return true }
+    }
+    false
+}
+
+// `If-Range`: absent → apply Range; present → only when it matches our ETag
+// exactly (a stale validator must get the FULL body, RFC 9110 §13.1.5).
+fn if_range_ok(if_range str, etag str) -> bool =>
+    if_range == "" || if_range == etag
+
+// Single `bytes=a-b` / `a-` / `-n` → (kind, start, end-inclusive):
+// kind 0 = ignore (malformed/multi-range), 1 = valid, 2 = unsatisfiable.
+fn parse_range(v str, size int) -> (int, int, int) {
+    if !v.starts_with("bytes=") { return (0, 0, 0) }
+    ro spec = v[6..v.byte_len()].trim_ascii()
+    match spec.find(",") { Some(_) => return (0, 0, 0), None => () }   // multi-range: ignore
+    match spec.find("-") {
+        Some(i) => {
+            ro a = spec[0..i]
+            ro b = spec[i + 1..spec.byte_len()]
+            if a == "" {
+                // suffix "-n": last n bytes
+                match to_nonneg_int(b) {
+                    Some(n) => if n == 0 { (2, 0, 0) }
+                               else { ro s = if n >= size { 0 } else { size - n }
+                                      if size == 0 { (2, 0, 0) } else { (1, s, size - 1) } }
+                    None    => (0, 0, 0)
+                }
+            } else {
+                match to_nonneg_int(a) {
+                    Some(start) => {
+                        if start >= size { return (2, 0, 0) }
+                        if b == "" { return (1, start, size - 1) }
+                        match to_nonneg_int(b) {
+                            Some(endv) => if endv < start { (0, 0, 0) }
+                                          else { (1, start, if endv >= size { size - 1 } else { endv }) }
+                            None       => (0, 0, 0)
+                        }
+                    }
+                    None => (0, 0, 0)
+                }
+            }
+        }
+        None => (0, 0, 0)
+    }
+}
+
+fn to_nonneg_int(s str) -> Option[int] {
+    if s.byte_len() == 0 { return None }
+    for c in s.chars() {
+        if !c.is_ascii_digit() { return None }
+    }
+    match s.to_int() { Ok(n) => Some(n), Err(_) => None }
+}
+
+fn hex_int(n int) -> str {
+    if n == 0 { return "0" }
+    ro digits = "0123456789abcdef"
+    mut v = n
+    mut out = ""
+    while v > 0 {
+        ro d = v % 16
+        out = "${digits[d..d + 1]}${out}"
+        v = v / 16
+    }
+    out
+}
+
+// Content-Type by extension (Go `mime.TypeByExtension` spirit, small table).
+fn content_type_for(path str) -> str {
+    ro ext = match path.rfind(".") {
+        Some(i) => path[i + 1..path.byte_len()].to_ascii_lower()
+        None    => ""
+    }
+    match ext {
+        "html" => "text/html; charset=utf-8"
+        "htm"  => "text/html; charset=utf-8"
+        "css"  => "text/css; charset=utf-8"
+        "js"   => "text/javascript; charset=utf-8"
+        "mjs"  => "text/javascript; charset=utf-8"
+        "json" => "application/json"
+        "txt"  => "text/plain; charset=utf-8"
+        "md"   => "text/markdown; charset=utf-8"
+        "svg"  => "image/svg+xml"
+        "png"  => "image/png"
+        "jpg"  => "image/jpeg"
+        "jpeg" => "image/jpeg"
+        "gif"  => "image/gif"
+        "webp" => "image/webp"
+        "ico"  => "image/x-icon"
+        "woff" => "font/woff"
+        "woff2" => "font/woff2"
+        "wasm" => "application/wasm"
+        "pdf"  => "application/pdf"
+        "xml"  => "application/xml"
+        "mp4"  => "video/mp4"
+        _      => "application/octet-stream"
+    }
+}

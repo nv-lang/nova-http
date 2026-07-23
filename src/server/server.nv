@@ -316,6 +316,15 @@ export fn ServerResponse mut @header(name str, value str) -> @ {
     @headers.insert(name, value)!!
 }
 
+/// Copy with a REPLACED fixed body (`with_*` = NEW value, D117) — status,
+/// headers and stream marker preserved. For body-rewriting middleware
+/// (`http.middleware.compress`, 222.12 Ф.4); callers guard
+/// `@is_streaming()` themselves — replacing the fixed body of a streaming
+/// response is meaningless (the producer wins on the wire).
+#stable(since = "0.1")
+export fn ServerResponse @with_body(data []u8) -> ServerResponse =>
+    { @status, @headers, body: data, @stream }
+
 /// Status code (borrow).
 #stable(since = "0.1")
 export fn ServerResponse @status_code() -> int => @status
