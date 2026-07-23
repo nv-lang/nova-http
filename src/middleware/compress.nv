@@ -1,0 +1,159 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: middleware/compress.nv — `http.middleware.compress` (Plan 222.12
+// Ф.4). Semantics: tower-http `CompressionLayer` (content-negotiation with
+// q-values, `Vary: accept-encoding`, don't-recompress/don't-compress-tiny
+// rules); form: chi-style `Middleware` (222.4). Encoder: gzip via the
+// `compress` package (already this package's dependency — client-side
+// auto-DEcompression, 205 Ф.2). Brotli: `compress` ships only
+// `brotli_decode` (no encoder) — `br` negotiation is deliberately absent
+// until an encoder exists; gzip is the universally-accepted baseline.
+//
+// Skip rules (each pinned by a test): streaming responses (chunk producer
+// wins the wire — compressing a fixed body would be dead code), bodies under
+// `min_size` (default 1024 — tiny payloads GROW under gzip framing),
+// responses already carrying `Content-Encoding`, non-compressible
+// content-types (allowlist: `text/*` + json/xml/javascript subtypes —
+// mirrors tower's image/video/zip blocklist from the other side), clients
+// whose `Accept-Encoding` doesn't admit gzip (explicit token, `*` wildcard,
+// `;q=0` refusals honored). A gzip that fails or GROWS the body falls back
+// to the identity response (never fails the request).
+//
+// `Vary: accept-encoding` is appended whenever the response WOULD be
+// negotiable (compressible type, non-streaming) — even when this particular
+// answer stays identity — so shared caches never serve a gzip body to a
+// no-gzip client (tower-http does the same).
+
+module middleware.compress
+
+import http.server.{Handler, handler_fn, Middleware, ServerRequest, ServerResponse}
+import compress.{gzip_encode, CompressLevel}
+
+/// Compression config (fluent; finish with `@middleware()`).
+#stable(since = "0.1")
+export type Compression value {
+    priv min_size int
+    priv level    CompressLevel
+}
+
+/// Defaults: min_size = 1024 bytes, default gzip level.
+#stable(since = "0.1")
+export fn Compression.new() -> Compression =>
+    { min_size: 1024, level: CompressLevel.default() }
+
+/// Do not compress bodies smaller than `n` bytes (default 1024).
+#stable(since = "0.1")
+export fn Compression mut @min_size(n int) -> @ { @min_size = n }
+
+/// gzip level (`CompressLevel.fastest()/default()/best()`).
+#stable(since = "0.1")
+export fn Compression mut @level(l CompressLevel) -> @ { @level = l }
+
+/// Build the middleware.
+#stable(since = "0.1")
+export fn Compression @middleware() -> Middleware {
+    ro cfg = @
+    Middleware.new(fn(next Handler) -> Handler => compress_handler(cfg, next))
+}
+
+/// Convenience: `compression(Compression.new())` → ready `Middleware`.
+#stable(since = "0.1")
+export fn compression(cfg Compression) -> Middleware => cfg.middleware()
+
+// ── internals ───────────────────────────────────────────────────────────────
+
+// Param → local copy before capture ([M-16]-family, cors.nv precedent).
+fn compress_handler(cfg Compression, next Handler) -> Handler {
+    ro c = cfg
+    handler_fn(|req| compress_apply(c, next, req))
+}
+
+fn compress_apply(cfg Compression, next Handler, req ServerRequest) -> ServerResponse {
+    ro resp0 = next.handle(req)
+    if resp0.is_streaming() { return resp0 }
+    if resp0.headers.contains("content-encoding") { return resp0 }
+    if !compressible_type(resp0) { return resp0 }
+    // Negotiable from here on: mark Vary even if this answer stays identity.
+    mut resp = resp0
+    resp.header("Vary", vary_value(resp0, "accept-encoding"))
+    if resp.body.len() < cfg.min_size { return resp }
+    if !accepts_gzip(req.header("accept-encoding") ?? "") { return resp }
+    match gzip_encode(resp.body, cfg.level) {
+        Ok(gz) => {
+            if gz.len() >= resp.body.len() { return resp }   // not worth it
+            // [M-fluent-value-init-local-deref] (221.1 №36): init mut-локали из
+            // fluent-сеттера на value-типе — пятый непокрытый deref-сайт семьи
+            // №9/№10; statement-форма до фикса:
+            mut out = resp
+            out.body(gz)
+            out.header("Content-Encoding", "gzip")
+            out
+        }
+        Err(_) => resp   // encoder failure never fails the request
+    }
+}
+
+// Content-negotiation: does `Accept-Encoding` admit gzip? Explicit `gzip`
+// token wins over `*`; `;q=0` (any zero spelling) is a refusal (RFC 9110
+// §12.5.3 subset: q ranks beyond zero/nonzero don't matter for one coding).
+fn accepts_gzip(ae str) -> bool {
+    if ae == "" { return false }
+    mut star_ok = false
+    mut star_seen = false
+    for part in ae.split(",") {
+        ro item = part.trim_ascii().to_ascii_lower()
+        if item == "" { continue }
+        ro (name, q_zero) = split_coding(item)
+        if name == "gzip" || name == "x-gzip" { return !q_zero }
+        if name == "*" {
+            star_seen = true
+            star_ok = !q_zero
+        }
+    }
+    star_seen && star_ok
+}
+
+// "gzip;q=0.8" → ("gzip", q==0?). Malformed q → treated as nonzero (serve
+// identity is always legal; being permissive here only risks compressing).
+fn split_coding(item str) -> (str, bool) {
+    match item.find(";") {
+        Some(i) => {
+            ro name = item[0..i].trim_ascii()
+            ro params = item[i + 1..item.byte_len()].trim_ascii()
+            (name, q_is_zero(params))
+        }
+        None => (item, false)
+    }
+}
+
+// "q=0", "q=0.0", "q=0.000" → true; anything else → false.
+fn q_is_zero(params str) -> bool {
+    if !params.starts_with("q=") { return false }
+    ro v = params[2..params.byte_len()].trim_ascii()
+    if v.byte_len() == 0 { return false }
+    for c in v.chars() {
+        if c != '0' && c != '.' { return false }
+    }
+    true
+}
+
+// Allowlist: `text/*` or a json/xml/javascript-ish subtype. Everything else
+// (images, video, archives, octet-stream) is assumed pre-compressed.
+fn compressible_type(resp ServerResponse) -> bool {
+    ro ct = match resp.headers.get("content-type") {
+        Some(hv) => match hv.to_str() { Ok(s) => s.to_ascii_lower(), Err(_) => "" }
+        None     => ""
+    }
+    if ct == "" { return false }
+    ct.starts_with("text/") || ct.contains("json") || ct.contains("xml") || ct.contains("javascript")
+}
+
+// Existing `Vary` (if any) + `, token` (HeaderMap set-semantics — one line).
+fn vary_value(resp ServerResponse, token str) -> str {
+    match resp.headers.get("vary") {
+        Some(hv) => {
+            ro prev = match hv.to_str() { Ok(s) => s, Err(_) => "" }
+            if prev == "" { token } else { "${prev}, ${token}" }
+        }
+        None => token
+    }
+}

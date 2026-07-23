@@ -164,7 +164,7 @@ export type StreamBody value { priv f fn() -> Option[[]u8] }
 export type ServerResponse value {
     ro status  int
     ro headers HeaderMap
-    ro body    []u8
+    body       []u8
     ro stream  Option[StreamBody]
 }
 
@@ -314,6 +314,18 @@ export fn sse_event(event str, data str) -> []u8 {
 #stable(since = "0.1")
 export fn ServerResponse mut @header(name str, value str) -> @ {
     @headers.insert(name, value)!!
+}
+
+/// Copy with a REPLACED fixed body (`with_*` = NEW value, D117) — status,
+/// headers and stream marker preserved. For body-rewriting middleware
+/// (`http.middleware.compress`, 222.12 Ф.4); callers guard
+/// `@is_streaming()` themselves — replacing the fixed body of a streaming
+/// response is meaningless (the producer wins on the wire).
+/// Property-style by arity (D84/D117/D409): fluent setter returns `@`
+/// (owner 2026-07-23: `with_body` was a second door — retired pre-release).
+#stable(since = "0.1")
+export fn ServerResponse mut @body(data []u8) -> @ {
+    @body = data
 }
 
 /// Status code (borrow).

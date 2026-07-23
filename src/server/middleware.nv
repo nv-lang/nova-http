@@ -1,0 +1,173 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: middleware.nv — `polaris.middleware` composition core (Plan
+// 222.4). Basis: Go/`chi` — their `func(http.Handler) http.Handler` is our
+// `fn(next Handler) -> Handler`, ONE-TO-ONE (plan banner). Tower's generic
+// `Service` (poll_ready/backpressure) is explicitly NOT ported (plan §4):
+// our sync fiber model has no async readiness signal to speak of, and
+// backpressure already lives at the accept-loop (222.7 admission-bounded).
+//
+// `Middleware` is a newtype wrapping the plain higher-order fn (uniform with
+// `Handler`, server.nv:329 — "concrete closure newtype", not a bare fn value)
+// so composition methods (`@apply`/`@then`) can hang off it (D84 property
+// style throughout).
+//
+// File placement: peer of `server.nv`/`server_router.nv` in the SAME module
+// (`http.server`) — folder-module peers compile in sorted order (D78).
+// `middleware.nv` sorts BEFORE both (`m` < `s`) — this is the CORRECT
+// direction for the one real embed-by-value this file introduces: `Router`
+// (server_router.nv) gets a NEW `mut layers []Middleware` field below, so
+// `Middleware` must already be complete by the time `server_router.nv`'s
+// `Router` struct is declared — which this ordering guarantees. The
+// reverse concern (`Middleware`'s OWN field, `fn(Handler) -> Handler`, needs
+// `Handler` from `server.nv`, which sorts AFTER this file) is the same
+// "precautionary, not a hard requirement" situation `extract.nv`'s banner
+// documents for its own use of `Router`/`ServerRequest` — a closure/fn-type
+// FIELD is not the same hazard as embedding another module's STRUCT by
+// value as a new member (`MethodEntry.handler`/`RouteNode.methods` do that,
+// which is why `server_router.nv` itself must sort after `server.nv`); this
+// compiled clean, so the concern doesn't materialize here either.
+//
+// ── Router integration (edits in `server_router.nv`: `Router.layers` field +
+// `Router.@layer`) ───────────────────────────────────────────────────────
+// Layers accumulate on `Router.@layers` and are baked into each
+// `MethodRouter`'s handlers INSIDE `@insert_segs` — i.e. at REGISTRATION
+// time (`@route`/`@get`/…/`@nest` all funnel through `@insert_segs`), NOT at
+// `@dispatch` (cheaper: one closure-wrap per route at setup, not one per
+// request — plan §2).
+//
+// Order — REAL-chi semantics (this plan-run's explicit resolution of the
+// plan draft's own admitted confusion, plan §2: "частый источник путаницы").
+// The plan's illustrative text there ("r.layer(a); r.layer(b) → запрос идёт
+// b → a → handler", i.e. LATER-added = outer) does NOT match actual `chi`
+// behavior: `chi`'s `chain()` (middleware.go) builds
+// `h := mws[last](endpoint)` then wraps OUTWARD with `mws[i]` for
+// `i = len-2 downTo 0` — `mws[0]` (FIRST-registered) ends up OUTERMOST and
+// runs FIRST at request time (same for Express `app.use(a); app.use(b)` —
+// `a` runs first). This file implements the REAL rule: **first `.layer()`
+// call = outermost, runs first**; `r.layer(a); r.layer(b)` → request flow
+// is `a → b → handler`. Pin-tested in `middleware_test.nv`.
+//
+// `Router.@fallback` (the GLOBAL 404, set independently of `@route`/
+// `@insert_segs`) is NOT wrapped by layers — it isn't a registered "route"
+// in the trie at all, so per-Handler wrap-at-registration has no hook for
+// it. This makes our `.layer()` behave like Axum's `route_layer` (applies
+// only to routes actually registered on THIS router) rather than Axum's
+// `.layer()` (which wraps the whole tower `Service`, fallback included,
+// because it wraps DISPATCH as a whole — the "expensive" per-request shape
+// this plan deliberately avoids, §4). `MethodRouter.@fallback` (the
+// PER-ROUTE 405 override) DOES get wrapped — it is set as part of building
+// the very `MethodRouter` that `@route`/`@insert_segs` registers, same as
+// any GET/POST handler on that route. Both choices are pin-tested in
+// `middleware_test.nv`.
+//
+// `@nest`'s "parent layers on top of sub's own" (plan §3) falls out of this
+// design for free: `@nest` re-inserts `sub`'s already-collected routes via
+// the SAME `self.@insert_segs` (server_router.nv's `@nest` body), which
+// wraps them (again) with the PARENT's current `@layers` — `sub`'s routes
+// were already wrapped with SUB's own layers back when they were registered
+// on `sub` (value semantics: `sub` itself is never mutated by `@nest`, see
+// that file's banner), so the parent's layers land OUTSIDE. The plan's
+// flagged "pitfall" (double-application if `sub` was nested elsewhere too)
+// does not actually trigger under value semantics — `wrap_method_router`
+// below returns a NEW `MethodRouter`, `sub`'s own tree is read-only to
+// `@nest` — but a pin-test proves it (nesting the SAME sub into two parents
+// with different layer sets, no cross-contamination).
+
+module http.server
+
+/// A middleware: wraps a `Handler` into a new `Handler` (Go/`chi`
+/// `func(http.Handler) http.Handler`; Express `use`-spirit). Newtype (not a
+/// bare `fn` value) so composition methods hang off it — uniform with
+/// `Handler` (server.nv:329).
+#stable(since = "0.1")
+export type Middleware value { priv f fn(Handler) -> Handler }
+
+/// Wrap a closure as a `Middleware`.
+#stable(since = "0.1")
+export fn Middleware.new(f fn(Handler) -> Handler) -> Middleware => { f }
+
+/// Apply this middleware to a concrete handler, producing the wrapped `Handler`.
+#stable(since = "0.1")
+export fn Middleware @apply(next Handler) -> Handler => (@f)(next)
+
+/// Compose two middlewares: `a.then(b)` — `a` wraps OUTSIDE, `b` INSIDE (`a`
+/// runs first at request time, then `b`, then the eventual handler).
+/// `a.then(b).apply(h) == a.apply(b.apply(h))`.
+// [M-16] (detach-capture, known live compiler bug — cited per task
+// instruction, not re-diagnosed): capturing a RAW `fn(Handler) -> Handler`
+// local (e.g. `ro outer_f = @f`, then calling it as `outer_f(x)` inside a
+// nested closure) codegens a bogus direct call to a top-level function
+// literally named `nova_fn_outer_f` instead of invoking the captured
+// closure value — repro was a one-line change, reverted here. Workaround:
+// capture the whole `Middleware` VALUE (bare `@`, precedent:
+// `std/collections/linkedlist.nv`'s `match @ { ... }`) and invoke it via
+// `.apply(...)` method-call syntax (same shape as `inner.apply(next)` below,
+// which codegens correctly) instead of calling a captured raw fn-value by
+// identifier.
+#stable(since = "0.1")
+export fn Middleware @then(inner Middleware) -> Middleware {
+    ro outer = @
+    Middleware.new(fn(next Handler) -> Handler => outer.apply(inner.apply(next)))
+}
+
+// ── Router integration: wrap-at-registration ───────────────────────────────
+
+// Fold `layers` around `h`. Walking the list back-to-front means the LAST
+// loop iteration applies `layers[0]` around everything already built —
+// `layers[0]` (first `.layer()` call) ends up as the outermost wrap, i.e.
+// the one that runs first (real-chi order, see file banner).
+fn wrap_handler(layers []Middleware, h Handler) -> Handler {
+    mut wrapped = h
+    mut i = layers.len() - 1
+    while i >= 0 {
+        ro mw = layers[i]
+        wrapped = mw.apply(wrapped)
+        i -= 1
+    }
+    wrapped
+}
+
+// Wrap every method-handler AND the per-route 405 `@fallback` held by `mr`
+// (both are part of "registering this route" — see file banner) with
+// `layers`. A no-op (returns `mr` unchanged) when there are no layers yet —
+// avoids an allocation/rebuild on the hot path for routers that never call
+// `.layer()`.
+fn wrap_method_router(layers []Middleware, mr MethodRouter) -> MethodRouter {
+    if layers.len() == 0 { return mr }
+    mut wrapped_routes = []MethodEntry.new()
+    for e in mr.routes {
+        wrapped_routes.push(MethodEntry{method: e.method, handler: wrap_handler(layers, e.handler)})
+    }
+    // No custom 405 override? When this route is covered by layers, MATERIALIZE
+    // the default `405 + Allow` as a fallback Handler and wrap it too (Plan
+    // 222.12 Ф.1 amendment to the 222.4 shape). Rationale: middleware that
+    // must see EVERY method hitting a registered route — CORS preflight
+    // (`OPTIONS` on a GET-only route) is the canonical case — otherwise dies
+    // on the dispatch-time generic 405, which no layer ever wraps. The wire
+    // bytes are IDENTICAL to dispatch's own `method_not_allowed` (same fn,
+    // `Allow` computed from the same method set — fixed at registration,
+    // exactly when this wrap runs); routes with no layers keep `None` and the
+    // dispatch-time path, byte-for-byte as before. Pin-tested in
+    // middleware_test.nv ("default 405 ... IS wrapped").
+    ro wrapped_fallback = match mr.fallback {
+        Some(h) => Some(wrap_handler(layers, h))
+        None    => Some(wrap_handler(layers, default_405_handler(mr.allowed_methods())))
+    }
+    { routes: wrapped_routes, fallback: wrapped_fallback }
+}
+
+// The registration-time twin of dispatch's `method_not_allowed` path (same
+// response builder). `allow` is copied to a local before capture ([M-16]-family
+// param-capture discipline, see middleware/cors.nv `cors_handler`).
+fn default_405_handler(allow []str) -> Handler {
+    ro a = allow
+    handler_fn(|_req| method_not_allowed(a))
+}
+
+/// Accumulate a middleware onto this router's layer chain. Baked into every
+/// handler registered AFTER this call (`@route`/`@get`/…/`@nest` — all
+/// funnel through `@insert_segs`, server_router.nv) — routes registered
+/// BEFORE this call do NOT get it (chi's own documented rule: middlewares
+/// must be added before the routes they should cover). Chainable (D409).
+#stable(since = "0.1")
+export fn Router mut @layer(mw Middleware) -> @ { @layers.push(mw) }

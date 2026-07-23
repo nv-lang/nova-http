@@ -1,0 +1,542 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: auth.nv — `polaris.auth` blocks (Plan 222.13): `Bearer`/`BasicAuth`
+// header extractors (Ф.1), `JwtClaims[T]` over std `Jwt.decode_hs256` (Ф.2 —
+// crypto is NOT reimplemented here, std/crypto/{jwt,hmac}.nv is the engine;
+// this file is wrappers ONLY, plan §1), cookie-jar extractor + `Set-Cookie`
+// response helper (axum-extra shape), and the sessions SKELETON (Ф.3:
+// `SessionStore` protocol + `MemorySessionStore` (HashMap+Mutex) +
+// `session_layer` middleware on the 222.4 `Middleware` core).
+//
+// File placement: peer of `server.nv`/`middleware.nv`/`respond.nv`/`extract.nv`
+// in the SAME module (`http.server`) — folder-module peers compile in sorted
+// order (D78); `auth.nv` sorts FIRST among the peers. That is safe here for the
+// same reason `middleware.nv`'s banner spells out: the only HARD ordering
+// hazard is embedding a LATER-sorting peer's struct BY VALUE inside a NEW
+// struct — nothing below does that (`Bearer`/`BasicAuth`/`CookieJar`/
+// `SessionData`/`SessionConfig` embed only root-`module http` types
+// (`Cookie`/`SameSite` — a different, earlier-compiled module) or scalars;
+// `Middleware`/`Handler`/`ServerRequest` appear in fn SIGNATURES only, the
+// "precautionary, not a hard requirement" case those banners document).
+//
+// ── Design decisions (this wave, documented not guessed) ──────────────────
+// · §5.1 form (JWT injection): `JwtAuth` config value + method-level-generic
+//   `@claims_at[T Deserialize](req, now_ms)` — the "секрет через
+//   конфиг-замыкание/State" form. NOT a `#impl(FromRequest)` on `JwtClaims[T]`:
+//   (a) `from_request(req)` has no secret channel (plan §3), and (b) a GENERIC
+//   wrapper's `.from_request(req)` call is the exact shape blocked end-to-end
+//   by live [M-generic-static-method-value-arg-addr-mismatch] (extract_test.nv
+//   banner). The concrete-receiver + method-generic + turbofish call
+//   (`auth.claims_at[MyClaims](req, now)`) mirrors the WORKING
+//   `Response @json_as[T]()` precedent (serdejson.nv:67).
+// · Explicit `now_ms u64` instead of the `Time` effect: `Handler` is a plain
+//   `fn(ServerRequest) -> ServerResponse` with NO effect row, so a handler
+//   body cannot call a `Time`-effectful fn (`Jwt.validate_hs256`) under
+//   --strict-effects. exp/nbf checking is therefore inlined here against a
+//   caller-supplied clock (mirrors std jwt.nv:137-159 — validation logic, not
+//   crypto), deterministic in tests by construction (the same AI-first goal
+//   jwt.nv states for `th.fixed_ms`).
+// · `require_jwt(auth)` middleware verifies SIGNATURE + exp/nbf via the
+//   `now_fn` closure supplied at construction (caller decides the clock —
+//   same explicit-clock reasoning as above).
+// · Sessions: `ttl` lives on the STORE (`MemorySessionStore.new(ttl_ms)`), not
+//   per-`@save` as the plan sketch drew — `@save(id, data, now_ms)` keeps the
+//   protocol effect-free with one clock argument instead of two (deviation
+//   documented for the umbrella integrator). Lazy TTL eviction happens on
+//   `@load` (expired entry → removed + `None`), tower-sessions-style.
+// · `session_layer` ensures a session id: existing cookie → injects
+//   `("session_id", sid)` into `req.params`; missing → generates via `id_gen`,
+//   EAGER-saves an empty `SessionData` and sets the session cookie on the
+//   response with the config's SECURE DEFAULTS (http_only=true, secure=true,
+//   SameSite=Lax — plan §4 "иначе типовая дыра").
+// · id/clock come in as plain closures (`id_gen fn() -> str`,
+//   `now_fn fn() -> u64`) — same effect-row constraint as above; production
+//   callers wrap their entropy source at router-construction time, tests pass
+//   counters. Session-id STRENGTH is the caller's duty (skeleton scope).
+
+module http.server
+
+import http.{HttpError, StatusCode, Cookie, SetCookie, SameSite}
+import std.collections.hashmap.{HashMap}
+import std.crypto.jwt.{Jwt, JwtError}
+import std.encoding.base64.{Base64}
+import std.encoding.json.{JsonValue}
+import std.encoding.serde.{Deserialize, JsonDeserializer}
+import std.runtime.sync.{Mutex}
+// Not referenced HERE — pulls `time.duration` into this CU so the checker can
+// annotate `Timestamp.now()` inside std jwt.nv's `validate_hs256` (compiled as
+// part of this CU via the `std.crypto.jwt` import above; without this the
+// package build ICEs: emit_c.rs:55932 "[P67-LEGACY] Path call return type
+// unknown for method=now").
+import std.time.duration.{Timestamp}
+
+// ── shared 401 helpers ─────────────────────────────────────────────────────
+
+fn err_401() -> HttpError => HttpError.new(Status(StatusCode.unauthorized()))
+
+/// A full `401 Unauthorized` response carrying `WWW-Authenticate: Bearer`
+/// (RFC 6750 §3 — the challenge an extractor-level `HttpError` cannot carry;
+/// used by `require_jwt`, available to hand-rolled guards).
+#stable(since = "0.1")
+export fn unauthorized_bearer() -> ServerResponse {
+    mut r = ServerResponse.text(401, "401 unauthorized")
+    r.header("WWW-Authenticate", "Bearer")
+    r
+}
+
+// Split `Authorization` into (scheme, rest); scheme match is case-insensitive
+// (RFC 7235 §2.1).
+fn auth_scheme(req ServerRequest, want str) -> Result[str, HttpError] {
+    match req.header("Authorization") {
+        Some(s) => match s.split_once(" ") {
+            Some((scheme, rest)) => {
+                if scheme.to_ascii_lower() == want { Ok(rest.trim_ascii()) } else { Err(err_401()) }
+            }
+            None => Err(err_401())
+        }
+        None => Err(err_401())
+    }
+}
+
+// ── Bearer (Ф.1) ───────────────────────────────────────────────────────────
+
+/// The raw bearer token from `Authorization: Bearer <token>` (RFC 6750).
+/// Missing header / non-Bearer scheme → 401 (`Status(401)` kind; pair with
+/// `unauthorized_bearer()` when the WWW-Authenticate challenge is wanted).
+#stable(since = "0.1")
+export type Bearer value { priv token str }
+
+/// The token string (property accessor, D117 — not a bare field).
+#stable(since = "0.1")
+export fn Bearer @token() -> str => @token
+
+#impl(FromRequest)
+export fn Bearer.from_request(req ServerRequest) -> Result[Bearer, HttpError] {
+    ro tok = auth_scheme(req, "bearer")?
+    if tok.byte_len() == 0 { return Err(err_401()) }
+    Ok(Bearer{ token: tok })
+}
+
+// ── BasicAuth (Ф.1, RFC 7617) ──────────────────────────────────────────────
+
+/// Basic authorization credentials (`Authorization: Basic base64(user:pass)`).
+#stable(since = "0.1")
+export type BasicAuth value { priv user str, priv pass str }
+
+/// The user-id (property accessor, D117).
+#stable(since = "0.1")
+export fn BasicAuth @user() -> str => @user
+/// The password (property accessor, D117).
+#stable(since = "0.1")
+export fn BasicAuth @pass() -> str => @pass
+
+#impl(FromRequest)
+export fn BasicAuth.from_request(req ServerRequest) -> Result[BasicAuth, HttpError] {
+    ro b64 = auth_scheme(req, "basic")?
+    ro raw = match Base64.decode(b64) {
+        Ok(bs) => bs
+        Err(_) => return Err(err_401())
+    }
+    ro creds = match raw.to_str() {
+        Ok(s)  => s
+        Err(_) => return Err(err_401())
+    }
+    // RFC 7617 §2: user-id MUST NOT contain ':' — first ':' splits.
+    match creds.split_once(":") {
+        Some((u, p)) => Ok(BasicAuth{ user: u, pass: p })
+        None         => Err(err_401())
+    }
+}
+
+// ── JwtClaims[T] over std Jwt (Ф.2) ────────────────────────────────────────
+
+/// Verified, typed JWT claims. NOT `value` — follows the `Json[T]` precedent
+/// ([M-generic-value-self-protocol-wrapper-mono]/-static-ctor-mangle family,
+/// respond.nv banner: generic wrappers stay non-`value`, free/method ctors).
+#stable(since = "0.1")
+export type JwtClaims[T] { priv claims T }
+
+/// The decoded claims (property accessor, D117).
+#stable(since = "0.1")
+export fn JwtClaims[T] @claims() -> T => @claims
+
+/// JWT verification config: the HS256 secret (State-form carrier, plan §3 —
+/// forgetting the secret is a COMPILE error, not a 500).
+#stable(since = "0.1")
+export type JwtAuth value { priv secret []u8 }
+
+/// Build a verifier around an HS256 secret.
+#stable(since = "0.1")
+export fn JwtAuth.new(secret []u8) -> JwtAuth => { secret }
+
+// JwtError → 401 (kind detail in the message; secret never echoed).
+fn jwt_401(e JwtError) -> HttpError {
+    // All verification failures map to 401 — detail kept coarse on purpose
+    // (RFC 6750 §3.1 spirit: don't leak WHY verification failed beyond class).
+    ro _ = e
+    err_401()
+}
+
+// exp/nbf check against an explicit clock — mirrors std jwt.nv:137-159
+// (validation, NOT crypto; see file banner for why the Time effect can't be
+// used from handler context). Seconds-valued claims per RFC 7519 §4.1.4/4.1.5.
+fn jwt_check_time(claims JsonValue, now_ms u64) -> Result[(), HttpError] {
+    ro now_s = now_ms / 1000
+    match claims.object() {
+        Some(m) => {
+            match m.get("exp") {
+                Some(JsonValue.Num(exp_s)) => {
+                    if (now_s as f64) >= exp_s { return Err(err_401()) }
+                }
+                _ => ()
+            }
+            match m.get("nbf") {
+                Some(JsonValue.Num(nbf_s)) => {
+                    if (now_s as f64) < nbf_s { return Err(err_401()) }
+                }
+                _ => ()
+            }
+            Ok(())
+        }
+        None => Err(err_401())
+    }
+}
+
+/// Extract + verify + decode typed claims: `Authorization: Bearer` → HS256
+/// signature (`Jwt.decode_hs256`, std — constant-time compare lives THERE) →
+/// exp/nbf vs `now_ms` → `T` via the same serde engine JSON bodies use.
+/// Turbofish at call sites: `auth.claims_at[MyClaims](req, now_ms)` (the
+/// working `@json_as[T]` shape). Every failure class → 401 `HttpError`
+/// (`IntoResponse` gives the typed reply for free).
+///
+/// `T` MUST opt out of serde's strict-by-default field checking with
+/// `#serde(allow_unknown)`: a JWT payload always carries registered claims
+/// (exp/nbf/iat/iss/... — RFC 7519 §4.1) beyond what `T` declares, so a
+/// strict `T` rejects EVERY real token with `UnknownField` → 401
+/// (verified live in auth_test.nv's claims fixture).
+#stable(since = "0.1")
+export fn JwtAuth @claims_at[T Deserialize](req ServerRequest, now_ms u64) -> Result[JwtClaims[T], HttpError] {
+    ro bearer = Bearer.from_request(req)?
+    ro payload = match Jwt.decode_hs256(@secret, bearer.token()) {
+        Ok(v)  => v
+        Err(e) => return Err(jwt_401(e))
+    }
+    jwt_check_time(payload, now_ms)?
+    // Inlined deserialize (NOT delegated to a bounded generic helper —
+    // [M-176-io-forward-bounded-generic], same inline reasoning as
+    // `Json[T].from_request`, extract.nv).
+    mut d = JsonDeserializer.new(payload, 0, 128)
+    match T.deserialize(d) {
+        Ok(c)  => Ok(JwtClaims{ claims: c })
+        Err(_) => Err(err_401())
+    }
+}
+
+// require_jwt guard body — hoisted to a named top-level fn so every closure
+// captures ONE level only ([M-16] two-level-deep capture segfault, worked
+// around exactly like `mark_handler` in middleware_test.nv).
+fn jwt_guard_handler(auth JwtAuth, now_fn fn() -> u64, next Handler) -> Handler =>
+    handler_fn(|req| {
+        ro verdict = jwt_verify_only(auth, req, now_fn())
+        match verdict {
+            Ok(_)  => next.handle(req)
+            Err(_) => unauthorized_bearer()
+        }
+    })
+
+// Untyped verification (signature + exp/nbf, no claims decode) — the
+// middleware-side check `require_jwt` runs.
+fn jwt_verify_only(auth JwtAuth, req ServerRequest, now_ms u64) -> Result[(), HttpError] {
+    ro bearer = Bearer.from_request(req)?
+    ro payload = match Jwt.decode_hs256(auth.secret, bearer.token()) {
+        Ok(v)  => v
+        Err(e) => return Err(jwt_401(e))
+    }
+    jwt_check_time(payload, now_ms)
+}
+
+/// Middleware guard: reject any request whose `Authorization: Bearer` token
+/// fails HS256 signature or exp/nbf checks with `401` +
+/// `WWW-Authenticate: Bearer`; pass verified requests through untouched.
+/// Typed claims inside the handler come from `@claims_at[T]` (plan §5.1
+/// resolution — the extractor and the guard COMPOSE, neither needs Extension
+/// magic). `now_fn` supplies the clock (file banner: `Handler` has no effect
+/// row, so the `Time` effect cannot be performed here).
+#stable(since = "0.1")
+export fn require_jwt(auth JwtAuth, now_fn fn() -> u64) -> Middleware =>
+    Middleware.new(fn(next Handler) -> Handler => jwt_guard_handler(auth, now_fn, next))
+
+// ── CookieJar (axum-extra shape) + Set-Cookie response helper ─────────────
+
+/// All cookies of a request (`Cookie:` header), parsed once. Missing header →
+/// empty jar (NOT an error — axum-extra `CookieJar` semantics); malformed
+/// header → the parse error (400-class).
+#stable(since = "0.1")
+export type CookieJar value { priv cookies []Cookie }
+
+/// Value of the cookie named `name`, or `None`.
+#stable(since = "0.1")
+export fn CookieJar @get(name str) -> Option[str] {
+    for c in @cookies {
+        if c.name == name { return Some(c.value) }
+    }
+    None
+}
+
+/// All cookies, in header order.
+#stable(since = "0.1")
+export fn CookieJar @all() -> []Cookie => @cookies
+
+/// Number of cookies in the jar.
+#stable(since = "0.1")
+export fn CookieJar @len() -> int => @cookies.len()
+
+#impl(FromRequest)
+export fn CookieJar.from_request(req ServerRequest) -> Result[CookieJar, HttpError] {
+    match req.header("Cookie") {
+        Some(s) => match Cookie.parse_header(s) {
+            Ok(cs) => Ok(CookieJar{ cookies: cs })
+            Err(e) => Err(e)
+        }
+        None => Ok(CookieJar{ cookies: []Cookie.new() })
+    }
+}
+
+/// Append a `Set-Cookie` header (APPEND, not insert — multiple cookies per
+/// response are legal and common). Values are handler-authored (`SetCookie`
+/// is validated by construction) — same `!!` rationale as `@header`
+/// (server.nv). Chainable (D409).
+#stable(since = "0.1")
+export fn ServerResponse mut @set_cookie(c SetCookie) -> @ {
+    @headers.append("Set-Cookie", c.serialize())!!
+}
+
+// ── Sessions skeleton (Ф.3) ────────────────────────────────────────────────
+
+/// A session's key/value data (V1: flat str→str pairs).
+#stable(since = "0.1")
+export type SessionData value { priv kv [](str, str) }
+
+/// Empty session data.
+#stable(since = "0.1")
+export fn SessionData.new() -> SessionData {
+    mut kv [](str, str) = []
+    SessionData{ kv }
+}
+
+/// Value for `key`, or `None`.
+#stable(since = "0.1")
+export fn SessionData @get(key str) -> Option[str] {
+    for (k, v) in @kv {
+        if k == key { return Some(v) }
+    }
+    None
+}
+
+/// Set `key` to `v` (replace-or-append). Chainable (D409).
+#stable(since = "0.1")
+export fn SessionData mut @set(key str, v str) -> @ {
+    mut i = 0
+    while i < @kv.len() {
+        ro (k, _) = @kv[i]
+        if k == key {
+            @kv[i] = (key, v)
+            return
+        }
+        i += 1
+    }
+    @kv.push((key, v))
+}
+
+/// Number of entries.
+#stable(since = "0.1")
+export fn SessionData @len() -> int => @kv.len()
+
+/// Session storage abstraction (in-memory below; Redis/DB are user-land
+/// implementations). All methods take/imply an explicit clock (`now_ms`) —
+/// see file banner (Handler has no effect row → no `Time` effect here).
+/// TTL policy lives on the STORE (documented deviation from the plan sketch's
+/// per-save `ttl` — one clock argument instead of two).
+#stable(since = "0.1")
+export type SessionStore protocol {
+    mut @load(id str, now_ms u64) -> Result[Option[SessionData], HttpError]
+    mut @save(id str, data SessionData, now_ms u64) -> Result[(), HttpError]
+    mut @destroy(id str) -> Result[(), HttpError]
+}
+
+// Stored entry: data + absolute expiry.
+type SessionEntry value { ro data SessionData, ro expires_ms u64 }
+
+/// In-memory `SessionStore`: `HashMap` under a `Mutex` (fiber-safe), lazy TTL
+/// eviction on `@load`.
+#stable(since = "0.1")
+export type MemorySessionStore { priv mu Mutex, priv map HashMap[str, SessionEntry], priv ttl_ms u64 }
+
+/// New store; every saved session lives `ttl_ms` from its save time.
+#stable(since = "0.1")
+export fn MemorySessionStore.new(ttl_ms u64) -> MemorySessionStore =>
+    { mu: Mutex.new(), map: HashMap[str, SessionEntry].new(), ttl_ms }
+
+#impl(SessionStore)
+export fn MemorySessionStore mut @load(id str, now_ms u64) -> Result[Option[SessionData], HttpError] {
+    mut mu = @mu
+    consume g = mu.lock()
+    // Explicit unlock at the single exit (not `defer` — D133's consume-tracking
+    // does not credit a defer'd `.unlock()` in this shape; sync_test.nv:108 form).
+    ro out = match @map.get(id) {
+        Some(e) => {
+            if now_ms >= e.expires_ms {
+                ro _ = @map.remove(id)   // lazy TTL eviction
+                Ok(none_session())
+            } else {
+                Ok(Some(e.data))
+            }
+        }
+        None => Ok(none_session())
+    }
+    g.unlock()
+    out
+}
+
+// Bare `None` in the branchy `Ok(None)` positions above monomorphizes to
+// `Option[int]` in emitted C (same defect class cookie.nv works around with
+// `none_cookie_str`/`none_cookie_int`) — a typed helper pins the instantiation.
+fn none_session() -> Option[SessionData] => None
+
+#impl(SessionStore)
+export fn MemorySessionStore mut @save(id str, data SessionData, now_ms u64) -> Result[(), HttpError] {
+    mut mu = @mu
+    consume g = mu.lock()
+    ro _ = @map.insert(id, SessionEntry{ data, expires_ms: now_ms + @ttl_ms })
+    g.unlock()
+    Ok(())
+}
+
+#impl(SessionStore)
+export fn MemorySessionStore mut @destroy(id str) -> Result[(), HttpError] {
+    mut mu = @mu
+    consume g = mu.lock()
+    ro _ = @map.remove(id)
+    g.unlock()
+    Ok(())
+}
+
+/// Session cookie policy. SECURE DEFAULTS (plan §4): `http_only=true`,
+/// `secure=true`, `same_site=Lax`.
+#stable(since = "0.1")
+export type SessionConfig value {
+    priv cookie_name str
+    priv ttl_ms      u64
+    priv secure      bool
+    priv http_only   bool
+    priv same_site   SameSite
+}
+
+/// Safe-default config: `nova_session` cookie, 1h TTL, HttpOnly+Secure+Lax.
+#stable(since = "0.1")
+export fn SessionConfig.new() -> SessionConfig =>
+    { cookie_name: "nova_session", ttl_ms: 3_600_000, secure: true, http_only: true, same_site: SameSite.Lax }
+
+/// Copy with another cookie name (with_* = NEW value).
+#stable(since = "0.1")
+export fn SessionConfig @with_cookie_name(name str) -> SessionConfig =>
+    { cookie_name: name, @ttl_ms, @secure, @http_only, @same_site }
+
+/// Copy with another TTL (milliseconds; with_* = NEW value).
+#stable(since = "0.1")
+export fn SessionConfig @with_ttl_ms(ttl u64) -> SessionConfig =>
+    { @cookie_name, ttl_ms: ttl, @secure, @http_only, @same_site }
+
+/// Cookie name (property accessor, D117).
+#stable(since = "0.1")
+export fn SessionConfig @cookie_name() -> str => @cookie_name
+/// Session TTL in milliseconds (property accessor, D117).
+#stable(since = "0.1")
+export fn SessionConfig @ttl_ms() -> u64 => @ttl_ms
+
+// Read the session id off the request's Cookie header (None on absent /
+// malformed header — a malformed Cookie header must not 500 a session lookup).
+fn session_id_of(req ServerRequest, cookie_name str) -> Option[str] {
+    match req.header("Cookie") {
+        Some(s) => match Cookie.parse_header(s) {
+            Ok(cs) => {
+                for c in cs {
+                    if c.name == cookie_name { return Some(c.value) }
+                }
+                none_str()
+            }
+            Err(_) => none_str()
+        }
+        None => none_str()
+    }
+}
+
+// Typed None pins the Option instantiation (same defect class + same shape as
+// `none_cookie_str` in cookie.nv / `none_session` above).
+fn none_str() -> Option[str] => None
+
+// session_layer body — hoisted top-level fn, ONE capture level per closure
+// ([M-16], same shape as jwt_guard_handler above / mark_handler in
+// middleware_test.nv). Takes the config UNPACKED into scalars, NOT the
+// `SessionConfig` value: capturing a value-STRUCT param in the closure env
+// emits mismatched value/pointer C (env field declared by value, body emits
+// `*cfg` indirection + ptr-assign — the same live "value/pointer mismatch"
+// family extract_test.nv's banner cites; scalars/str/enum capture cleanly).
+// (params deliberately NOT named after SetCookie fields: a field-SHORTHAND in
+// a record literal inside the closure is missed by closure capture analysis —
+// `use of undeclared identifier` in emitted C; explicit `field: name` with
+// distinct names captures fine.)
+fn session_handler(store MemorySessionStore, cookie_name str, ttl_s int, sec bool,
+                   honly bool, ssite SameSite, now_fn fn() -> u64,
+                   id_gen fn() -> str, next Handler) -> Handler =>
+    handler_fn(|req| {
+        match session_id_of(req, cookie_name) {
+            Some(sid) => {
+                // Existing session cookie: expose the id to the handler via
+                // the params channel (same [](str,str) channel path params use).
+                mut r2 = req
+                mut ps = req.params
+                ps.push(("session_id", sid))
+                r2.params(ps)
+                next.handle(r2)
+            }
+            None => {
+                // No cookie: mint an id, eager-save an empty session, tell
+                // the client (Set-Cookie with the config's secure defaults).
+                ro sid = id_gen()
+                mut st = store
+                ro _ = st.save(sid, SessionData.new(), now_fn())
+                mut r2 = req
+                mut ps = req.params
+                ps.push(("session_id", sid))
+                r2.params(ps)
+                mut resp = next.handle(r2)
+                ro cookie = SetCookie {
+                    name: cookie_name, value: sid, domain: none_str(), path: Some("/"),
+                    max_age: Some(ttl_s), secure: sec, http_only: honly, same_site: ssite,
+                }
+                resp.set_cookie(cookie)
+                resp
+            }
+        }
+    })
+
+/// Session middleware (222.4 core): guarantees every request reaches the
+/// handler with a `("session_id", sid)` param — read it via
+/// `req.param("session_id")`; load/mutate data through the shared store
+/// (`@load`/`@save` with the same clock). New visitors get an empty session
+/// EAGER-saved + a `Set-Cookie` per `cfg` (secure defaults). SKELETON scope:
+/// concrete `MemorySessionStore` (a `[S SessionStore]`-generic layer is the
+/// follow-up once generic-capture codegen is proven safe); `id_gen` supplies
+/// session-id entropy — its strength is the caller's responsibility.
+#stable(since = "0.1")
+export fn session_layer(store MemorySessionStore, cfg SessionConfig, now_fn fn() -> u64,
+                        id_gen fn() -> str) -> Middleware {
+    // Unpack OUTSIDE the closures (see session_handler note).
+    ro cookie_name = cfg.cookie_name
+    ro ttl_s = (cfg.ttl_ms / 1000) as int
+    ro sec = cfg.secure
+    ro honly = cfg.http_only
+    ro ssite = cfg.same_site
+    Middleware.new(fn(next Handler) -> Handler =>
+        session_handler(store, cookie_name, ttl_s, sec, honly, ssite, now_fn, id_gen, next))
+}

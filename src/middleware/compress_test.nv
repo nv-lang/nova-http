@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Plan 222.12 Ф.4 — `http.middleware.compress` pin tests. Round-trip goes
+// through the REAL `compress` package (`gzip_decode` — plan §5's own gate
+// shape). Mock-first: `route_once` on raw bytes, no sockets.
+
+module middleware.compress_test
+
+import http.middleware.compress.{Compression, compression}
+import http.server.{Router, route_once, handler_fn, ServerResponse, StreamBody}
+import compress.{gzip_decode, CompressLevel}
+
+// ~2600 bytes of highly-compressible text (above the 1024 default threshold).
+fn big_text() -> str {
+    consume sb = StringBuilder.new()
+    sb.cap(2600)
+    mut i = 0
+    while i < 200 {
+        sb.append("the quick brown fox jumps over the lazy dog; ")
+        i += 1
+    }
+    sb.into_str()
+}
+
+fn req_ae(ae str) -> []u8 {
+    consume sb = StringBuilder.new()
+    sb.cap(96)
+    sb.append("GET /x HTTP/1.1\r\nHost: x\r\n")
+    if ae != "" { sb.append("Accept-Encoding: ${ae}\r\n") }
+    sb.append("\r\n")
+    sb.into_str().bytes()
+}
+
+fn hdr(resp ServerResponse, name str) -> str {
+    match resp.headers.get(name) {
+        Some(hv) => match hv.to_str() { Ok(s) => s, Err(_) => "" }
+        None     => ""
+    }
+}
+
+// The canned RESPONSE is captured by value (struct copied to a local before
+// capture — [M-16]-family discipline; a captured raw fn-param would hit the
+// bogus-direct-call bug, see middleware/log.nv).
+fn routed_resp(cfg Compression, resp ServerResponse) -> Router {
+    mut r = Router.new()
+    r.layer(compression(cfg))
+    ro rr = resp
+    r.get("/x", handler_fn(|_req| rr))!!
+    r
+}
+
+fn text_ok() -> ServerResponse => ServerResponse.text(200, big_text())
+
+test "compress: gzip applied, decodes back to the original (round-trip)" {
+    ro resp = route_once(routed_resp(Compression.new(), text_ok()), req_ae("gzip"))
+    assert(resp.status_code() == 200)
+    assert(hdr(resp, "content-encoding") == "gzip")
+    assert(hdr(resp, "vary") == "accept-encoding")
+    assert(resp.body.len() < big_text().byte_len())
+    match gzip_decode(resp.body, 1_000_000) {
+        Ok(plain) => assert(unsafe { plain.to_str_unchecked() } == big_text())
+        Err(_)    => assert(false)
+    }
+}
+
+test "compress: no Accept-Encoding -> identity, but Vary is still set" {
+    ro resp = route_once(routed_resp(Compression.new(), text_ok()), req_ae(""))
+    assert(hdr(resp, "content-encoding") == "")
+    assert(hdr(resp, "vary") == "accept-encoding")
+    assert(resp.body.len() == big_text().byte_len())
+}
+
+test "compress: gzip;q=0 refusal honored; * wildcard admits gzip" {
+    ro refused = route_once(routed_resp(Compression.new(), text_ok()), req_ae("gzip;q=0, identity"))
+    assert(hdr(refused, "content-encoding") == "")
+    ro star = route_once(routed_resp(Compression.new(), text_ok()), req_ae("*"))
+    assert(hdr(star, "content-encoding") == "gzip")
+    ro star0 = route_once(routed_resp(Compression.new(), text_ok()), req_ae("*;q=0"))
+    assert(hdr(star0, "content-encoding") == "")
+    ro q8 = route_once(routed_resp(Compression.new(), text_ok()), req_ae("gzip;q=0.8"))
+    assert(hdr(q8, "content-encoding") == "gzip")
+}
+
+// 200 repetitive bytes: under the 1024 default (identity), but big enough
+// that gzip actually SHRINKS it once min_size(16) admits it (a ~34-byte body
+// would be rejected by the grows-under-gzip guard, not the threshold).
+fn small_text() -> str {
+    consume sb = StringBuilder.new()
+    sb.cap(200)
+    mut i = 0
+    while i < 40 {
+        sb.append("tiny ")
+        i += 1
+    }
+    sb.into_str()
+}
+
+test "compress: small bodies below min_size stay identity; min_size(16) compresses them" {
+    ro small = route_once(routed_resp(Compression.new(), ServerResponse.text(200, small_text())), req_ae("gzip"))
+    assert(hdr(small, "content-encoding") == "")
+    mut cfg = Compression.new()
+    cfg.min_size(16).level(CompressLevel.best())
+    ro forced = route_once(routed_resp(cfg, ServerResponse.text(200, small_text())), req_ae("gzip"))
+    assert(hdr(forced, "content-encoding") == "gzip")
+}
+
+test "compress: non-compressible content-type untouched (no Vary either)" {
+    ro resp = route_once(routed_resp(Compression.new(), ServerResponse.bytes(200, "application/octet-stream", big_text().bytes())), req_ae("gzip"))
+    assert(hdr(resp, "content-encoding") == "")
+    assert(hdr(resp, "vary") == "")
+}
+
+fn pre_encoded() -> ServerResponse {
+    mut r = ServerResponse.text(200, big_text())
+    r.header("Content-Encoding", "br")
+    r
+}
+
+test "compress: pre-encoded response is never re-compressed" {
+    ro resp = route_once(routed_resp(Compression.new(), pre_encoded()), req_ae("gzip"))
+    assert(hdr(resp, "content-encoding") == "br")
+    assert(resp.body.len() == big_text().byte_len())
+}
+
+test "compress: streaming (SSE) responses pass through untouched" {
+    ro resp = route_once(routed_resp(Compression.new(), ServerResponse.sse(StreamBody.from_chunks([big_text().bytes()]))), req_ae("gzip"))
+    assert(resp.is_streaming())
+    assert(hdr(resp, "content-encoding") == "")
+}
+
+test "compress: json content-type is compressible" {
+    ro resp = route_once(routed_resp(Compression.new(), ServerResponse.bytes(200, "application/json", big_text().bytes())), req_ae("gzip"))
+    assert(hdr(resp, "content-encoding") == "gzip")
+}

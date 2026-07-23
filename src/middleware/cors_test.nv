@@ -1,0 +1,118 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Plan 222.12 Ф.1 — `http.middleware.cors` pin tests: preflight OPTIONS
+// (answered 204 by the middleware itself, `next`/405-fallback never shows),
+// Allow-Origin echo vs `*`, credentials, wildcard-header mirror, Vary.
+// Mock-first (D361): `route_once` on raw bytes, no sockets.
+
+module middleware.cors_test
+
+import http.middleware.cors.{Cors, cors}
+import http.server.{Router, route_once, handler_fn, ServerResponse}
+
+// Raw HTTP/1.1 request with extra headers (peer of router_test.nv's get_req,
+// which this module cannot see — different module).
+fn req(method str, path str, headers [](str, str)) -> []u8 {
+    consume sb = StringBuilder.new()
+    sb.cap(128)
+    sb.append("${method} ${path} HTTP/1.1\r\nHost: x\r\n")
+    for (k, v) in headers {
+        sb.append("${k}: ${v}\r\n")
+    }
+    sb.append("\r\n")
+    sb.into_str().bytes()
+}
+
+// First value of a response header ("" if absent).
+fn hdr(resp ServerResponse, name str) -> str {
+    match resp.headers.get(name) {
+        Some(hv) => match hv.to_str() { Ok(s) => s, Err(_) => "" }
+        None     => ""
+    }
+}
+
+fn routed(c Cors) -> Router {
+    mut r = Router.new()
+    r.layer(cors(c))
+    r.get("/x", handler_fn(|_req| ServerResponse.text(200, "ok")))!!
+    r
+}
+
+test "cors: request without Origin passes through untouched" {
+    ro resp = route_once(routed(Cors.permissive()), req("GET", "/x", []))
+    assert(resp.status_code() == 200)
+    assert(hdr(resp, "access-control-allow-origin") == "")
+}
+
+test "cors: allowed origin is echoed on a simple response + Vary: origin" {
+    mut c = Cors.new()
+    c.allow_origin("https://a.example")
+    ro resp = route_once(routed(c), req("GET", "/x", [("Origin", "https://a.example")]))
+    assert(resp.status_code() == 200)
+    assert(hdr(resp, "access-control-allow-origin") == "https://a.example")
+    assert(hdr(resp, "vary") == "origin")
+}
+
+test "cors: disallowed origin gets NO allow-origin (but Vary stays)" {
+    mut c = Cors.new()
+    c.allow_origin("https://a.example")
+    ro resp = route_once(routed(c), req("GET", "/x", [("Origin", "https://evil.example")]))
+    assert(resp.status_code() == 200)
+    assert(hdr(resp, "access-control-allow-origin") == "")
+    assert(hdr(resp, "vary") == "origin")
+}
+
+test "cors: permissive -> Allow-Origin: *" {
+    ro resp = route_once(routed(Cors.permissive()), req("GET", "/x", [("Origin", "https://any.example")]))
+    assert(hdr(resp, "access-control-allow-origin") == "*")
+}
+
+test "cors: preflight OPTIONS -> 204 with methods/headers/max-age, next not consulted" {
+    mut c = Cors.new()
+    c.allow_origin("https://a.example").allow_method("GET").allow_method("POST")
+    c.allow_header("x-token").max_age(600)
+    ro resp = route_once(routed(c), req("OPTIONS", "/x",
+        [("Origin", "https://a.example"), ("Access-Control-Request-Method", "POST")]))
+    // The route only registers GET — a dispatched OPTIONS would be the 405
+    // fallback; 204 proves the middleware answered the preflight itself.
+    assert(resp.status_code() == 204)
+    assert(hdr(resp, "access-control-allow-origin") == "https://a.example")
+    assert(hdr(resp, "access-control-allow-methods") == "GET, POST")
+    assert(hdr(resp, "access-control-allow-headers") == "x-token")
+    assert(hdr(resp, "access-control-max-age") == "600")
+    assert(hdr(resp, "vary") == "origin, access-control-request-method, access-control-request-headers")
+}
+
+test "cors: preflight with wildcard headers mirrors Access-Control-Request-Headers" {
+    ro resp = route_once(routed(Cors.permissive()), req("OPTIONS", "/x",
+        [("Origin", "https://any.example"),
+         ("Access-Control-Request-Method", "GET"),
+         ("Access-Control-Request-Headers", "x-a, x-b")]))
+    assert(resp.status_code() == 204)
+    assert(hdr(resp, "access-control-allow-methods") == "*")
+    assert(hdr(resp, "access-control-allow-headers") == "x-a, x-b")
+}
+
+test "cors: credentials echo the origin and set allow-credentials" {
+    mut c = Cors.new()
+    c.allow_origin("https://a.example").credentials(true)
+    ro resp = route_once(routed(c), req("GET", "/x", [("Origin", "https://a.example")]))
+    assert(hdr(resp, "access-control-allow-origin") == "https://a.example")
+    assert(hdr(resp, "access-control-allow-credentials") == "true")
+}
+
+test "cors: preflight from a disallowed origin -> 204 WITHOUT allow-headers" {
+    mut c = Cors.new()
+    c.allow_origin("https://a.example").allow_method("GET")
+    ro resp = route_once(routed(c), req("OPTIONS", "/x",
+        [("Origin", "https://evil.example"), ("Access-Control-Request-Method", "GET")]))
+    assert(resp.status_code() == 204)
+    assert(hdr(resp, "access-control-allow-origin") == "")
+    assert(hdr(resp, "access-control-allow-methods") == "")
+}
+
+test "cors: expose-headers land on simple responses" {
+    mut c = Cors.new()
+    c.allow_origin("https://a.example").expose_header("x-total-count")
+    ro resp = route_once(routed(c), req("GET", "/x", [("Origin", "https://a.example")]))
+    assert(hdr(resp, "access-control-expose-headers") == "x-total-count")
+}

@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: middleware/log.nv — `http.middleware.log` (Plan 222.12 Ф.2).
+// Semantics: chi `middleware.Logger` + `RequestID` + `RealIP` folded into ONE
+// configurable middleware (chi ships three; our config toggles cover the same
+// surface without three separate layer registrations). Form: chi-style
+// `Middleware` (222.4 core).
+//
+// Per request: method, path, status, response-body size and wall duration
+// (`Monotonic` pair around `next.handle` — `Time` effect; ambient default in
+// prod, `with Time = th.fixed_ms(...)` in tests makes every line
+// deterministic, same recipe as std/concurrency/rate_limiter_test.nv).
+// `X-Request-Id` is propagated from the request when present (and safe) or
+// generated from a process-wide `AtomicInt` counter (`#share`, D415 — the
+// config VALUE copies freely between fibers, all copies share one counter
+// cell). `RealIP` is OPT-IN (chi's own caveat: `X-Forwarded-For` is
+// client-controlled — only enable behind a proxy you trust to overwrite it).
+//
+// Effect note: the wrapped handler's BODY calls `Time`-row functions while
+// `Handler` stays the pure `fn(ServerRequest) -> ServerResponse` — allowed
+// because `Time` has an ambient default handler (probed and pinned by the
+// flagship aggregator's `snapshot_body`, examples/flagship §banner).
+//
+// Closure discipline ([M-16]-family, see middleware/cors.nv): struct params
+// are copied to locals before capture; every closure captures only from its
+// direct enclosing scope.
+
+module middleware.log
+
+import http.server.{Handler, handler_fn, Middleware, ServerRequest, ServerResponse}
+import std.io.{stdout, Io}
+import std.runtime.sync.{AtomicInt}
+import std.time.duration
+
+/// Access-log middleware config (fluent; finish with `@middleware()`).
+/// Defaults: request-id ON, real-ip OFF, sink = stdout.
+#stable(since = "0.1")
+export type Log value {
+    // Field deliberately NOT named `sink` (unlike its setter): with a
+    // fn-typed field, `cfg.sink(f)` resolves to CALLING the field's closure
+    // (one string arg) instead of the same-named D84 setter — CC-FAIL
+    // "passing 'void *' to parameter of incompatible type 'nova_str'"
+    // (repro: rename back, `nova test src/middleware`). [M-16]-family
+    // dispatch neighbor, worked around by de-colliding the names.
+    priv emit       fn(str) -> ()
+    priv request_id bool
+    priv real_ip    bool
+    priv counter    AtomicInt
+}
+
+/// Default config: request-id on, real-ip off, lines to stdout (`Io` default).
+#stable(since = "0.1")
+export fn Log.new() -> Log =>
+    { emit: fn(line str) -> () => default_sink(line), request_id: true, real_ip: false,
+      counter: AtomicInt.new(0) }
+
+// Default sink: stdout via the ambient `Io` effect (`real_io` is
+// `#default_handler`, std/io/console.nv — same default-row tolerance the
+// `Time` calls above rely on). NOT `println`: the variadic extern fails to
+// EMIT in an external-package CU ("undefined identifier `println`" at
+// codegen while the checker accepts it — std CUs emit it fine; package-CU
+// gap, worked around rather than blocked on).
+fn default_sink(line str) Io -> () {
+    mut out = stdout()
+    ro _ = out.write("${line}\n".bytes())
+}
+
+/// Redirect log lines (default: stdout). A test passes a capturing closure
+/// here — no sockets, no stdout scraping.
+#stable(since = "0.1")
+export fn Log mut @sink(f fn(str) -> ()) -> @ { @emit = f }
+
+/// Toggle `X-Request-Id` propagation/generation (default ON).
+#stable(since = "0.1")
+export fn Log mut @request_id(on bool) -> @ { @request_id = on }
+
+/// Include the first `X-Forwarded-For` hop in the line (default OFF — the
+/// header is client-controlled; enable only behind a trusted proxy, chi
+/// `RealIP`'s own warning).
+#stable(since = "0.1")
+export fn Log mut @real_ip(on bool) -> @ { @real_ip = on }
+
+/// Build the middleware.
+#stable(since = "0.1")
+export fn Log @middleware() -> Middleware {
+    ro cfg = @
+    Middleware.new(fn(next Handler) -> Handler => log_handler(cfg, next))
+}
+
+/// Convenience: `logger(Log.new())` → ready `Middleware` (chi's name).
+#stable(since = "0.1")
+export fn logger(cfg Log) -> Middleware => cfg.middleware()
+
+// ── internals ───────────────────────────────────────────────────────────────
+
+// Param → local copy before capture ([M-16]-family, cors.nv precedent).
+fn log_handler(cfg Log, next Handler) -> Handler {
+    ro c = cfg
+    handler_fn(|req| log_apply(c, next, req))
+}
+
+fn log_apply(cfg Log, next Handler, req ServerRequest) Time -> ServerResponse {
+    ro t0 = Monotonic.now()
+    ro id = if cfg.request_id { request_id_of(cfg, req) } else { "" }
+    mut resp = next.handle(req)
+    ro ms = Monotonic.now().elapsed_since(t0).millis()
+    if id != "" { resp.header("X-Request-Id", id) }
+    consume sb = StringBuilder.new()
+    sb.cap(96)
+    if id != "" {
+        sb.append("[${id}] ")
+    }
+    sb.append("${req.method().str()} ${req.path()} -> ${resp.status_code()} ${resp.body.len()}B in ${ms}ms")
+    if cfg.real_ip {
+        ro ip = real_ip_of(req)
+        if ip != "" { sb.append(" from ${ip}") }
+    }
+    // [M-16] (cited): `ro emit = cfg.emit; emit(line)` codegens a bogus
+    // direct call to `nova_fn_emit` (undefined symbol). The parenthesized
+    // field-call form emits the correct closure invocation (`(@f)(...)`
+    // precedent, server.nv `Handler @handle`).
+    (cfg.emit)(sb.into_str())
+    resp
+}
+
+// Incoming `X-Request-Id` (if header-safe and short) or a fresh `req-<n>`.
+fn request_id_of(cfg Log, req ServerRequest) -> str {
+    match req.header("x-request-id") {
+        Some(id) => if safe_token(id) { id } else { fresh_id(cfg) }
+        None     => fresh_id(cfg)
+    }
+}
+
+fn fresh_id(cfg Log) -> str {
+    // `AtomicInt` is a `#share` cell — a `mut` BINDING is only needed to
+    // satisfy the receiver-mut check; the copy aliases the same cell.
+    mut counter = cfg.counter
+    ro n = counter.fetch_add(1) + 1
+    "req-${n}"
+}
+
+// First `X-Forwarded-For` hop, trimmed ("" when absent/unsafe).
+fn real_ip_of(req ServerRequest) -> str {
+    match req.header("x-forwarded-for") {
+        Some(xff) => {
+            ro first = match xff.find(",") {
+                Some(i) => xff[0..i]
+                None    => xff
+            }
+            ro ip = first.trim_ascii()
+            if safe_token(ip) { ip } else { "" }
+        }
+        None => ""
+    }
+}
+
+// Visible-ASCII, bounded — safe both for the panicking `resp.header` setter
+// and for keeping log lines one-line (no CR/LF smuggling into the sink).
+fn safe_token(s str) -> bool {
+    if s.byte_len() == 0 || s.byte_len() > 64 { return false }
+    for c in s.chars() {
+        ro cp = c as int
+        if cp < 0x21 || cp > 0x7E { return false }
+    }
+    true
+}
