@@ -192,27 +192,15 @@ export fn serve_connection(consume stream TcpStream, handler fn([]u8) -> ServerR
 #stable(since = "0.1")
 export fn serve(consume listener TcpListener, handler fn([]u8) -> ServerResponse, policy ServerPolicy) Net Time Detach {
     consume lst = listener
-    // [M-nv-spawn-ctx-capture-mut-param-ptr-mismatch] RESIDUAL VARIANT
-    // (2026-07-23 re-check after the coordinator's fix-wave signal, nova
-    // main b31a157f5 + p-fix-2227-blockers): the marker's ORIGINAL repro
-    // (`spawn consume ws = s.share() { ... }` referencing a `mut TcpStream`
-    // PARAMETER inline) IS fixed — confirmed with a standalone probe. This is
-    // a DIFFERENT, still-open variant: capturing a bare (no `mut`/`consume`
-    // qualifier) VALUE-type PARAMETER into a `detach { ... }` ctx, after an
-    // earlier `ro`-receiver method call was made on it in the SAME function
-    // (`policy.max_inflight()` above), still CC-FAILs identically ("assigning
-    // to 'NovaValue_ServerPolicy' from incompatible type
-    // 'NovaValue_ServerPolicy *'"). Minimal isolated repro (12 lines, zero
-    // Net/servernet): a `fn use_it(policy SomeValueRecord) Detach { if
-    // policy.some_method() { detach { policy.some_method() } } }`. Reported
-    // back to the coordinator this same pass — kept here (not silently
-    // dropped) because the fix does NOT cover it yet. Re-binding to a plain
-    // local up front avoids it, same as before. `inflight` itself is a plain
-    // LOCAL (not a parameter) — same as before, it captures into `detach {}`
-    // with no issue (the bug is parameter-specific).
-    ro policy_local = policy
-    ro handler_local = handler
-    mut inflight = Semaphore.new(policy_local.max_inflight())
+    // [M-nv-spawn-ctx-capture-mut-param-ptr-mismatch]: CLOSED (ОКНО-1,
+    // 2026-07-23, nova main f83d3d87f) — the residual variant this file
+    // used to route around (capturing a bare VALUE-type PARAMETER into a
+    // `detach { ... }` ctx after an earlier `ro`-receiver method call on it,
+    // e.g. `policy.max_inflight()` below) is fixed; `policy`/`handler`
+    // capture straight into `detach { }` with no local-rebind indirection
+    // needed anymore (confirmed by this file's own `nova test` run — see
+    // task report for the pass count).
+    mut inflight = Semaphore.new(policy.max_inflight())
     mut running = true
     while running {
         match lst.accept() {
@@ -225,11 +213,11 @@ export fn serve(consume listener TcpListener, handler fn([]u8) -> ServerResponse
                             // exit, success OR panic, no defer/bare-release
                             // pairing needed.
                             consume p {
-                                ro _ = serve_connection(stream, handler_local, policy_local)
+                                ro _ = serve_connection(stream, handler, policy)
                             }
                         }
                         None => {
-                            if policy_local.reject_with_503() {
+                            if policy.reject_with_503() {
                                 ro _ = stream.write_all("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".bytes())
                             }
                             stream.close()
