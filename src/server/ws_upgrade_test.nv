@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: server/ws_upgrade_test.nv — `WebSocketUpgrade` extractor +
+// `is_upgrade_request` (http.ws), driven through a REAL `ServerRequest` built
+// via this module's own `parse_request` (module-private, same-module access
+// — same style as `router_test.nv`/`extract_test.nv`'s own `get_req` helper).
+
+module http.server
+
+import http.ws.{is_upgrade_request}
+
+fn ws_upgrade_req(key str, extra_headers str) -> []u8 =>
+    "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n${extra_headers}\r\n".bytes()
+
+fn plain_get_req(path str) -> []u8 => "GET ${path} HTTP/1.1\r\nHost: x\r\n\r\n".bytes()
+
+test "is_upgrade_request: valid upgrade GET -> true" {
+    ro req = parse_request(ws_upgrade_req("dGhlIHNhbXBsZSBub25jZQ==", ""))!!
+    assert(is_upgrade_request(req))
+}
+
+test "is_upgrade_request: plain GET (no upgrade headers) -> false" {
+    ro req = parse_request(plain_get_req("/"))!!
+    assert(!is_upgrade_request(req))
+}
+
+test "is_upgrade_request: POST with upgrade headers -> false (method must be GET)" {
+    ro raw = "POST /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n".bytes()
+    ro req = parse_request(raw)!!
+    assert(!is_upgrade_request(req))
+}
+
+test "is_upgrade_request: missing Sec-WebSocket-Version -> false" {
+    ro raw = "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n".bytes()
+    ro req = parse_request(raw)!!
+    assert(!is_upgrade_request(req))
+}
+
+test "WebSocketUpgrade.from_request: valid upgrade -> Ok, accept_response computes correct Sec-WebSocket-Accept" {
+    ro req = parse_request(ws_upgrade_req("dGhlIHNhbXBsZSBub25jZQ==", ""))!!
+    ro up = WebSocketUpgrade.from_request(req)!!
+    ro resp = up.accept_response(None)
+    assert(resp.status_code() == 101)
+    ro accept_hdr = resp.headers.get("Sec-WebSocket-Accept")
+    ro accept_val = match accept_hdr { Some(hv) => hv.to_str() ?? "", None => "" }
+    assert(accept_val == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+}
+
+test "WebSocketUpgrade.from_request: not an upgrade request -> Err" {
+    ro req = parse_request(plain_get_req("/"))!!
+    ro r = WebSocketUpgrade.from_request(req)
+    assert(match r { Err(_) => true, Ok(_) => false })
+}
+
+test "WebSocketUpgrade.from_request: Sec-WebSocket-Protocol list parsed + trimmed" {
+    ro req = parse_request(ws_upgrade_req("dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Protocol: chat, superchat\r\n"))!!
+    ro up = WebSocketUpgrade.from_request(req)!!
+    ro ps = up.protocols()
+    assert(ps.len() == 2)
+    assert(ps[0] == "chat")
+    assert(ps[1] == "superchat")
+}
+
+test "WebSocketUpgrade.accept_response: echoes the offered protocol when given" {
+    ro req = parse_request(ws_upgrade_req("dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Protocol: chat\r\n"))!!
+    ro up = WebSocketUpgrade.from_request(req)!!
+    ro resp = up.accept_response(Some("chat"))
+    ro proto_hdr = resp.headers.get("Sec-WebSocket-Protocol")
+    ro proto_val = match proto_hdr { Some(hv) => hv.to_str() ?? "", None => "" }
+    assert(proto_val == "chat")
+}
+
+test "WebSocketUpgrade.on_upgrade: shape-complete — returns a valid 101 response" {
+    ro req = parse_request(ws_upgrade_req("dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Protocol: chat\r\n"))!!
+    ro up = WebSocketUpgrade.from_request(req)!!
+    ro resp = up.on_upgrade(|_ws| ())
+    assert(resp.status_code() == 101)
+    ro proto_hdr = resp.headers.get("Sec-WebSocket-Protocol")
+    ro proto_val = match proto_hdr { Some(hv) => hv.to_str() ?? "", None => "" }
+    assert(proto_val == "chat") // first-offered echoed automatically (plan §5)
+}
