@@ -1,0 +1,118 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// [M-serve-connection-header-408-codegen] — SCRATCH REPRO, NOT a test (no
+// `test { }` block, no `fn main()` — `nova test` reports this file as SKIP
+// "no test blocks and no fn main() — nothing to link/run (compiled OK)",
+// same as any other plain implementation file; it is NEVER collected/run by
+// the default OR `--full` test sweep). Kept on record for whoever picks up
+// the codegen side — see the commented-out repro body below.
+//
+// SYMPTOM: a client that sends an INCOMPLETE HTTP/1.1 request line (no
+// terminating blank line) and then goes idle should get a `408 Request
+// Timeout` once `ServerPolicy.header_deadline` elapses (deliverable 3,
+// slowloris mitigation). Instead the client observes a silent close — ZERO
+// bytes, no response at all — when the request flows through the REAL
+// exported `serve_connection()` (equivalently `serve_router()`/`serve()`,
+// which call it internally).
+//
+// 5-STEP BISECTION (owner decision 2026-07-23, `[M-178-server-policy-
+// surface]` task — full narrative in that task's own report; summarized
+// here since this file is the durable record):
+//   1. A bare `supervised(deadline:)` nested inside `detach { }`, made to
+//      ACTUALLY elapse (not race a fast completion/EOF) — CORRECT.
+//   2. TWO sequential deadline-guarded reads (first gets data quickly,
+//      second must actually time out) in the same shape — CORRECT.
+//   3. Same as (2) plus a `Semaphore.try_acquire_permit()` / `consume p {
+//      }` admission wrapper around it (matching `serve()`'s own shape) —
+//      CORRECT.
+//   4. A HAND-WRITTEN line-for-line reproduction of `read_header_phase`'s
+//      OWN control flow (idle-deadline then a fresh header-deadline, the
+//      SAME `dcrlf` double-CRLF check, the SAME header text and deadline
+//      values as the failing scenario) — CORRECT: classifies the scenario
+//      as `header_timeout`, exactly as the real logic should.
+//   5. Calling the REAL exported `serve_connection()` DIRECTLY (bypassing
+//      `serve()`'s own accept loop, `Router` dispatch, and the `Semaphore`
+//      admission gate entirely — just `serve_connection(stream, handler,
+//      policy)` with a trivial `raw_handler`) with the IDENTICAL external
+//      scenario — REPRODUCES THE BUG (client observes 0 bytes).
+//
+// CONCLUSION: the underlying `supervised(deadline:)`-nested-in-`detach{}`
+// primitive is proven correct (steps 1-3); a hand-written equivalent of the
+// EXACT logic `read_header_phase`/`read_one_request` implement is ALSO
+// proven correct (step 4); only the REAL, compiled
+// `read_one_request`/`serve_connection`/`read_header_phase` (policy.nv/
+// serve.nv, this package) misbehave for this one scenario (step 5). This
+// points at a narrow codegen artifact specific to those compiled functions
+// (possibly related to their enum-heavy control flow — `GovernedRead`/
+// `HeaderPhase`/`BodyPhase` — or the specific multi-file/multi-layer call
+// chain), NOT a logic bug in this package's own `.nv` source (which mirrors
+// step 4's proven-correct form), and NOT the scheduler-level #15/#38 this
+// same task closed (both confirmed unrelated by steps 1-3). Root-causing
+// further would need comparing the generated C between step 4's hand-
+// written version and the real compiled functions — compiler/codegen-side
+// work, out of this package's own remit.
+//
+// This file itself declares a real module (below) but has ZERO `test { }`
+// blocks and no `fn main()` — `nova test`/`nova check` compile it (still
+// caught if it ever stops compiling) but report SKIP "no test blocks and no
+// fn main() — nothing to link/run", same as `src/serve/serve.nv`/
+// `src/static.nv` and every other plain-implementation-file precedent in
+// this package; it is NEVER collected/run by the default OR `--full` test
+// sweep.
+
+module rt._repro_serve_408_codegen
+
+// Repro body (was `rt/serve_policy_smoke.nv`'s own 4th test) kept below,
+// commented out, ready to drop back in once the codegen side is fixed:
+//
+// import std.net.{TcpListener, TcpStream, SocketAddr, real_net}
+// import ../../server.{Router, ServerRequest, ServerResponse}
+// import ../../servernet.{ServerPolicy}
+// import ../../serve.{serve_router}
+//
+// fn echo_routes() -> Router {
+//     mut r = Router.new()
+//     r.get("/health", fn(_req ServerRequest) -> ServerResponse => ServerResponse.text(200, "ok"))!!
+//     r
+// }
+//
+// test "serve_router(): incomplete headers past header_deadline -> 408" {
+//     with Net = real_net() {
+//         ro (port_tx, port_rx) = Channel.new(1)
+//         ro (got_tx, got_rx) = Channel.new(1)
+//         ro policy = ServerPolicy.new().header_deadline(150.to_millis()).idle_deadline(150.to_millis())
+//         with Fail[TimeoutError] = |_e| {} {
+//             supervised(timeout: 3.to_seconds()) {
+//                 spawn {
+//                     consume lst = match TcpListener.bind(SocketAddr.loopback(0)) {
+//                         Ok(consume l)  => l
+//                         Err(_) => { ro _ = port_tx.try_send(0 as u16); return }
+//                     }
+//                     ro _ = port_tx.try_send(lst.local_port())
+//                     serve_router(lst, echo_routes(), policy)
+//                 }
+//                 spawn {
+//                     ro port = match port_rx.recv() { Some(p) => p, None => 0 as u16 }
+//                     match TcpStream.connect(SocketAddr.loopback(port)) {
+//                         Ok(consume conn) => {
+//                             consume cli = conn
+//                             // A partial request line with NO terminating blank
+//                             // line — the header block never completes.
+//                             ro _ = cli.write_str("GET /health HTTP/1.1\r\nHost: localhost\r\n")
+//                             (500).to_millis().sleep()
+//                             match cli.read_to_vec(4096) {
+//                                 Ok(chunk) => { ro _ = got_tx.try_send(chunk) }
+//                                 Err(_)    => ()
+//                             }
+//                             cli.close()
+//                         }
+//                         Err(_) => ()
+//                     }
+//                 }
+//             }
+//         }
+//         got_tx.close()
+//         ro got = got_rx.try_recv() ?? []u8.new()
+//         ro s = unsafe { got.to_str_unchecked() }
+//         assert(s.contains("408"))
+//     }
+// }

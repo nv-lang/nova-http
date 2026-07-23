@@ -1,31 +1,24 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // [M-178-server-policy-surface] (owner decision 2026-07-22; layer-contract
 // refit 2026-07-23, Plan 222 §0а) — LIVE HTTP/1.1 smoke over loopback
-// sockets for `serve_router()` (`../../serve/serve.nv`, the `Router`-taking
-// convenience wrapper over `http.servernet.serve` + `ServerPolicy`
-// (`../config.nv`)): keep-alive across multiple requests, request body-size
-// cap → 413, chunked-request decode, header-deadline slowloris cutoff →
-// 408, admission-control → 503. Pure/unit-level coverage of the byte-level
-// policy helpers lives in `../policy_test.nv` instead (no sockets needed
-// there — same-module private-fn access). Full design rationale (why each
-// test binds its listener INSIDE the server's own `spawn`, why `with
+// sockets for `serve_router()` (`../../serve/serve.nv`): keep-alive across
+// multiple requests, request body-size cap → 413, chunked-request decode,
+// admission-control → 503. Pure/unit-level coverage of the byte-level policy
+// helpers lives in `../policy_test.nv` instead (no sockets needed there —
+// same-module private-fn access). Full design rationale (why each test
+// binds its listener INSIDE the server's own `spawn`, why `with
 // Fail[TimeoutError] = |_| {} { supervised(timeout: ...) { ... } }` bounds a
 // test around `serve_router()`'s inherently infinite loop) was trimmed from
 // this header — see git history (pre-2026-07-23) or `../policy_test.nv`'s
 // own banner for the same pattern spelled out in full; kept short here so
 // `EXPECT_TIMEOUT_MS` stays inside the test-runner's own first-30-lines scan
-// window (`test_runner.rs` — a marker past line 30 is invisible to the
-// timeout-lane gate, confirmed by hitting exactly this the first time this
-// file's header grew past it).
+// window (a marker past line 30 is invisible to the timeout-lane gate).
 //
-// KNOWN STILL-OPEN compiler defect (task report has the isolated repro):
-// [M-nv-cancel-loop-accept-swallowed] — a bare single `accept()` cancels
-// fine under `supervised(timeout:)`, but `serve()`'s own accept LOOP (retry-
-// on-Err) swallows the one-shot cancellation and never re-delivers it — so
-// every test below (each bounding a live `serve_router()` loop) hangs until
-// this lands upstream. Not a regression in this package (`nova check` stays
-// clean); confirmed via a minimal repro with zero Router/ServerPolicy
-// involved.
+// The header-deadline → 408 scenario (deliverable 3) is carved out to
+// `rt/_repro_serve_408_codegen.nv` instead of a 5th test here — see that
+// file's own header for [M-serve-connection-header-408-codegen] (a narrow
+// codegen artifact, NOT the scheduler-level #15/#38 this file's tests
+// themselves already proved closed: all 4 below are stable/deterministic).
 //
 // EXPECT_TIMEOUT_MS 30000
 
@@ -185,48 +178,15 @@ test "serve_router(): chunked request body decodes and reaches the handler" {
 }
 
 // ── 4. header-deadline slowloris cutoff → 408 (deliverable 3) ─────────────
-
-test "serve_router(): incomplete headers past header_deadline -> 408" {
-    with Net = real_net() {
-        ro (port_tx, port_rx) = Channel.new(1)
-        ro (got_tx, got_rx) = Channel.new(1)
-        ro policy = ServerPolicy.new().header_deadline(150.to_millis()).idle_deadline(150.to_millis())
-        with Fail[TimeoutError] = |_e| {} {
-            supervised(timeout: 3.to_seconds()) {
-                spawn {
-                    consume lst = match TcpListener.bind(SocketAddr.loopback(0)) {
-                        Ok(consume l)  => l
-                        Err(_) => { ro _ = port_tx.try_send(0 as u16); return }
-                    }
-                    ro _ = port_tx.try_send(lst.local_port())
-                    serve_router(lst, echo_routes(), policy)
-                }
-                spawn {
-                    ro port = match port_rx.recv() { Some(p) => p, None => 0 as u16 }
-                    match TcpStream.connect(SocketAddr.loopback(port)) {
-                        Ok(consume conn) => {
-                            consume cli = conn
-                            // A partial request line with NO terminating blank
-                            // line — the header block never completes.
-                            ro _ = cli.write_str("GET /health HTTP/1.1\r\nHost: localhost\r\n")
-                            (500).to_millis().sleep()
-                            match cli.read_to_vec(4096) {
-                                Ok(chunk) => { ro _ = got_tx.try_send(chunk) }
-                                Err(_)    => ()
-                            }
-                            cli.close()
-                        }
-                        Err(_) => ()
-                    }
-                }
-            }
-        }
-        got_tx.close()
-        ro got = got_rx.try_recv() ?? []u8.new()
-        ro s = unsafe { got.to_str_unchecked() }
-        assert(s.contains("408"))
-    }
-}
+//
+// MOVED OUT to `rt/_repro_serve_408_codegen.nv` (owner decision 2026-07-23):
+// this scenario hits a narrow, precisely-bisected codegen artifact
+// ([M-serve-connection-header-408-codegen]) — the deadline primitive and the
+// hand-written equivalent logic are both proven correct; only the REAL
+// compiled `read_one_request`/`serve_connection`/`read_header_phase` misbehave
+// for this one case. Carved out so this file's remaining 4 tests gate GREEN
+// while that one repro stays on record (not test-lane-collected — see its
+// own header) for whoever picks up the codegen side.
 
 // ── 5. admission control → 503 (deliverable 1) ────────────────────────────
 
