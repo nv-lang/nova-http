@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: ws/socket.nv — live WebSocket (Plan 222.14 §3/§4, still СЛОЙ 1:
+// this is the RFC 6455 conversation over a raw `TcpStream`, no Router/
+// FromRequest dependency — `WebSocketUpgrade`, the actual extractor, lives
+// in `server/ws_upgrade.nv` where `ServerRequest`/`FromRequest` are visible).
+//
+// Automatic protocol behaviour (plan §4, "not left to the caller"):
+//   · Ping -> auto-Pong reply (RFC 6455 §5.5.3), Ping still surfaced to the
+//     caller informationally (`Message.Ping`) — plan §4 exact wording.
+//   · Fragmentation (`Continuation` frames) reassembled into ONE `Message`
+//     before `@recv()` returns it; control frames (Ping/Pong/Close) MAY be
+//     interleaved mid-fragmentation per RFC 6455 §5.4 and are handled
+//     in-place rather than treated as a protocol violation.
+//   · `max_message_size` enforced on the running total (both the
+//     single-frame AND the reassembled-fragments path) — DoS guard (plan §4).
+//   · Close handshake: receiving a `Close` frame echoes one back (RFC 6455
+//     §5.5.1 "an endpoint MUST send a Close frame in response") before
+//     `@recv()` reports the clean end-of-stream (`Ok(None)`).
+//
+// `WebSocket consume` (D133, same must-consume discipline as `Body`/`File`)
+// — the plan's stated differentiator: forgetting `@close()` is a compile
+// error here, unlike Node/Go's leak-by-default socket handles.
+
+module http.ws
+
+import std.net.{TcpStream, NetError}
+
+/// A decoded application-level WS message (opcodes folded into 4 shapes —
+/// `Continuation` doesn't escape this layer, it is reassembly plumbing).
+#stable(since = "0.1")
+export type Message enum
+    | Text(str)
+    | Binary([]u8)
+    | Ping([]u8)
+    | Pong([]u8)
+
+const DEFAULT_MAX_MESSAGE_SIZE int = 16 * 1024 * 1024 // 16 MiB — конс. дефолт (plan §4)
+
+/// A live WebSocket connection (server-side). MUST-CONSUME — `@close()` is
+/// the only way to discharge it (D133).
+#stable(since = "0.1")
+export type WebSocket consume {
+    priv consume stream TcpStream // D4: TcpStream is ITSELF `consume value` — field-level marker required
+    priv max_message_size int
+    priv buf []u8
+    priv closed bool
+}
+
+/// Wrap an already-upgraded `TcpStream` (default 16 MiB message limit).
+#stable(since = "0.1")
+export fn WebSocket.new(consume stream TcpStream) -> WebSocket =>
+    { stream, max_message_size: DEFAULT_MAX_MESSAGE_SIZE, buf: []u8.new(), closed: false }
+
+/// Wrap an already-upgraded `TcpStream` with an explicit message-size limit
+/// (DoS guard, plan §4 — "лимит размера сообщения обязателен").
+#stable(since = "0.1")
+export fn WebSocket.with_limit(consume stream TcpStream, max_message_size int) -> WebSocket =>
+    { stream, max_message_size, buf: []u8.new(), closed: false }
+
+// ── raw frame I/O over the accumulator buffer (mirrors servernet.nv's own
+// Content-Length accumulate-then-parse `read_request` shape) ──────────────
+
+fn WebSocket mut @fill_at_least(need int) Net -> Result[(), NetError] {
+    mut reading = true
+    mut result Result[(), NetError] = Ok(())
+    while reading && @buf.len() < need {
+        match @stream.read_to_vec(65536) {
+            Ok(chunk) => {
+                if chunk.len() == 0 {
+                    reading = false
+                    result = Err(NetError.Closed)
+                } else {
+                    @buf.append(chunk)
+                }
+            }
+            Err(e) => {
+                reading = false
+                result = Err(e)
+            }
+        }
+    }
+    result
+}
+
+/// Read exactly one frame off the wire (blocking this fiber only — Net park,
+/// not the whole event loop). Enforces server-role masking (RFC 6455 §5.1 —
+/// a compliant server MUST reject an unmasked frame from a client).
+fn WebSocket mut @read_frame() Net -> Result[Frame, WsError] {
+    match @fill_at_least(2) {
+        Ok(_)  => ()
+        Err(_) => return Err(WsError.Closed(1006)) // abnormal closure (browser-convention code; never on the wire)
+    }
+    mut hint = frame_len_hint(@buf)
+    while hint.is_some() {
+        ro more = hint ?? 0
+        match @fill_at_least(@buf.len() + more) {
+            Ok(_)  => ()
+            Err(_) => return Err(WsError.Closed(1006))
+        }
+        hint = frame_len_hint(@buf)
+    }
+    ro masked = ((@buf[1] as int) & 0x80) != 0
+    match Frame.decode(@buf) {
+        Ok((f, n)) => {
+            ro rest []u8 = @buf[n..@buf.len()]
+            @buf = rest
+            if !masked {
+                return Err(WsError.UnmaskedClientFrame)
+            }
+            Ok(f)
+        }
+        Err(e) => Err(e)
+    }
+}
+
+fn WebSocket mut @send_pong(payload []u8) Net -> () {
+    ro pong = Frame.new(true, OpCode.Pong, payload)
+    ro _ = @stream.write_all(pong.encode(false))
+}
+
+fn WebSocket mut @echo_close(payload []u8) Net -> () {
+    if !@closed {
+        ro echo = Frame.new(true, OpCode.Close, payload)
+        ro _ = @stream.write_all(echo.encode(false))
+    }
+    @closed = true
+}
+
+/// Reassemble a (possibly fragmented) message starting at `first`.
+/// Interleaved control frames (Ping/Pong/Close) are handled in place
+/// (RFC 6455 §5.4 permits them mid-fragmentation); a `TooLarge` guard fires
+/// on the RUNNING total, not just the final size.
+fn WebSocket mut @collect_message(first Frame) Net -> Result[[]u8, WsError] {
+    mut acc []u8 = []u8.new()
+    acc.append(first.payload())
+    if acc.len() > @max_message_size {
+        return Err(WsError.TooLarge(acc.len()))
+    }
+    if first.fin() {
+        return Ok(acc)
+    }
+    mut done = false
+    while !done {
+        ro nxt = @read_frame()?
+        match nxt.opcode() {
+            OpCode.Continuation => {
+                acc.append(nxt.payload())
+                if acc.len() > @max_message_size {
+                    return Err(WsError.TooLarge(acc.len()))
+                }
+                if nxt.fin() { done = true }
+            }
+            OpCode.Ping => @send_pong(nxt.payload())
+            OpCode.Pong => ()
+            OpCode.Close => {
+                @echo_close(nxt.payload())
+                return Err(WsError.Closed(1000))
+            }
+            _ => return Err(WsError.ProtocolViolation("expected a continuation frame during a fragmented message"))
+        }
+    }
+    Ok(acc)
+}
+
+// ── public API (plan §3) ────────────────────────────────────────────────────
+
+/// Receive the next application message. `None` = peer closed cleanly (the
+/// close handshake has already been echoed — call `@close()` to release the
+/// socket). Ping/Pong are surfaced informationally (plan §4); Ping ALSO gets
+/// an automatic Pong reply before this returns.
+#stable(since = "0.1")
+export fn WebSocket mut @recv() Net -> Result[Option[Message], WsError] {
+    if @closed { return Ok(None) }
+    ro frame = @read_frame()?
+    match frame.opcode() {
+        OpCode.Ping => {
+            @send_pong(frame.payload())
+            Ok(Some(Message.Ping(frame.payload())))
+        }
+        OpCode.Pong => Ok(Some(Message.Pong(frame.payload())))
+        OpCode.Close => {
+            @echo_close(frame.payload())
+            Ok(None)
+        }
+        OpCode.Text => {
+            ro bytes = @collect_message(frame)?
+            match bytes.to_str() {
+                Ok(s)  => Ok(Some(Message.Text(s)))
+                Err(_) => Err(WsError.ProtocolViolation("invalid UTF-8 in text message"))
+            }
+        }
+        OpCode.Binary => {
+            ro bytes = @collect_message(frame)?
+            Ok(Some(Message.Binary(bytes)))
+        }
+        OpCode.Continuation =>
+            Err(WsError.ProtocolViolation("unexpected continuation frame (no fragmented message in progress)"))
+    }
+}
+
+/// Send one message. Always encodes UNMASKED (`mask: false`) — RFC 6455
+/// §5.1, a server frame must never be masked.
+#stable(since = "0.1")
+export fn WebSocket mut @send(m Message) Net -> Result[(), WsError] {
+    ro frame = match m {
+        Message.Text(s)   => Frame.new(true, OpCode.Text, s.bytes())
+        Message.Binary(b) => Frame.new(true, OpCode.Binary, b)
+        Message.Ping(b)   => Frame.new(true, OpCode.Ping, b)
+        Message.Pong(b)   => Frame.new(true, OpCode.Pong, b)
+    }
+    match @stream.write_all(frame.encode(false)) {
+        Ok(_)  => Ok(())
+        Err(_) => Err(WsError.Closed(1006))
+    }
+}
+
+/// Close handshake (RFC 6455 §7.1.2) + release the socket. MUST-CONSUME
+/// discharge (D133) — the only way to retire a `WebSocket` value.
+#stable(since = "0.1")
+export fn WebSocket consume @close(code u16, reason str) Net -> Result[(), WsError] {
+    if !@closed {
+        mut payload []u8 = []u8.new(cap: 2 + reason.byte_len())
+        ro code_int = code as int
+        payload.push(((code_int >> 8) & 0xFF) as u8)
+        payload.push((code_int & 0xFF) as u8)
+        payload.append(reason.bytes())
+        ro frame = Frame.new(true, OpCode.Close, payload)
+        ro _ = @stream.write_all(frame.encode(false))
+    }
+    @stream.close()
+    Ok(())
+}

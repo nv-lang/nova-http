@@ -1,0 +1,178 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: background.nv — `BackgroundTasks` (Plan 222.16, FastAPI
+// `BackgroundTasks`-дух: «ответить сейчас, доделать после»), собранная как
+// ЧИСТАЯ КОМПОЗИЦИЯ существующих `spawn`/`supervised`/`Supervisor` (D416)
+// примитивов — ни одного нового рантайм-механизма, ноль хардкода.
+//
+// Форма: коллектор (`.add(fn() -> ())`-цепочка, порядок добавления =
+// порядок исполнения — тот же контракт, что у FastAPI/Starlette
+// `BackgroundTasks`: задачи не запараллеливаются, каждая следующая ждёт
+// завершения предыдущей). Каждая задача исполняется в СВОЁМ отдельном
+// supervised scope (не общем на все задачи) — это осознанный выбор, а не
+// издержка: общий scope со всеми задачами внутри `for { spawn {...} }`
+// запускал бы их ПАРАЛЛЕЛЬНО (M:N-фибры), что ломает FIFO-гарантию
+// порядка; per-task scope сериализует их, оставаясь М:N-safe и без нового
+// примитива.
+//
+// Паника ОДНОЙ задачи не должна ронять процесс и не должна мешать
+// ОСТАЛЬНЫМ задачам — единственный существующий механизм перехвата паники
+// в Nova лежит на границе fiber'а (D13/D416: catch-panic-hook в
+// компиляторе отменён, см. docs/plans/222-http-framework.md §7б/222.16
+// «ПЕРЕСМОТР МЕХАНИЗМА 2026-07-23»), поэтому `@drain()` заворачивает КАЖДУЮ
+// задачу в `spawn` под `supervised` с ПОЛЬЗОВАТЕЛЬСКОЙ Supervisor-политикой
+// (не встроенный `std.concurrency.supervisor.stop()` — свой хендлер нужен,
+// чтобы вытащить ТЕКСТ паники/ошибки и залогировать её, D416 §1: `err`
+// typed-throw сужается `is T`, string-throw/panic — `str`-сообщение,
+// подтверждено пробой `err.try_as[str]()` в этом же плане). `Decision.Stop`
+// — ребёнок «выкинут» (Erlang temporary): scope продолжает, ошибка не
+// эскалируется, ничто не роняет `@drain()` целиком.
+//
+// Логирование по умолчанию — тот же рецепт, что `middleware/log.nv`:
+// stdout через ambient `Io`-эффект (переопределяемо `@sink(f)` — тесты
+// подставляют перехватывающий closure, без stdout-скрейпинга). Поле
+// специально названо `emit` (не `sink`) — `middleware/log.nv`'s `Log`
+// повторяет эту же несимметрию по той же причине: fn-типовое поле с тем
+// же именем, что и одноимённый D84-сеттер, резолвится в ВЫЗОВ поля вместо
+// сеттера (CC-FAIL `passing 'void *' to incompatible type 'nova_str'`,
+// [M-16]-family). Де-коллизия именем — тот же обходной путь.
+//
+// [M-16]-family closure discipline (см. middleware/cors.nv банер): `@tasks`
+// копируется в ЛОКАЛ (`ro task = t`) ПЕРЕД тем, как попасть в тело `spawn` —
+// прямой захват `@`-поля внутри вложенного closure мис-кодогенится на этом
+// фронтенде (тот же класс бага, что заставляет cors.nv копировать `cfg`
+// в локал перед захватом в handler-замыкание).
+//
+// Третий живой gotcha, найденный при реализации (НЕ [M-16] — другой
+// механизм, тот же симптом-класс "звонок мимо значения"): копирование
+// fn-типового ПОЛЯ в локал и вызов локала бэйр-синтаксисом
+// (`ro log_line = @emit; log_line("...")`) линкуется в несуществующую
+// свободную C-функцию `nova_fn_log_line` — `lld-link: undefined symbol`
+// — НЕЗАВИСИМО от имени локала (репро с разными именами: `emit`,
+// `log_line` — оба ломаются одинаково, значит дело не в коллизии имён).
+// Рабочий вызов fn-типового ПОЛЯ — прямой, без промежуточного локала,
+// В СКОБКАХ: `(@emit)(...)` — ИДЕНТИЧНО существующему прецеденту этого
+// же файла до правки (`Handler @handle` => `(@f)(req)`, `StreamBody
+// @next_chunk` => `(@f)()`, оба выше в server.nv) — просто раньше никто
+// не пытался присвоить fn-поле в локал первым. Не нужен и локал-копи
+// (`ro`) discipline ([M-16]) здесь: вызов `(@emit)(...)` живёт в теле
+// `@drain()` НАПРЯМУЮ (не внутри вложенного `spawn`/effect-closure), так
+// что прямой доступ к `@`-полю безопасен без предварительной копии.
+//
+// Живой compiler-gotcha, найденный ПРИ РЕАЛИЗАЦИИ этого файла (не описан
+// нигде заранее, задокументирован здесь как местный precedent): closure-
+// light параметр callback'а (`|s| { ... }`), переданный в позицию
+// `fn(str) -> ()`, может мис-вывестись как `nova_int` вместо `nova_str`
+// (репро: два разных closure-light `|s| {...}` литерала с ОДИНАКОВЫМ
+// именем параметра, поданные в ОДНУ и ту же `fn(str)->()`-сигнатуру в
+// одном компил-юните — второй литерал получает C-параметр `nova_int s`,
+// CC-FAIL при вызове `.push(s)` в `Vec[str]`). Обходной путь: closure-
+// FULL синтаксис с явной типизацией параметра (`fn(line str) { ... }`)
+// вместо closure-light (`|line| {...}`) на КАЖДОМ callback'е, чей тип
+// параметра — `str` (см. `background_test.nv`, все `@sink(...)`-аргументы
+// — closure-full). Живой баг, не переисследован здесь до диагностики —
+// цитируется, не устраняется (масштаб этого под-плана не включает
+// компиляторную починку); зона ответственности: compiler-codegen closure
+// param type inference.
+//
+// TODO(222.7 serve()/ServerPolicy — интеграционная точка): `@drain()`
+// СЕЙЧАС автономна — вызывается синхронно из `http.servernet.handle_
+// connection` ПОСЛЕ успешной записи ответа в сокет (см. servernet.nv), но
+// НЕ привязана к жизненному циклу сервера, потому что ЖИЗНЕННОГО ЦИКЛА
+// (accept-LOOP + graceful-shutdown `ServerPolicy`) в этом репо ещё нет
+// (`[M-178-server-graceful-deadline]`, server.nv banner). Когда 222.7
+// приземлит accept-loop + deadline-drain, задачи из ЭТОГО модуля тоже не
+// должны пережить shutdown — два варианта на выбор владельца ServerPolicy:
+//   (a) обернуть вызов `@drain()` в `supervised(deadline: ...)` на
+//       стороне run-loop (тот же приём, что уже обсуждается для
+//       connection-фибров) — простое, но задачи, не успевшие стартовать
+//       к дедлайну, теряются молча;
+//   (b) завести process-wide WaitGroup/счётчик in-flight-drain'ов
+//       (инкремент перед первым `spawn`, декремент после последнего),
+//       который shutdown ждёт с тем же deadline — не теряет уже начатые
+//       задачи, симметрично амбиции FastAPI/Starlette lifespan-shutdown.
+// Решение НЕ принято здесь намеренно — принадлежит дизайну 222.7's
+// ServerPolicy, а не этому мелкому под-плану.
+
+module http.server
+
+import std.concurrency.supervisor as sup
+import std.io.{stdout, Io, real_io}
+
+/// FastAPI `BackgroundTasks`-аналог: коллектор задач `fn() -> ()`,
+/// исполняемых ПОСЛЕ отправки ответа клиенту (не задерживают латентность
+/// хендлера). Value-тип — тот же reference-semantics паттерн, что у
+/// `ServerRequest`/`ServerResponse`'s собственных heap-backed полей
+/// (`[]u8`/`HeaderMap`): копия шарит те же `tasks`.
+#stable(since = "0.1")
+export type BackgroundTasks value {
+    priv tasks []fn() -> ()
+    priv emit  fn(str) -> ()
+}
+
+/// Empty collector; panics/failed tasks log to stdout by default (`@sink`
+/// overrides — tests inject a capturing closure instead of stdout-scraping).
+#stable(since = "0.1")
+export fn BackgroundTasks.new() -> BackgroundTasks =>
+    { tasks: [], emit: fn(line str) -> () { with Io = real_io() { default_sink(line) } } }
+
+/// Queue a task — FIFO order preserved (fluent chain, D117: mutate-in-place
+/// + `-> @`, mirrors `ServerResponse mut @header`/`Cors mut @allow_origin`).
+#stable(since = "0.1")
+export fn BackgroundTasks mut @add(task fn() -> ()) -> @ {
+    @tasks.push(task)
+}
+
+/// Number of queued tasks (tests / diagnostics).
+#stable(since = "0.1")
+export fn BackgroundTasks @task_count() -> int => @tasks.len()
+
+/// Redirect failure-log lines (default: stdout via ambient `Io`). A test
+/// passes a capturing closure — no sockets, no stdout scraping (same
+/// recipe as `middleware/log.nv`'s `Log @sink`).
+#stable(since = "0.1")
+export fn BackgroundTasks mut @sink(f fn(str) -> ()) -> @ { @emit = f }
+
+// Default failure sink: stdout via the ambient `Io` effect (`real_io` is
+// `#default_handler`, std/io/console.nv) — same default-row tolerance
+// `middleware/log.nv`'s `default_sink` relies on.
+fn default_sink(line str) Io -> () {
+    mut out = stdout()
+    ro _ = out.write("${line}\n".bytes())
+}
+
+/// Run every queued task, IN ORDER, ONE AT A TIME (see file banner for why
+/// per-task scopes, not one shared scope). A task that panics/throws is
+/// contained by ITS OWN supervised scope: `Decision.Stop` — the failure is
+/// logged (`@emit`) and does NOT propagate, does NOT stop tasks queued
+/// after it, does NOT crash the process. Meant to be called by the server
+/// AFTER the response has been fully written to the client (see
+/// `http.servernet.handle_connection`) — see file banner TODO for the
+/// graceful-shutdown lifecycle gap (222.7).
+#stable(since = "0.1")
+export fn BackgroundTasks mut @drain() {
+    for t in @tasks {
+        ro task = t
+        mut failed = false
+        mut reason = ""
+        with Supervisor = effect Supervisor {
+            on_child_fail(idx, err) -> Decision {
+                failed = true
+                if let Some(s) = err.try_as[str]() {
+                    reason = s
+                } else {
+                    reason = "non-string task error"
+                }
+                return Decision.Stop
+            }
+        } {
+            supervised {
+                spawn {
+                    task()
+                }
+            }
+        }
+        if failed {
+            (@emit)("background task failed: ${reason}")
+        }
+    }
+}

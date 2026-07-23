@@ -26,8 +26,8 @@
 
 module middleware.log
 
-import http.server.{Handler, handler_fn, Middleware, ServerRequest, ServerResponse}
-import std.io.{stdout, Io}
+import http.server.{Handler, middleware, Middleware, ServerRequest, ServerResponse}
+import std.io.{stdout, Io, real_io}
 import std.runtime.sync.{AtomicInt}
 import std.time.duration
 
@@ -50,7 +50,7 @@ export type Log value {
 /// Default config: request-id on, real-ip off, lines to stdout (`Io` default).
 #stable(since = "0.1")
 export fn Log.new() -> Log =>
-    { emit: fn(line str) -> () => default_sink(line), request_id: true, real_ip: false,
+    { emit: fn(line str) -> () { with Io = real_io() { default_sink(line) } }, request_id: true, real_ip: false,
       counter: AtomicInt.new(0) }
 
 // Default sink: stdout via the ambient `Io` effect (`real_io` is
@@ -79,29 +79,30 @@ export fn Log mut @request_id(on bool) -> @ { @request_id = on }
 #stable(since = "0.1")
 export fn Log mut @real_ip(on bool) -> @ { @real_ip = on }
 
-/// Build the middleware.
+/// Build the middleware. `Time` row: the per-request line measures elapsed
+/// time via `Monotonic.now()` (ambient default in prod; a test builds under
+/// `th.fixed_ms` — same row-declaration chain as `RateLimit.middleware()`,
+/// strict-effects package gate 222 §9).
 #stable(since = "0.1")
-export fn Log @middleware() -> Middleware {
+export fn Log @middleware() Time -> Middleware {
     ro cfg = @
-    Middleware.new(fn(next Handler) -> Handler => log_handler(cfg, next))
+    middleware(fn(req ServerRequest, next Handler) -> ServerResponse => log_apply(cfg, next, req))
 }
 
 /// Convenience: `logger(Log.new())` → ready `Middleware` (chi's name).
 #stable(since = "0.1")
-export fn logger(cfg Log) -> Middleware => cfg.middleware()
+export fn logger(cfg Log) Time -> Middleware => cfg.middleware()
 
 // ── internals ───────────────────────────────────────────────────────────────
 
-// Param → local copy before capture ([M-16]-family, cors.nv precedent).
-fn log_handler(cfg Log, next Handler) -> Handler {
-    ro c = cfg
-    handler_fn(|req| log_apply(c, next, req))
-}
-
+// `next` arrives as a PARAM — `next(req)` is the safe D52 param call-through
+// ([M-16]: a CAPTURED Handler must not be called by identifier; the flat
+// `middleware(...)` closure above only captures `cfg` and passes `next`
+// through as its own closure param).
 fn log_apply(cfg Log, next Handler, req ServerRequest) Time -> ServerResponse {
     ro t0 = Monotonic.now()
     ro id = if cfg.request_id { request_id_of(cfg, req) } else { "" }
-    mut resp = next.handle(req)
+    mut resp = next(req)
     ro ms = Monotonic.now().elapsed_since(t0).millis()
     if id != "" { resp.header("X-Request-Id", id) }
     consume sb = StringBuilder.new()
@@ -116,8 +117,7 @@ fn log_apply(cfg Log, next Handler, req ServerRequest) Time -> ServerResponse {
     }
     // [M-16] (cited): `ro emit = cfg.emit; emit(line)` codegens a bogus
     // direct call to `nova_fn_emit` (undefined symbol). The parenthesized
-    // field-call form emits the correct closure invocation (`(@f)(...)`
-    // precedent, server.nv `Handler @handle`).
+    // field-call form emits the correct closure invocation.
     (cfg.emit)(sb.into_str())
     resp
 }

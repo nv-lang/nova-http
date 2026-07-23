@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: ws/handshake_test.nv — `ws_accept_key` against the literal
+// worked example from RFC 6455 §1.3 (`is_upgrade_request` — which needs a
+// real `ServerRequest`, built via `http.server`'s own request parser — is
+// tested alongside the `WebSocketUpgrade` extractor in
+// `server/ws_upgrade_test.nv`, same module as `ServerRequest`).
+
+module http.ws
+
+test "ws_accept_key: RFC 6455 §1.3 worked example" {
+    assert(ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==")!! == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+}
+
+test "ws_accept_key: empty key -> BadHandshake" {
+    ro r = ws_accept_key("")
+    assert(match r { Err(BadHandshake(_)) => true, _ => false })
+}
+
+test "ws_accept_key: not-base64 key -> BadHandshake" {
+    ro r = ws_accept_key("not valid base64!!")
+    assert(match r { Err(BadHandshake(_)) => true, _ => false })
+}
+
+test "ws_accept_key: base64-valid but wrong decoded length -> BadHandshake" {
+    // "aGVsbG8=" decodes to 5 bytes ("hello"), not the required 16.
+    ro r = ws_accept_key("aGVsbG8=")
+    assert(match r { Err(BadHandshake(_)) => true, _ => false })
+}
+
+test "ws_accept_key: differs for different keys (sanity, not just echoing GUID hash)" {
+    ro a = ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==")!!
+    ro b = ws_accept_key("AQIDBAUGBwgJCgsMDQ4PEA==")!!
+    assert(a != b)
+}

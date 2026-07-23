@@ -52,6 +52,7 @@ module http.servernet
 import std.net.{TcpListener, TcpStream, NetError}
 import ../server.{ServerResponse, StreamBody, serialize_response}
 import ../server.{serialize_response_head, encode_chunk, encode_chunk_end}
+import ../server.{BackgroundTasks}
 
 /// Read one full HTTP/1.1 request off `stream` (headers + Content-Length body),
 /// run it through `handler` (a plain byte-level callback — see this file's own
@@ -61,18 +62,42 @@ import ../server.{serialize_response_head, encode_chunk, encode_chunk_end}
 /// close`; keep-alive is a server marker). Fixed-body responses serialize in
 /// one shot; streaming responses (`[M-178-server-streaming]`) write
 /// incrementally — see `write_streaming`.
+///
+/// Plan 222.16: if the routed response carries `BackgroundTasks`
+/// (`ServerResponse.background(...)`), they run AFTER the response is fully
+/// written (success path only — a write failure means the client never got
+/// the response, so "after the response" never happened; see
+/// `run_background` below). See `background.nv`'s `BackgroundTasks` banner
+/// for the graceful-shutdown lifecycle TODO — this is the live integration
+/// point 222.7's `ServerPolicy` will need to hook into.
 #stable(since = "0.1")
 export fn handle_connection(consume stream TcpStream, handler fn([]u8) -> ServerResponse) Net -> Result[(), NetError] {
     consume s = stream
     ro raw = read_request(s)
     ro resp = handler(raw)
+    ro bg = resp.take_background()
     if resp.is_streaming() {
-        write_streaming(s, resp)
+        ro r = write_streaming(s, resp)
+        match r {
+            Ok(_)  => run_background(bg)
+            Err(_) => ()
+        }
+        r
     } else {
         match s.write_all(serialize_response(resp)) {
-            Ok(_)  => { s.close(); Ok(()) }
+            Ok(_)  => { s.close(); run_background(bg); Ok(()) }
             Err(e) => { s.close(); Err(e) }
         }
+    }
+}
+
+// Drain queued `BackgroundTasks`, if the response carried any (Plan 222.16).
+// A no-op for the (overwhelmingly common) case of a response with no
+// background work attached.
+fn run_background(bg Option[BackgroundTasks]) {
+    match bg {
+        Some(tasks) => { mut t = tasks; t.drain() }
+        None => ()
     }
 }
 

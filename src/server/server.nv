@@ -12,8 +12,12 @@
 //
 // CORE scope (plaintext HTTP/1.1): in-memory request body (buffered by the conn
 // driver), Content-Length framing, `Handler` returns a value `ServerResponse`.
-// Handler is a concrete closure newtype (`Handler.of(f)`), the Go-`HandlerFunc`
-// form the plan names as the fallback for `impl Handler` (Q27).
+// Handler is a newtype over the fn type (`type Handler fn(ServerRequest) ->
+// ServerResponse`, D52/D55 ОКНО-5 2026-07-23): a bare fn/closure auto-lifts
+// into it at any Handler-expecting position, and a Handler VALUE is called
+// directly (`h(req)`) — Go `http.HandlerFunc` shape. The former `handler_fn`
+// constructor and `@handle` method were removed with the newtype-over-fn
+// migration (222.3 §5а, owner decision 2026-07-23).
 //
 // Streaming RESPONSE bodies (`[M-178-server-streaming]`, Plan 178 followup) —
 // DONE (Plan 116/M-178-server-streaming force-impl): `StreamBody`/`stream_body`
@@ -159,26 +163,29 @@ export type StreamBody value { priv f fn() -> Option[[]u8] }
 
 /// A handler's response (CORE: in-memory body → exact Content-Length framing;
 /// `stream` set → chunked/streaming body, see `ServerResponse.stream`/`.sse`
-/// below, `[M-178-server-streaming]`).
+/// below, `[M-178-server-streaming]`; `background` set → FastAPI-`BackgroundTasks`-
+/// style deferred work, run by the connection driver AFTER the response bytes
+/// are on the wire — see `background.nv`'s `BackgroundTasks`, Plan 222.16).
 #stable(since = "0.1")
 export type ServerResponse value {
-    ro status  int
-    ro headers HeaderMap
-    body       []u8
-    ro stream  Option[StreamBody]
+    ro status     int
+    ro headers    HeaderMap
+    body          []u8
+    ro stream     Option[StreamBody]
+    background    Option[BackgroundTasks]
 }
 
 /// Response with a status code and empty body/headers.
 #stable(since = "0.1")
 export fn ServerResponse.new(status int) -> ServerResponse =>
-    { status, headers: HeaderMap.new(), body: []u8.new(), stream: None }
+    { status, headers: HeaderMap.new(), body: []u8.new(), stream: None, background: None }
 
 /// `text/plain; charset=utf-8` response.
 #stable(since = "0.1")
 export fn ServerResponse.text(status int, s str) -> ServerResponse {
     mut h = HeaderMap.new()
     ro _ = h.insert("Content-Type", "text/plain; charset=utf-8") // статическое имя — не может отказать
-    { status, headers: h, body: s.bytes(), stream: None }
+    { status, headers: h, body: s.bytes(), stream: None, background: None }
 }
 
 /// `text/html; charset=utf-8` response.
@@ -186,7 +193,7 @@ export fn ServerResponse.text(status int, s str) -> ServerResponse {
 export fn ServerResponse.html(status int, s str) -> ServerResponse {
     mut h = HeaderMap.new()
     ro _ = h.insert("Content-Type", "text/html; charset=utf-8") // статическое имя — не может отказать
-    { status, headers: h, body: s.bytes(), stream: None }
+    { status, headers: h, body: s.bytes(), stream: None, background: None }
 }
 
 /// Raw-bytes response with an explicit Content-Type.
@@ -194,20 +201,20 @@ export fn ServerResponse.html(status int, s str) -> ServerResponse {
 export fn ServerResponse.bytes(status int, content_type str, data []u8) -> ServerResponse {
     mut h = HeaderMap.new()
     ro _ = h.insert("Content-Type", content_type) // статическое имя — не может отказать
-    { status, headers: h, body: data, stream: None }
+    { status, headers: h, body: data, stream: None, background: None }
 }
 
 /// Bodyless response (204/304/…).
 #stable(since = "0.1")
 export fn ServerResponse.empty(status int) -> ServerResponse =>
-    { status, headers: HeaderMap.new(), body: []u8.new(), stream: None }
+    { status, headers: HeaderMap.new(), body: []u8.new(), stream: None, background: None }
 
 /// Redirect response (`Location: location`).
 #stable(since = "0.1")
 export fn ServerResponse.redirect(status int, location str) -> ServerResponse {
     mut h = HeaderMap.new()
     ro _ = h.insert("Location", location) // статическое имя — не может отказать
-    { status, headers: h, body: []u8.new(), stream: None }
+    { status, headers: h, body: []u8.new(), stream: None, background: None }
 }
 
 // ── Streamed response body ([M-178-server-streaming]) ─────────────────────────
@@ -258,7 +265,7 @@ export fn StreamBody.from_chunks(chunks [][]u8) -> StreamBody {
 /// `text/event-stream` specialisation. `[M-178-server-streaming]`
 #stable(since = "0.1")
 export fn ServerResponse.stream(status int, headers HeaderMap, producer StreamBody) -> ServerResponse =>
-    { status, headers, body: []u8.new(), stream: Some(producer) }
+    { status, headers, body: []u8.new(), stream: Some(producer), background: None }
 
 /// `text/event-stream` (SSE) response — sets the standard no-cache headers and
 /// streams `producer`'s chunks as the raw SSE wire bytes (format each chunk
@@ -269,7 +276,7 @@ export fn ServerResponse.sse(producer StreamBody) -> ServerResponse {
     ro _ = h.insert("Content-Type", "text/event-stream; charset=utf-8") // статическое имя — не может отказать
     ro _ = h.insert("Cache-Control", "no-cache")
     ro _ = h.insert("X-Accel-Buffering", "no")
-    { status: 200, headers: h, body: []u8.new(), stream: Some(producer) }
+    { status: 200, headers: h, body: []u8.new(), stream: Some(producer), background: None }
 }
 
 /// Whether this response streams its body via a chunk producer (vs. a fixed
@@ -282,6 +289,22 @@ export fn ServerResponse @is_streaming() -> bool => @stream.is_some()
 /// semantics needed.
 #stable(since = "0.1")
 export fn ServerResponse @take_stream() -> Option[StreamBody] => @stream
+
+/// Attach `BackgroundTasks` to run AFTER this response's bytes are fully
+/// written to the client (FastAPI `response.background`-analog, Plan
+/// 222.16). Fluent setter (D117/D409): mutate-in-place + `-> @`, mirrors
+/// `@header`/`@body` above.
+#stable(since = "0.1")
+export fn ServerResponse mut @background(tasks BackgroundTasks) -> @ {
+    @background = Some(tasks)
+}
+
+/// Take the attached `BackgroundTasks` (`None` if the handler queued none).
+/// The connection driver (`http.servernet.handle_connection`) calls this
+/// AFTER writing the response to the socket, then `@drain()`s the result —
+/// see `background.nv`'s file banner for the graceful-shutdown TODO.
+#stable(since = "0.1")
+export fn ServerResponse @take_background() -> Option[BackgroundTasks] => @background
 
 /// Format one SSE event's wire bytes (WHATWG SSE): optional `event:` line +
 /// one `data:` line per `\n`-separated line of `data` + the blank-line
@@ -332,21 +355,20 @@ export fn ServerResponse mut @body(data []u8) -> @ {
 #stable(since = "0.1")
 export fn ServerResponse @status_code() -> int => @status
 
-// ── Handler (concrete closure newtype — Go HandlerFunc, Q27 fallback) ─────────
+// ── Handler (newtype over the fn type — Go HandlerFunc, D52/D55) ──────────────
 
-/// A request handler: a function `ServerRequest -> ServerResponse`. CORE uses this
-/// concrete closure newtype (the plan's `impl Handler` fallback) so handlers store
-/// in `ServeMux` routes without existential boxing.
+/// A request handler: a newtype over `fn(ServerRequest) -> ServerResponse`
+/// (D52 form). A bare function or closure auto-lifts into `Handler` wherever
+/// one is expected (D55 obvious single-wrapper coercion) — registration reads
+/// `r.get("/x", fn(req ServerRequest) -> ServerResponse { ... })`, no wrapper
+/// call. A `Handler` value is invoked DIRECTLY: `h(req)` (call-through; the
+/// one meaningful operation over a function forwards, Go `http.HandlerFunc`
+/// precedent — 222.3 §5а). NB (probed 2026-07-23): closure-light `|req| ...`
+/// against a newtype-over-fn expectation mis-codegens its param as `nova_int`
+/// — spell handlers closure-FULL (`fn(req ServerRequest) -> ServerResponse`),
+/// same known limitation middleware_test.nv documents for bare fn-types.
 #stable(since = "0.1")
-export type Handler value { priv f fn(ServerRequest) -> ServerResponse }
-
-/// Wrap a closure as a `Handler`.
-#stable(since = "0.1")
-export fn handler_fn(f fn(ServerRequest) -> ServerResponse) -> Handler => { f }
-
-/// Invoke the handler.
-#stable(since = "0.1")
-export fn Handler @handle(req ServerRequest) -> ServerResponse => (@f)(req)
+export type Handler fn(ServerRequest) -> ServerResponse
 
 // ── serve_once: the pure request→response driver (mock-testable, no sockets) ──
 //

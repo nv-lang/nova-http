@@ -231,17 +231,17 @@ export fn JwtAuth @claims_at[T Deserialize](req ServerRequest, now_ms u64) -> Re
     }
 }
 
-// require_jwt guard body — hoisted to a named top-level fn so every closure
-// captures ONE level only ([M-16] two-level-deep capture segfault, worked
-// around exactly like `mark_handler` in middleware_test.nv).
-fn jwt_guard_handler(auth JwtAuth, now_fn fn() -> u64, next Handler) -> Handler =>
-    handler_fn(|req| {
-        ro verdict = jwt_verify_only(auth, req, now_fn())
-        match verdict {
-            Ok(_)  => next.handle(req)
-            Err(_) => unauthorized_bearer()
-        }
-    })
+// require_jwt guard body — hoisted to a named top-level fn so the flat
+// closure in `require_jwt` captures ONE level only ([M-16] discipline) and
+// `next` arrives HERE as a param (`next(req)` = safe D52 param call-through;
+// a captured Handler must never be called by identifier inside a closure).
+fn jwt_guard_apply(auth JwtAuth, now_fn fn() -> u64, next Handler, req ServerRequest) -> ServerResponse {
+    ro verdict = jwt_verify_only(auth, req, now_fn())
+    match verdict {
+        Ok(_)  => next(req)
+        Err(_) => unauthorized_bearer()
+    }
+}
 
 // Untyped verification (signature + exp/nbf, no claims decode) — the
 // middleware-side check `require_jwt` runs.
@@ -262,8 +262,11 @@ fn jwt_verify_only(auth JwtAuth, req ServerRequest, now_ms u64) -> Result[(), Ht
 /// magic). `now_fn` supplies the clock (file banner: `Handler` has no effect
 /// row, so the `Time` effect cannot be performed here).
 #stable(since = "0.1")
-export fn require_jwt(auth JwtAuth, now_fn fn() -> u64) -> Middleware =>
-    Middleware.new(fn(next Handler) -> Handler => jwt_guard_handler(auth, now_fn, next))
+export fn require_jwt(auth JwtAuth, now_fn fn() -> u64) -> Middleware {
+    ro a = auth
+    ro nf = now_fn
+    middleware(fn(req ServerRequest, next Handler) -> ServerResponse => jwt_guard_apply(a, nf, next, req))
+}
 
 // ── CookieJar (axum-extra shape) + Set-Cookie response helper ─────────────
 
@@ -475,50 +478,50 @@ fn session_id_of(req ServerRequest, cookie_name str) -> Option[str] {
 fn none_str() -> Option[str] => None
 
 // session_layer body — hoisted top-level fn, ONE capture level per closure
-// ([M-16], same shape as jwt_guard_handler above / mark_handler in
-// middleware_test.nv). Takes the config UNPACKED into scalars, NOT the
-// `SessionConfig` value: capturing a value-STRUCT param in the closure env
-// emits mismatched value/pointer C (env field declared by value, body emits
-// `*cfg` indirection + ptr-assign — the same live "value/pointer mismatch"
-// family extract_test.nv's banner cites; scalars/str/enum capture cleanly).
+// ([M-16], same shape as jwt_guard_apply above). `next` arrives as a PARAM —
+// `next(r2)` is the safe D52 param call-through. Takes the config UNPACKED
+// into scalars, NOT the `SessionConfig` value: capturing a value-STRUCT param
+// in the closure env emits mismatched value/pointer C (env field declared by
+// value, body emits `*cfg` indirection + ptr-assign — the same live
+// "value/pointer mismatch" family extract_test.nv's banner cites;
+// scalars/str/enum capture cleanly).
 // (params deliberately NOT named after SetCookie fields: a field-SHORTHAND in
 // a record literal inside the closure is missed by closure capture analysis —
 // `use of undeclared identifier` in emitted C; explicit `field: name` with
 // distinct names captures fine.)
-fn session_handler(store MemorySessionStore, cookie_name str, ttl_s int, sec bool,
-                   honly bool, ssite SameSite, now_fn fn() -> u64,
-                   id_gen fn() -> str, next Handler) -> Handler =>
-    handler_fn(|req| {
-        match session_id_of(req, cookie_name) {
-            Some(sid) => {
-                // Existing session cookie: expose the id to the handler via
-                // the params channel (same [](str,str) channel path params use).
-                mut r2 = req
-                mut ps = req.params
-                ps.push(("session_id", sid))
-                r2.params(ps)
-                next.handle(r2)
-            }
-            None => {
-                // No cookie: mint an id, eager-save an empty session, tell
-                // the client (Set-Cookie with the config's secure defaults).
-                ro sid = id_gen()
-                mut st = store
-                ro _ = st.save(sid, SessionData.new(), now_fn())
-                mut r2 = req
-                mut ps = req.params
-                ps.push(("session_id", sid))
-                r2.params(ps)
-                mut resp = next.handle(r2)
-                ro cookie = SetCookie {
-                    name: cookie_name, value: sid, domain: none_str(), path: Some("/"),
-                    max_age: Some(ttl_s), secure: sec, http_only: honly, same_site: ssite,
-                }
-                resp.set_cookie(cookie)
-                resp
-            }
+fn session_apply(store MemorySessionStore, cookie_name str, ttl_s int, sec bool,
+                 honly bool, ssite SameSite, now_fn fn() -> u64,
+                 id_gen fn() -> str, next Handler, req ServerRequest) -> ServerResponse {
+    match session_id_of(req, cookie_name) {
+        Some(sid) => {
+            // Existing session cookie: expose the id to the handler via
+            // the params channel (same [](str,str) channel path params use).
+            mut r2 = req
+            mut ps = req.params
+            ps.push(("session_id", sid))
+            r2.params(ps)
+            next(r2)
         }
-    })
+        None => {
+            // No cookie: mint an id, eager-save an empty session, tell
+            // the client (Set-Cookie with the config's secure defaults).
+            ro sid = id_gen()
+            mut st = store
+            ro _ = st.save(sid, SessionData.new(), now_fn())
+            mut r2 = req
+            mut ps = req.params
+            ps.push(("session_id", sid))
+            r2.params(ps)
+            mut resp = next(r2)
+            ro cookie = SetCookie {
+                name: cookie_name, value: sid, domain: none_str(), path: Some("/"),
+                max_age: Some(ttl_s), secure: sec, http_only: honly, same_site: ssite,
+            }
+            resp.set_cookie(cookie)
+            resp
+        }
+    }
+}
 
 /// Session middleware (222.4 core): guarantees every request reaches the
 /// handler with a `("session_id", sid)` param — read it via
@@ -537,6 +540,9 @@ export fn session_layer(store MemorySessionStore, cfg SessionConfig, now_fn fn()
     ro sec = cfg.secure
     ro honly = cfg.http_only
     ro ssite = cfg.same_site
-    Middleware.new(fn(next Handler) -> Handler =>
-        session_handler(store, cookie_name, ttl_s, sec, honly, ssite, now_fn, id_gen, next))
+    ro st = store
+    ro nf = now_fn
+    ro ig = id_gen
+    middleware(fn(req ServerRequest, next Handler) -> ServerResponse =>
+        session_apply(st, cookie_name, ttl_s, sec, honly, ssite, nf, ig, next, req))
 }

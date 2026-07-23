@@ -14,15 +14,15 @@
 module rt.streaming_smoke
 
 import std.net.{TcpListener, TcpStream, SocketAddr, real_net}
-import ../../server.{Router, ServerResponse, StreamBody, handler_fn, sse_event}
+import ../../server.{Router, ServerResponse, StreamBody, sse_event}
 import ../../serve.{handle_connection_router}
 
 fn routes() -> Router {
     mut r = Router.new()
-    r.get("/events", handler_fn(|req| {
+    r.get("/events", fn(req ServerRequest) -> ServerResponse {
         ro chunks [][]u8 = [sse_event("tick", "1"), sse_event("tick", "2"), sse_event("done", "bye")]
         ServerResponse.sse(StreamBody.from_chunks(chunks))
-    }))!!
+    })!!
     r
 }
 

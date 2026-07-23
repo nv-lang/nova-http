@@ -27,18 +27,19 @@ Public API is unchanged from `std.http` — only the module path moved
 ```nova
 import http.{Http}
 import http.client.{HttpClient}
-import http.server.{ServeMux, ServerResponse, handler_fn, serve_once}
+import http.server.{Router, ServerRequest, ServerResponse, serve_once}
 
 fn make_client() Http -> HttpClient {
     HttpClient.new()
 }
 
-fn make_mux() -> ServeMux {
-    ro mux = ServeMux.new()
-    mux.handle("/", handler_fn(fn(req) {
-        ServerResponse.text(200, "hello from nova-http")
-    }))
-    mux
+fn make_router() -> Router {
+    mut r = Router.new()
+    // A bare closure auto-lifts into `Handler` (newtype over
+    // `fn(ServerRequest) -> ServerResponse`, D52/D55) — no wrapper call.
+    r.get("/", fn(req ServerRequest) -> ServerResponse =>
+        ServerResponse.text(200, "hello from nova-http"))!!
+    r
 }
 ```
 
@@ -139,6 +140,29 @@ nova test src
 
 Some tests (`servernet/rt/*`, live socket smoke tests) bind real ports and
 may need a longer timeout (`--timeout 300`) than the default under load.
+
+## Gate
+
+The package gate (Plan 222 §9, owner decision 2026-07-23) is
+`scripts/gate.ps1` — run it before merging anything:
+
+```powershell
+# env NOVA_STD_PATH / NOVA_CG_INCLUDE / NOVA_RT_DIR set as above;
+# $env:NOVA optionally points at a specific nova.exe
+powershell -File scripts/gate.ps1            # optionally: -TestTimeout 300
+```
+
+Two mandatory steps, in order:
+
+1. **`nova check src --strict-effects`** — the whole package must type-check
+   with undeclared transitive effects as *errors*. Only the deliberate
+   `src/neg/*` EXPECT_COMPILE_ERROR fixtures may FAIL; any other FAIL is a
+   gate failure. Rationale: a package gate without `--strict-effects` does
+   not catch effect bombs that only detonate in a consumer compile-unit
+   built with the flag (precedent: the background/log default-sink
+   `E_UNDECLARED_TRANSITIVE_EFFECT` found by the flagship build, commit
+   4019173).
+2. **`nova test src`** — the full test suite over the C-codegen pipeline.
 
 ## License
 

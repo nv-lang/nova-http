@@ -1,0 +1,104 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Plan 222.16 — LIVE-socket wiring proof: `http.servernet.handle_connection`
+// actually drains a response's `BackgroundTasks` when driving a real
+// connection (not just the pure/mock unit coverage in
+// `../../server/background_test.nv`). Mirrors `handle_connection_smoke.nv`'s
+// shape (server fiber / client fiber over a loopback `TcpListener`).
+//
+// What this proves: the client gets the CORRECT response bytes (background
+// work doesn't leak into/corrupt the wire body), AND the background task
+// queued via `ServerResponse.background(...)` actually ran — end-to-end
+// through the real driver. The STRICT "after the response, not before/
+// concurrent" ordering claim is a plain sequential-control-flow fact in
+// `servernet.handle_connection` (`write_all` → `close` → `run_background`,
+// one fiber, no concurrency between those three steps) — already covered
+// deterministically (no socket-timing flakiness) by
+// `background_test.nv`'s "tasks only run after the explicit checkpoint"
+// test; this smoke test's job is ONLY the live-wiring connectivity, so it
+// doesn't assert relative timing over the socket (that would be a race).
+//
+// EXPECT_TIMEOUT_MS-marked (standalone per test-conventions.md — never folds
+// into the shared http.servernet folder-CU, same reasoning as its sibling).
+//
+// EXPECT_TIMEOUT_MS 30000
+
+module rt.background_tasks_smoke
+
+import std.net.{TcpListener, TcpStream, SocketAddr, real_net}
+import ../../server.{Router, ServerResponse, BackgroundTasks}
+import ../../servernet.{handle_connection}
+
+fn routes(ran_tx ChanWriter[bool]) -> Router {
+    mut r = Router.new()
+    r.get("/notify", fn(req ServerRequest) -> ServerResponse {
+        ro tx = ran_tx
+        mut bg = BackgroundTasks.new()
+        bg.add(|| { tx.try_send(true) })
+        mut resp = ServerResponse.text(200, "queued")
+        resp.background(bg)
+        resp
+    })!!
+    r
+}
+
+test "servernet: BackgroundTasks attached to a live response actually drains" {
+    with Net = real_net() {
+        consume lst = match TcpListener.bind(SocketAddr.loopback(0)) {
+            Ok(consume l)  => l
+            Err(_) => { assert(false); return }
+        }
+        ro port = lst.local_port()
+        assert(port > 0)
+
+        // Plan 173.3 (D415 §2): fiber results flow back through channels, not
+        // outer-`mut` capture (same discipline as handle_connection_smoke.nv).
+        ro (ok_tx, ok_rx) = Channel.new(1)
+        ro (got_tx, got_rx) = Channel.new(1)
+        ro (ran_tx, ran_rx) = Channel.new(1)
+        supervised {
+            // Server fiber: accept one connection, serve it through handle_connection.
+            spawn {
+                match lst.accept() {
+                    Ok(consume srv) => {
+                        consume s = srv
+                        match handle_connection(s, routes(ran_tx)) {
+                            Ok(_)  => { ok_tx.try_send(true) }
+                            Err(_) => ()
+                        }
+                    }
+                    Err(_) => ()
+                }
+            }
+            // Client fiber: connect, send a raw GET, read the response.
+            spawn {
+                match TcpStream.connect(SocketAddr.loopback(port)) {
+                    Ok(consume conn) => {
+                        consume cli = conn
+                        match cli.write_str("GET /notify HTTP/1.1\r\nHost: localhost\r\n\r\n") {
+                            Ok(_)  => ()
+                            Err(_) => ()
+                        }
+                        match cli.read_to_vec(4096) {
+                            Ok(chunk) => { got_tx.try_send(chunk) }
+                            Err(_)    => ()
+                        }
+                        cli.close()
+                    }
+                    Err(_) => ()
+                }
+            }
+        }
+        lst.close()
+        ok_tx.close()
+        got_tx.close()
+        ran_tx.close()
+        ro server_ok = ok_rx.try_recv() ?? false
+        ro got = got_rx.try_recv() ?? []u8.new()
+        ro ran = ran_rx.try_recv() ?? false
+        assert(server_ok)
+        ro resp = unsafe { got.to_str_unchecked() }
+        assert(resp.contains("HTTP/1.1 200 OK"))
+        assert(resp.contains("queued"))
+        assert(ran)   // BackgroundTasks drained through the LIVE driver
+    }
+}

@@ -78,12 +78,12 @@ test "QueryDeserializer: empty query string -> no fields present" {
 
 test "Bytes: raw body bytes, no decode" {
     mut r = Router.new()
-    r.post("/raw", handler_fn(|req| {
+    r.post("/raw", fn(req ServerRequest) -> ServerResponse {
         match Bytes.from_request(req) {
             Ok(b)  => ServerResponse.text(200, "len=${b.data().len()}")
             Err(e) => e.into_response()
         }
-    }))!!
+    })!!
     ro wire = serve_once(r, post_text_req("/raw", "hello"))
     ro s = unsafe { wire.to_str_unchecked() }
     assert(s.contains("len=5"))
@@ -91,12 +91,12 @@ test "Bytes: raw body bytes, no decode" {
 
 test "Text: body as UTF-8 text" {
     mut r = Router.new()
-    r.post("/echo", handler_fn(|req| {
+    r.post("/echo", fn(req ServerRequest) -> ServerResponse {
         match Text.from_request(req) {
             Ok(t)  => ServerResponse.text(200, "got=${t.data()}")
             Err(e) => e.into_response()
         }
-    }))!!
+    })!!
     ro wire = serve_once(r, post_text_req("/echo", "hello there"))
     ro s = unsafe { wire.to_str_unchecked() }
     assert(s.contains("got=hello there"))
@@ -104,7 +104,7 @@ test "Text: body as UTF-8 text" {
 
 test "Headers: exposes the request's header map" {
     mut r = Router.new()
-    r.get("/hdrs", handler_fn(|req| {
+    r.get("/hdrs", fn(req ServerRequest) -> ServerResponse {
         match Headers.from_request(req) {
             Ok(h) => match h.data().get("Host") {
                 Some(_) => ServerResponse.text(200, "has-host")
@@ -112,7 +112,7 @@ test "Headers: exposes the request's header map" {
             }
             Err(e) => e.into_response()
         }
-    }))!!
+    })!!
     ro wire = serve_once(r, get_req("/hdrs"))
     ro s = unsafe { wire.to_str_unchecked() }
     assert(s.contains("has-host"))
@@ -133,12 +133,12 @@ type CreateItem value { ro name str, ro qty int }
 
 test "PathParam[T]: round-trip through Router dispatch" {
     mut r = Router.new()
-    r.get("/users/{id}", handler_fn(|req| {
+    r.get("/users/{id}", fn(req ServerRequest) -> ServerResponse {
         match PathParam[UserIdParams].from_request(req) {
             Ok(p)  => ServerResponse.text(200, "id=${p.data().id}")
             Err(e) => e.into_response()
         }
-    }))!!
+    })!!
     ro wire = serve_once(r, get_req("/users/42"))
     ro s = unsafe { wire.to_str_unchecked() }
     assert(s.contains("id=42"))
@@ -146,24 +146,24 @@ test "PathParam[T]: round-trip through Router dispatch" {
 
 test "PathParam[T]: bad int -> HttpError, not a crash" {
     mut r = Router.new()
-    r.get("/users/{id}", handler_fn(|req| {
+    r.get("/users/{id}", fn(req ServerRequest) -> ServerResponse {
         match PathParam[UserIdParams].from_request(req) {
             Ok(p)  => ServerResponse.text(200, "id=${p.data().id}")
             Err(e) => e.into_response()
         }
-    }))!!
+    })!!
     ro wire = serve_once(r, get_req("/users/not-a-number"))
     assert(status_line(wire) == "HTTP/1.1 400 Bad Request")
 }
 
 test "Query[T]: round-trip through Router dispatch" {
     mut r = Router.new()
-    r.get("/search", handler_fn(|req| {
+    r.get("/search", fn(req ServerRequest) -> ServerResponse {
         match Query[SearchQuery].from_request(req) {
             Ok(q)  => ServerResponse.text(200, "q=${q.data().q} limit=${q.data().limit}")
             Err(e) => e.into_response()
         }
-    }))!!
+    })!!
     ro wire = serve_once(r, get_req("/search?q=widgets&limit=10"))
     ro s = unsafe { wire.to_str_unchecked() }
     assert(s.contains("q=widgets limit=10"))
@@ -171,12 +171,12 @@ test "Query[T]: round-trip through Router dispatch" {
 
 test "Json[T]: round-trip through Router dispatch" {
     mut r = Router.new()
-    r.post("/items", handler_fn(|req| {
+    r.post("/items", fn(req ServerRequest) -> ServerResponse {
         match Json[CreateItem].from_request(req) {
             Ok(j)  => ServerResponse.text(200, "name=${j.data().name} qty=${j.data().qty}")
             Err(e) => e.into_response()
         }
-    }))!!
+    })!!
     ro wire = serve_once(r, post_json_req("/items", "{\"name\":\"gizmo\",\"qty\":5}"))
     ro s = unsafe { wire.to_str_unchecked() }
     assert(s.contains("name=gizmo qty=5"))
@@ -184,12 +184,12 @@ test "Json[T]: round-trip through Router dispatch" {
 
 test "Json[T]: malformed body -> HttpError, not a crash" {
     mut r = Router.new()
-    r.post("/items", handler_fn(|req| {
+    r.post("/items", fn(req ServerRequest) -> ServerResponse {
         match Json[CreateItem].from_request(req) {
             Ok(j)  => ServerResponse.text(200, "name=${j.data().name}")
             Err(e) => e.into_response()
         }
-    }))!!
+    })!!
     ro wire = serve_once(r, post_json_req("/items", "{not json"))
     assert(status_line(wire) == "HTTP/1.1 400 Bad Request")
 }
@@ -206,8 +206,8 @@ test "Json[T]: malformed body -> HttpError, not a crash" {
 
 test "PathParam+Query+Json composed on one route; 404/405 unaffected on the same Router" {
     mut r = Router.new()
-    r.get("/health", handler_fn(|req| ServerResponse.text(200, "ok")))!!
-    r.post("/items/{id}", handler_fn(|req| {
+    r.get("/health", fn(req ServerRequest) -> ServerResponse => ServerResponse.text(200, "ok"))!!
+    r.post("/items/{id}", fn(req ServerRequest) -> ServerResponse {
         match PathParam[UserIdParams].from_request(req) {
             Ok(p) => match Query[SearchQuery].from_request(req) {
                 Ok(q) => match Json[CreateItem].from_request(req) {
@@ -218,7 +218,7 @@ test "PathParam+Query+Json composed on one route; 404/405 unaffected on the same
             }
             Err(e) => e.into_response()
         }
-    }))!!
+    })!!
 
     // happy path: all three extractors succeed
     ro wire = serve_once(r, post_json_req("/items/7?q=widgets&limit=1", "{\"name\":\"gizmo\",\"qty\":5}"))

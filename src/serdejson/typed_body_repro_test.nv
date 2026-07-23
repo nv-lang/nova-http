@@ -14,7 +14,7 @@
 
 module http.serdejson
 
-import ../server.{Router, ServerResponse, handler_fn, serve_once}
+import ../server.{Router, ServerResponse, serve_once}
 import std.encoding.serde.{Serialize, Deserialize, Serializer, Deserializer, SerError, DeError}
 
 #impl(Serialize + Deserialize)
@@ -28,7 +28,7 @@ test "typed request body: json_decode_body[T] decodes ServerRequest.body_bytes()
     mut got_id = 0
     mut got_name = ""
     mut router = Router.new()
-    router.post("/w", handler_fn(|r| {
+    router.post("/w", fn(r ServerRequest) -> ServerResponse {
         match json_decode_body[ReqWidget](r.body_bytes()) {
             Ok(w) => {
                 got_id = w.id
@@ -37,7 +37,7 @@ test "typed request body: json_decode_body[T] decodes ServerRequest.body_bytes()
             }
             Err(_) => ServerResponse.text(400, "bad")
         }
-    }))!!
+    })!!
     ro wire []u8 = serve_once(router, req)
     ro s = unsafe { wire.to_str_unchecked() }
     assert(s.contains("200"))

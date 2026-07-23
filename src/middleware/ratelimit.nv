@@ -31,7 +31,7 @@
 
 module middleware.ratelimit
 
-import http.server.{Handler, handler_fn, Middleware, ServerRequest, ServerResponse}
+import http.server.{Handler, middleware, Middleware, ServerRequest, ServerResponse}
 import std.concurrency.rate_limiter.{TokenBucket}
 import std.collections.hashmap.{HashMap}
 
@@ -60,7 +60,7 @@ export fn RateLimit mut @per_client(on bool) -> @ { @per_client = on }
 export fn RateLimit @middleware() Time -> Middleware {
     ro cfg = @
     ro buckets = HashMap[str, TokenBucket].new()
-    Middleware.new(fn(next Handler) -> Handler => rl_handler(cfg, buckets, next))
+    middleware(fn(req ServerRequest, next Handler) -> ServerResponse => rl_apply(cfg, buckets, next, req))
 }
 
 /// Convenience: `ratelimit(RateLimit.new(100, 50.0))` → ready `Middleware`.
@@ -69,13 +69,10 @@ export fn ratelimit(cfg RateLimit) Time -> Middleware => cfg.middleware()
 
 // ── internals ───────────────────────────────────────────────────────────────
 
-// Params → local copies before capture ([M-16]-family, cors.nv precedent).
-fn rl_handler(cfg RateLimit, buckets HashMap[str, TokenBucket], next Handler) -> Handler {
-    ro c = cfg
-    ro b = buckets
-    handler_fn(|req| rl_apply(c, b, next, req))
-}
-
+// `next` arrives as a PARAM — `next(req)` is the safe D52 param call-through
+// ([M-16] discipline, see cors.nv `cors_apply`). The flat `middleware(...)`
+// closure above captures only the two locals (`cfg`, `buckets` — the SHARED
+// bucket table, one per built middleware value).
 fn rl_apply(cfg RateLimit, buckets0 HashMap[str, TokenBucket], next Handler, req ServerRequest) Time -> ServerResponse {
     ro key = if cfg.per_client { client_key(req) } else { "" }
     mut buckets = buckets0
@@ -88,7 +85,7 @@ fn rl_apply(cfg RateLimit, buckets0 HashMap[str, TokenBucket], next Handler, req
         }
     }
     if bucket.acquire() {
-        next.handle(req)
+        next(req)
     } else {
         mut resp = ServerResponse.text(429, "429 too many requests")
         resp.header("Retry-After", "${retry_after_secs(cfg.per_sec)}")

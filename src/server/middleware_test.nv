@@ -20,43 +20,41 @@ module http.server
 // order — see file banner's trace in the comment below `mark`'s body.
 //
 // Trace for `r.layer(a); r.layer(b)` wrapping `h` (real-chi: `a` outer):
-//   a's wrapped-handler runs first, calls `next.handle(req)` (= b's
+//   a's wrapped-handler runs first, calls `next(req)` (= b's
 //   wrapped-handler) BEFORE doing its own post-work; b's wrapped-handler
-//   likewise calls `next.handle(req)` (= raw `h`) first. `h` returns with NO
+//   likewise calls `next(req)` (= raw `h`) first. `h` returns with NO
 //   `x-order` header. Unwinding: `b`'s post-work runs first (prev=None →
 //   "B"), THEN `a`'s post-work runs (prev="B" → prepend "A" → "A,B"). Final
 //   header = "A,B" — matches entry order.
 //
-// [M-16] (detach-capture, known live compiler bug — cited per task
-// instruction, not re-diagnosed): a TWO-level-deep nested closure
-// (`|next| handler_fn(|req| { ...uses tag AND next... })`, where the
-// innermost closure reaches past its direct parent to a grandparent's
-// capture) segfaulted at runtime (repro: `nova test`, exit
-// STATUS_ACCESS_VIOLATION, crash on the very first test using `mark`).
-// Workaround: hoist the inner closure into a named top-level fn
-// (`mark_handler`) so EVERY closure here captures from its OWN direct
-// enclosing scope only (one level), never reaching through a middle
-// closure to a grandparent's variable.
-fn mark_handler(tag str, next Handler) -> Handler =>
-    handler_fn(|req| {
-        mut resp = next.handle(req)
-        ro prev = match resp.headers.get("x-order") {
-            Some(hv) => hv.to_str()!!
-            None     => ""
-        }
-        ro combined = if prev == "" { tag } else { "${tag},${prev}" }
-        resp.header("x-order", combined)
-        resp
-    })
+// [M-16] discipline (detach-capture, known live compiler bug — cited per
+// task instruction, not re-diagnosed): the middleware body is a named
+// top-level fn so `next` arrives as a PARAM (`next(req)` = safe D52 param
+// call-through) and the flat `middleware(...)` closure in `mark` captures
+// only `t` from its direct enclosing scope — a captured Handler called by
+// identifier inside a closure mis-codegens (bogus `nova_fn_next` direct
+// call), and the historical two-level-deep grandparent capture segfaulted.
+fn mark_apply(tag str, next Handler, req ServerRequest) -> ServerResponse {
+    mut resp = next(req)
+    ro prev = match resp.headers.get("x-order") {
+        Some(hv) => hv.to_str()!!
+        None     => ""
+    }
+    ro combined = if prev == "" { tag } else { "${tag},${prev}" }
+    resp.header("x-order", combined)
+    resp
+}
 
-// closure-light (`|next| ...`) failed to infer `next`'s type from
-// `Middleware.new`'s expected `fn(Handler) -> Handler` here (codegen'd the
-// param as `nova_int` — separate finding from the `[M-16]` segfault above,
-// worked around the same way `@then` (middleware.nv) already does: spell
-// out closure-FULL `fn(next Handler) -> Handler => …` explicitly).
-fn mark(tag str) -> Middleware => Middleware.new(fn(next Handler) -> Handler => mark_handler(tag, next))
+// Flat 222.4 §4а form (closure-FULL — closure-light `|req, next|` against a
+// fn-type/newtype expectation codegens params as `nova_int`, the known
+// finding this file already documented for `fn(Handler) -> Handler`).
+fn mark(tag str) -> Middleware {
+    ro t = tag
+    middleware(fn(req ServerRequest, next Handler) -> ServerResponse => mark_apply(t, next, req))
+}
 
-fn base_ok() -> Handler => handler_fn(|req| ServerResponse.text(200, "base"))
+fn base_ok() -> Handler =>
+    fn(req ServerRequest) -> ServerResponse => ServerResponse.text(200, "base")
 
 // ── single layer: sanity ────────────────────────────────────────────────────
 
@@ -104,9 +102,9 @@ test "middleware: Router.layer chains fluently (.layer(a).layer(b))" {
 
 test "middleware: routes registered BEFORE .layer() are NOT wrapped" {
     mut r = Router.new()
-    r.get("/before", handler_fn(|req| ServerResponse.text(200, "before")))!!
+    r.get("/before", fn(req ServerRequest) -> ServerResponse => ServerResponse.text(200, "before"))!!
     r.layer(mark("A"))
-    r.get("/after", handler_fn(|req| ServerResponse.text(200, "after")))!!
+    r.get("/after", fn(req ServerRequest) -> ServerResponse => ServerResponse.text(200, "after"))!!
     ro wire_before = serve_once(r, get_req("/before"))
     ro wire_after  = serve_once(r, get_req("/after"))
     assert(!resp_contains(wire_before, "x-order"))
@@ -118,7 +116,7 @@ test "middleware: routes registered BEFORE .layer() are NOT wrapped" {
 test "middleware: nest — parent layers wrap outside the sub-router's own layers" {
     mut sub = Router.new()
     sub.layer(mark("SUB"))
-    sub.get("/settings", handler_fn(|req| ServerResponse.text(200, "settings")))!!
+    sub.get("/settings", fn(req ServerRequest) -> ServerResponse => ServerResponse.text(200, "settings"))!!
     mut r = Router.new()
     r.layer(mark("PARENT"))
     r.nest("/api", sub)!!
@@ -134,7 +132,7 @@ test "middleware: nest — parent layers wrap outside the sub-router's own layer
 
 test "middleware: nesting the same sub-router into two parents stays independent" {
     mut sub = Router.new()
-    sub.get("/x", handler_fn(|req| ServerResponse.text(200, "x")))!!
+    sub.get("/x", fn(req ServerRequest) -> ServerResponse => ServerResponse.text(200, "x"))!!
     mut r1 = Router.new()
     r1.layer(mark("R1"))
     r1.nest("/a", sub)!!
@@ -158,7 +156,7 @@ test "middleware: MethodRouter's per-route 405 fallback IS wrapped by layers" {
     mut r = Router.new()
     r.layer(mark("A"))
     mut mr = get(base_ok())
-    mr.fallback(handler_fn(|req| ServerResponse.text(405, "custom method not allowed")))
+    mr.fallback(fn(req ServerRequest) -> ServerResponse => ServerResponse.text(405, "custom method not allowed"))
     r.route("/guarded", mr)!!
     ro wire = serve_once(r, post_req("/guarded"))
     assert(status_line(wire) == "HTTP/1.1 405 Method Not Allowed")
@@ -182,7 +180,7 @@ test "middleware: default 405 (no custom fallback) IS wrapped when layers exist"
 test "middleware: Router's global 404 fallback is NOT wrapped by layers" {
     mut r = Router.new()
     r.layer(mark("A"))
-    r.fallback(handler_fn(|req| ServerResponse.text(404, "custom not found")))
+    r.fallback(fn(req ServerRequest) -> ServerResponse => ServerResponse.text(404, "custom not found"))
     ro wire = serve_once(r, get_req("/missing"))
     assert(status_line(wire) == "HTTP/1.1 404 Not Found")
     assert(!resp_contains(wire, "x-order"))

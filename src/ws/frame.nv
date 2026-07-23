@@ -1,0 +1,286 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: ws/frame.nv — WebSocket frame codec, RFC 6455 §5 (Plan 222.14
+// Ф.1, http.ws СЛОЙ 1). Pure Nova (no Net effect) — mock-testable on byte
+// fixtures, same discipline as `http.server`'s own `serve_once` core
+// (D361 mock-first).
+//
+// Layer discipline (222 §0а / 222.14 §1): `http.ws` is СЛОЙ 1 — it may see
+// `http`/`http.server` (СЛОЙ 0-1, same or lower layer — `ServerRequest` used
+// by `is_upgrade_request` in the handshake.nv peer) but MUST NOT import
+// Router/extract (СЛОЙ 2, `polaris`/`http.server.extract`).
+//
+// Scope (plan §5 V1 boundary): server-side only (masked CLIENT frames are
+// decoded/unmasked; server frames encode UNMASKED — `@encode(mask: false)`
+// is the production path). `permessage-deflate` — NOT implemented (plan §5).
+
+module http.ws
+
+/// One WebSocket frame's opcode (RFC 6455 §5.2 tbl).
+#stable(since = "0.1")
+export type OpCode enum
+    | Continuation | Text | Binary | Close | Ping | Pong
+
+/// Framing/protocol errors (plan §2 exact set — no scope creep beyond it).
+#stable(since = "0.1")
+export type WsError enum
+    | BadFrame(str)
+    | TooLarge(int)
+    | UnmaskedClientFrame
+    | BadHandshake(str)
+    | ProtocolViolation(str)
+    | Closed(u16)
+
+/// One decoded WebSocket frame (post-unmask — `@payload` is ALWAYS the raw
+/// application bytes, mask already applied during `decode`).
+#stable(since = "0.1")
+export type Frame value {
+    priv fin     bool
+    priv opcode  OpCode
+    priv payload []u8
+}
+
+/// FIN bit — false means more `Continuation` frames follow (fragmentation,
+/// reassembled by `http.ws.socket`, not here — this is the pure codec).
+#stable(since = "0.1")
+export fn Frame @fin() -> bool => @fin
+/// This frame's opcode.
+#stable(since = "0.1")
+export fn Frame @opcode() -> OpCode => @opcode
+/// Unmasked application payload bytes.
+#stable(since = "0.1")
+export fn Frame @payload() -> []u8 => @payload
+
+/// Construct a frame value directly (used by `http.ws.socket`'s fragment
+/// reassembly/auto-pong, and by tests building fixtures without going
+/// through the wire encoder).
+#stable(since = "0.1")
+export fn Frame.new(fin bool, opcode OpCode, payload []u8) -> Frame => { fin, opcode, payload }
+
+// ── decode ──────────────────────────────────────────────────────────────────
+
+/// Decode ONE frame from the front of `buf`. `buf` MUST already hold a
+/// complete frame (header + full payload) — the live socket reader
+/// (`http.ws.socket`) accumulates bytes via `frame_len_hint` (below) BEFORE
+/// calling this, mirroring `http.server`'s own Content-Length accumulate-
+/// then-parse shape (`servernet.nv` `read_request`). A short `buf` is a
+/// `BadFrame` (caller bug, not a protocol case — this fn is not a streaming
+/// parser).
+///
+/// Returns `(frame, bytes consumed)` — plan §2 exact signature.
+#stable(since = "0.1")
+export fn Frame.decode(buf []u8) -> Result[(Frame, int), WsError] {
+    ro n = buf.len()
+    if n < 2 {
+        return Err(WsError.BadFrame("frame too short: need at least 2 header bytes"))
+    }
+    ro b0 = buf[0] as int
+    ro b1 = buf[1] as int
+
+    if (b0 & 0x70) != 0 {
+        return Err(WsError.ProtocolViolation("reserved bits (RSV1-3) set — no extension negotiated"))
+    }
+
+    ro fin = (b0 & 0x80) != 0
+    ro opcode_val = b0 & 0x0F
+    ro opcode = match opcode_val {
+        0x0 => Continuation
+        0x1 => Text
+        0x2 => Binary
+        0x8 => Close
+        0x9 => Ping
+        0xA => Pong
+        _   => return Err(WsError.BadFrame("unknown opcode ${opcode_val.to_str()}"))
+    }
+
+    ro masked = (b1 & 0x80) != 0
+    ro len7 = b1 & 0x7F
+
+    mut pos = 2
+    mut payload_len = 0
+    if len7 == 126 {
+        if n < pos + 2 {
+            return Err(WsError.BadFrame("truncated 16-bit extended length"))
+        }
+        payload_len = ((buf[pos] as int) << 8) | (buf[pos + 1] as int)
+        pos += 2
+    } else if len7 == 127 {
+        if n < pos + 8 {
+            return Err(WsError.BadFrame("truncated 64-bit extended length"))
+        }
+        // Top bit MUST be 0 (RFC 6455 §5.2) — a genuine >2^63 length is not a
+        // real message anyway (would blow any sane `max_message_size`); guard
+        // via the high byte instead of building the full 64-bit value first.
+        if ((buf[pos] as int) & 0x80) != 0 {
+            return Err(WsError.BadFrame("64-bit length top bit set"))
+        }
+        mut v = 0
+        for i in 0..8 {
+            v = (v << 8) | (buf[pos + i] as int)
+        }
+        payload_len = v
+        pos += 8
+    } else {
+        payload_len = len7
+    }
+
+    // Control frames (RFC 6455 §5.5): never fragmented, payload <= 125.
+    if opcode_val >= 0x8 {
+        if !fin {
+            return Err(WsError.ProtocolViolation("control frame must not be fragmented"))
+        }
+        if payload_len > 125 {
+            return Err(WsError.ProtocolViolation("control frame payload exceeds 125 bytes"))
+        }
+    }
+
+    mut mask_key [4]u8 = [0, 0, 0, 0]
+    if masked {
+        if n < pos + 4 {
+            return Err(WsError.BadFrame("truncated masking key"))
+        }
+        // [M-ws-fixarr-literal-from-index-expr-cc-fail]: assigning a `[4]u8`
+        // literal whose ELEMENTS are index expressions (not constants)
+        // mis-codegens — `struct _NovaFixArr_4_9_nova_byte` receives a
+        // `Nova_Vec____nova_byte*` (the literal gets treated as a Vec
+        // literal, not a fixed-array literal). Per-index assignment into
+        // the already-zeroed array (constant-literal init, the WORKING
+        // form per `sha1.nv`) sidesteps it.
+        mask_key[0] = buf[pos]
+        mask_key[1] = buf[pos + 1]
+        mask_key[2] = buf[pos + 2]
+        mask_key[3] = buf[pos + 3]
+        pos += 4
+    }
+
+    if n < pos + payload_len {
+        return Err(WsError.BadFrame("truncated payload"))
+    }
+
+    mut payload []u8 = []u8.new(cap: payload_len)
+    for i in 0..payload_len {
+        ro byte = buf[pos + i]
+        if masked {
+            payload.push(byte ^ mask_key[i % 4])
+        } else {
+            payload.push(byte)
+        }
+    }
+
+    Ok((Frame.new(fin, opcode, payload), pos + payload_len))
+}
+
+/// How many MORE bytes the live reader needs to buffer before it can safely
+/// call `decode` — `None` once `buf` already holds a full frame (`decode`
+/// will succeed, modulo genuine protocol errors). Lets `http.ws.socket`
+/// accumulate exactly like `servernet.read_request` does for
+/// Content-Length, WITHOUT `decode` itself needing a non-plan `Incomplete`
+/// `WsError` variant.
+#stable(since = "0.1")
+export fn frame_len_hint(buf []u8) -> Option[int] {
+    ro n = buf.len()
+    if n < 2 { return Some(2 - n) }
+    ro b1 = buf[1] as int
+    ro masked = (b1 & 0x80) != 0
+    ro len7 = b1 & 0x7F
+    mut header_len = 2
+    if len7 == 126 { header_len = 4 }
+    else if len7 == 127 { header_len = 10 }
+    if masked { header_len += 4 }
+    if n < header_len { return Some(header_len - n) }
+
+    mut pos = 2
+    mut payload_len = 0
+    if len7 == 126 {
+        payload_len = ((buf[pos] as int) << 8) | (buf[pos + 1] as int)
+        pos += 2
+    } else if len7 == 127 {
+        mut v = 0
+        for i in 0..8 { v = (v << 8) | (buf[pos + i] as int) }
+        payload_len = v
+        pos += 8
+    } else {
+        payload_len = len7
+    }
+    if masked { pos += 4 }
+    ro total = pos + payload_len
+    if n < total { Some(total - n) } else { None }
+}
+
+// ── encode ──────────────────────────────────────────────────────────────────
+
+fn opcode_bits(oc OpCode) -> int {
+    match oc {
+        Continuation => 0x0
+        Text         => 0x1
+        Binary       => 0x2
+        Close        => 0x8
+        Ping         => 0x9
+        Pong         => 0xA
+    }
+}
+
+/// A non-cryptographic mask-key derivation — `mask: true` exists ONLY for
+/// round-trip test symmetry (encode-then-decode our own frames) and for
+/// building masked fixtures; a real Nova WS SERVER never sends masked
+/// frames in production (RFC 6455 §5.1 forbids it — masking is
+/// client→server only, plan §5 "WS-клиент — НЕТ"). Deterministic from the
+/// payload so tests are reproducible; NOT a security boundary.
+/// `[M-ws-encode-mask-key-non-random]`
+fn derive_mask_key(payload []u8) -> [4]u8 {
+    mut h = (payload.len() * 2654435761) as int
+    for b in payload {
+        h = (h * 33 + (b as int)) & 0x7FFFFFFF
+    }
+    mut key [4]u8 = [0, 0, 0, 0]
+    key[0] = ((h >> 24) & 0xFF) as u8
+    key[1] = ((h >> 16) & 0xFF) as u8
+    key[2] = ((h >> 8) & 0xFF) as u8
+    key[3] = (h & 0xFF) as u8
+    key
+}
+
+/// Encode this frame to wire bytes. `mask: true` masks the payload (client
+/// role / test fixtures, see `derive_mask_key`); `mask: false` is the
+/// server-production path (RFC 6455 §5.1).
+#stable(since = "0.1")
+export fn Frame @encode(mask bool) -> []u8 {
+    ro plen = @payload.len()
+    mut out []u8 = []u8.new(cap: plen + 14)
+
+    mut b0 = opcode_bits(@opcode)
+    if @fin { b0 = b0 | 0x80 }
+    out.push(b0 as u8)
+
+    ro mask_bit = if mask { 0x80 } else { 0 }
+    if plen < 126 {
+        out.push((mask_bit | plen) as u8)
+    } else if plen < 65536 {
+        out.push((mask_bit | 126) as u8)
+        out.push(((plen >> 8) & 0xFF) as u8)
+        out.push((plen & 0xFF) as u8)
+    } else {
+        out.push((mask_bit | 127) as u8)
+        out.push(0 as u8)
+        out.push(0 as u8)
+        out.push(0 as u8)
+        out.push(0 as u8)
+        out.push(((plen >> 24) & 0xFF) as u8)
+        out.push(((plen >> 16) & 0xFF) as u8)
+        out.push(((plen >> 8) & 0xFF) as u8)
+        out.push((plen & 0xFF) as u8)
+    }
+
+    if mask {
+        ro key = derive_mask_key(@payload)
+        out.push(key[0])
+        out.push(key[1])
+        out.push(key[2])
+        out.push(key[3])
+        for i in 0..plen {
+            out.push(@payload[i] ^ key[i % 4])
+        }
+    } else {
+        out.append(@payload)
+    }
+    out
+}

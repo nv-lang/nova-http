@@ -8,7 +8,7 @@
 module http.static_test
 
 import http.static.{Static, serve_path, static_handler}
-import http.server.{Router, route_once, handler_fn, ServerRequest, ServerResponse}
+import http.server.{Router, route_once, ServerRequest, ServerResponse}
 
 // Sorted by path — `EmbeddedDir.new` contract (entries sorted, unique).
 fn fixture() -> EmbeddedDir =>
@@ -156,7 +156,7 @@ fn ServerRequest_stub() -> ServerRequest {
     mut r = Router.new()
     // route_once path would need a Router; parse via a capturing handler instead.
     mut captured Option[ServerRequest] = None
-    r.get("/probe", handler_fn(|req| { captured = Some(req); ServerResponse.empty(200) }))!!
+    r.get("/probe", fn(req ServerRequest) -> ServerResponse { captured = Some(req); ServerResponse.empty(200) })!!
     ro _ = route_once(r, "GET /probe HTTP/1.1\r\nHost: x\r\n\r\n".bytes())
     match captured {
         Some(req) => req
