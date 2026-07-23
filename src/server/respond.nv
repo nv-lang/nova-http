@@ -1,0 +1,242 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: respond.nv — `IntoResponse` protocol + typed-status `ServerResponse`
+// constructors (Plan 222.5, `polaris.respond`). Everything an HTTP handler can
+// return collapses to a `ServerResponse` through ONE protocol:
+//   `str` / `StatusCode` / `ServerResponse` (identity) / `Json[T Serialize]` /
+//   `HttpError` / the blanket `Result[R IntoResponse, E IntoResponse]` (gives
+//   `?`-ergonomics in handlers for free — mirrors the `Option`/`Result`
+//   `Debug`/`Display` blanket precedent, std/prelude/protocols.nv).
+//
+// File placement: peer of `server.nv`/`server_router.nv` in the SAME module
+// (`http.server`) — folder-module peers compile in sorted order (D78), and
+// this file's name sorts AFTER `server.nv` (needs `ServerResponse`/`Handler`
+// already declared) — same rationale as `server_router.nv`'s own banner.
+// Unlike `server_router.nv`'s `RouteNode`/`MethodEntry`, nothing declared here
+// embeds another module type BY VALUE inside a NEW struct (`Json[T]` holds a
+// generic `T`, monomorphized per instantiation) — so this file does not
+// itself need to sort after `server_router.nv`; ordering vs `server_router.nv`
+// is irrelevant (`extract.nv`, Plan 222.3, is the one that needs `Router`
+// AND `Json[T]`/`IntoResponse` from here, so it must sort after BOTH — see
+// that file's own banner).
+//
+// §5 open questions (222.5 plan) resolved (Ф.0, verified not guessed):
+//   1. Tuple-impl `(StatusCode, R IntoResponse) : IntoResponse` — no working
+//      precedent for a `#impl` on a bare tuple TYPE anywhere in std (grepped);
+//      the plan's own fallback applies: `ServerResponse.json(status, v)` (or
+//      `.header()` chaining on the built response) covers the "status + body"
+//      shape without inventing tuple-receiver syntax. NOT implemented.
+//   2. `HttpError.into_response()` status/body mapping — status by `ErrorKind`
+//      (see `http_error_status` below: transport-class kinds → 503, decode/
+//      protocol/url/header kinds → 400, `Status(c)` echoes `c`, `BodyTooLarge`
+//      → 413, `Blocked` → 403, everything else → 500); body is JSON
+//      `{"error": "<kind name>", "message": "<to_str()>"}` (FastAPI-class
+//      shape — structured, not bare text) via the SAME `Serialize`
+//      auto-derive machine as any other record (`HttpErrorBody` below).
+
+module http.server
+
+import http.{StatusCode, HttpError, ErrorKind}
+import std.encoding.serde.{Serialize, SerError, json_encode}
+
+// ── IntoResponse protocol ──────────────────────────────────────────────────
+
+/// Everything an HTTP handler can return converges here — lets handlers write
+/// `-> Result[Json[User], HttpError]` instead of hand-assembling `ServerResponse`.
+#stable(since = "0.1")
+export type IntoResponse protocol {
+    @into_response() -> ServerResponse
+}
+
+// ── StatusCode-typed constructors (§4 — chinit «статус голым int»: adds a
+// `StatusCode`-accepting overload beside EVERY existing bare-`int` form, D84
+// axis-2 arg-type overload on a concrete namespace-static fn — same class as
+// `Response.new` already having 3-arg/4-arg overloads in message.nv). The
+// bare-`int` forms are NOT removed (migration happens site-by-site, plan §4)
+// but are the ones new call-sites should avoid. ─────────────────────────────
+
+/// `text/plain` response with a typed `StatusCode` (prefer this over the
+/// bare-`int` `ServerResponse.text(int, str)` — DEPRECATED for new call-sites,
+/// kept for source compat until sites migrate, plan 222.5 §4).
+#stable(since = "0.1")
+export fn ServerResponse.text(status StatusCode, s str) -> ServerResponse =>
+    ServerResponse.text(status.as_u16() as int, s)
+
+/// `text/html` response with a typed `StatusCode` (see `.text` note above).
+#stable(since = "0.1")
+export fn ServerResponse.html(status StatusCode, s str) -> ServerResponse =>
+    ServerResponse.html(status.as_u16() as int, s)
+
+/// Raw-bytes response with a typed `StatusCode` (see `.text` note above).
+#stable(since = "0.1")
+export fn ServerResponse.bytes(status StatusCode, content_type str, data []u8) -> ServerResponse =>
+    ServerResponse.bytes(status.as_u16() as int, content_type, data)
+
+/// Bodyless response with a typed `StatusCode` (see `.text` note above).
+#stable(since = "0.1")
+export fn ServerResponse.empty(status StatusCode) -> ServerResponse =>
+    ServerResponse.empty(status.as_u16() as int)
+
+/// Redirect response with a typed `StatusCode` (see `.text` note above).
+#stable(since = "0.1")
+export fn ServerResponse.redirect(status StatusCode, location str) -> ServerResponse =>
+    ServerResponse.redirect(status.as_u16() as int, location)
+
+// ── Json[T] — response body wrapper (double duty, Axum-parity: the SAME type
+// also gets a `#impl(FromRequest)` in extract.nv, Plan 222.3, for the request
+// side — declared HERE because the `IntoResponse` impl below needs it and
+// 222.5 lands before/with 222.3, plan §1). ─────────────────────────────────
+
+/// A JSON request/response body wrapper — `json(v).into_response()` on
+/// the way out, `Json[T].from_request(req)` (extract.nv) on the way in.
+///
+/// NOT `value` (deviates from plan §2's literal `Json[T] value {...}`) —
+/// [M-generic-value-self-protocol-wrapper-mono] (found this wave, minimal
+/// repro below): a GENERIC `value`-kind type conforming to a protocol whose
+/// method has NO method-level generic param and returns `Result[Self, E]` (or
+/// `Option[Self]`) makes the forward-decl pass emit an invalid C struct
+/// instantiated on the BARE typevar name itself (`NovaValue_Json____Nova_T_p`
+/// — literal "T", never substituted) alongside the correctly-monomorphized
+/// concrete ones — `unknown type name`, CC-FAIL. Reproduces with a 12-line
+/// minimal case unrelated to Json/HttpError (`type Wrap[T] value {...}` +
+/// `type P protocol { .m(x int) -> Result[Self, E] }` + `fn Wrap[T
+/// Equal].m(...) -> Result[Wrap[T], E]`); reproduces with `Option[Self]` too
+/// (not Result-specific). Two workarounds confirmed: (a) give the protocol
+/// method its OWN method-level generic param (`.m[D](...)`, mirrors
+/// `Deserialize.deserialize[D Deserializer]`'s shape — but that changes
+/// `FromRequest`'s signature, not authorized by the plan); (b) drop `value`
+/// (this type becomes a normal heap/GC'd reference type — the one applied
+/// here, smallest surface change, no protocol-signature deviation). Does NOT
+/// affect NON-generic conformers (`Bytes`/`Text`/`Headers` in extract.nv stay
+/// `value` — confirmed unaffected). Report to integrator for
+/// `docs/plans/backlog-followups.md` registration + plan 222.3/222.5
+/// §2-amendment (this worktree does not touch the nova repo).
+#stable(since = "0.1")
+export type Json[T] { priv data T }
+
+/// The wrapped value (property accessor, D117 — not a bare field).
+#stable(since = "0.1")
+export fn Json[T] @data() -> T => @data
+
+/// Wrap a value as a `Json[T]` body. FREE FUNCTION, not `Json.new[T](...)` —
+/// [M-generic-value-static-ctor-mangle] (found + isolated during this wave,
+/// minimal repro below): a namespace-static constructor `TypeName.method[T](v
+/// T) -> TypeName[T]` on a generic `value`-kind type, called with an
+/// INFERRED (non-turbofish) `T`, emits the WRONG C type for both (a) a local
+/// binding `ro x = TypeName.method(v)` (`Nova_TypeName____<T>` — pointer/
+/// reference-kind naming — instead of the correct value-kind
+/// `NovaValue_TypeName____<T>`) and (b) the constructor result chained
+/// straight into another instance-method call (passes the struct BY VALUE
+/// where the receiver parameter is a pointer). Reproduces with T = a
+/// user-defined `value` record AND with T = a bare primitive (`int`) — not
+/// specific to `Json`/`Widget`; reproduces regardless of the constructor's
+/// name (`.new`/`.make`/…) — not a `.new`-specific quirk. A FREE function
+/// with the identical generic-return shape (`fn box_iter[T](it VecIter[T]) ->
+/// BoxIter[T]`, std/collections/vec_lazy/core.nv — pre-existing precedent for
+/// this exact style) is NOT affected — the type is inferred correctly for
+/// both the local-binding and chained-call shapes. Repro (isolated, 10
+/// lines): `export type Box[T] value { priv data T }` +
+/// `export fn Box.make[T](v T) -> Box[T] => { data: v }` + `ro b =
+/// Box.make(42)` → CC-FAIL `unknown type name 'Nova_Box____nova_int'`. Report
+/// to integrator for `docs/plans/backlog-followups.md` registration (this
+/// worktree does not touch the nova repo).
+#stable(since = "0.1")
+export fn json[T](v T) -> Json[T] => { data: v }
+
+/// One-call JSON response: encode `v` (`#impl(Serialize)`) with
+/// `Content-Type: application/json` + the given status. Replaces manual
+/// `serdejson`-plumbing for server responses (plan §3). A `SerError` (non-
+/// finite float / depth-limit / lossy-integer — all programmer bugs on the
+/// SERIALIZE side, not request input) collapses to a 500 with the detail in
+/// the body — there is no sane 4xx mapping for "the handler's own DTO failed
+/// to encode".
+#stable(since = "0.1")
+export fn ServerResponse.json[T Serialize](status StatusCode, v T) -> ServerResponse {
+    match json_encode(v) {
+        Ok(s)  => ServerResponse.bytes(status, "application/json", s.bytes())
+        Err(e) => server_json_encode_error(e)
+    }
+}
+
+fn server_json_encode_error(e SerError) -> ServerResponse =>
+    ServerResponse.text(StatusCode.internal_error(), "500 internal server error: ${e.to_str()}")
+
+// ── IntoResponse impls (the bulk of this plan's value — blanket Result[R,E]
+// gives `?`-ergonomics in handlers for free) ───────────────────────────────
+
+/// Identity — a handler that already built its `ServerResponse` passes through.
+#impl(IntoResponse)
+export fn ServerResponse @into_response() -> ServerResponse => @
+
+/// A bare `str` becomes a `200 OK` `text/plain` response.
+#impl(IntoResponse)
+export fn str @into_response() -> ServerResponse => ServerResponse.text(StatusCode.ok(), @)
+
+/// A bare `StatusCode` becomes a bodyless response at that status.
+#impl(IntoResponse)
+export fn StatusCode @into_response() -> ServerResponse => ServerResponse.empty(@)
+
+/// `Json[T Serialize]` becomes a `200 OK` `application/json` response.
+#impl(IntoResponse)
+export fn Json[T Serialize] @into_response() -> ServerResponse =>
+    ServerResponse.json(StatusCode.ok(), @data())
+
+/// Structured error body — `{"error": "<kind>", "message": "<detail>"}`, status
+/// from `http_error_status` below (§5.2 resolution, this file's banner).
+#impl(Serialize)
+type HttpErrorBody value { ro error str, ro message str }
+
+fn http_error_kind_name(kind ErrorKind) -> str {
+    match kind {
+        Connect             => "connect"
+        Dns                 => "dns"
+        Tls                 => "tls"
+        Timeout             => "timeout"
+        Protocol(_)         => "protocol"
+        InvalidUrl          => "invalid_url"
+        InvalidHeader       => "invalid_header"
+        Status(_)           => "status"
+        TooManyRedirects(_) => "too_many_redirects"
+        BodyTooLarge        => "body_too_large"
+        Closed              => "closed"
+        Canceled            => "canceled"
+        Blocked(_)          => "blocked"
+        Other(_)            => "other"
+    }
+}
+
+fn http_error_status(kind ErrorKind) -> StatusCode {
+    match kind {
+        Connect             => StatusCode.service_unavailable()
+        Dns                 => StatusCode.service_unavailable()
+        Tls                 => StatusCode.service_unavailable()
+        Timeout             => StatusCode.service_unavailable()
+        Protocol(_)         => StatusCode.bad_request()
+        InvalidUrl          => StatusCode.bad_request()
+        InvalidHeader       => StatusCode.bad_request()
+        Status(c)           => c
+        TooManyRedirects(_) => StatusCode.internal_error()
+        BodyTooLarge        => StatusCode.new(413)!!  // 413 Content Too Large — static literal, in-range by construction
+        Closed              => StatusCode.service_unavailable()
+        Canceled            => StatusCode.service_unavailable()
+        Blocked(_)          => StatusCode.forbidden()
+        Other(_)            => StatusCode.internal_error()
+    }
+}
+
+/// `HttpError` → a typed status (by `kind`) + a structured JSON error body.
+#impl(IntoResponse)
+export fn HttpError @into_response() -> ServerResponse =>
+    ServerResponse.json(http_error_status(@kind), HttpErrorBody{ error: http_error_kind_name(@kind), message: @to_str() })
+
+/// BLANKET — `Result[R IntoResponse, E IntoResponse]` : `IntoResponse`. Gives
+/// `?`-ergonomics in handlers for free (a handler can end in `foo()?` and
+/// `-> Result[R, HttpError]` directly, no manual `match`). Mirrors the
+/// `Option`/`Result` `Debug`/`Display` blanket precedent (std/prelude/
+/// protocols.nv `fn Result[T Display, E Display] @display(...)`).
+#impl(IntoResponse)
+export fn Result[R IntoResponse, E IntoResponse] @into_response() -> ServerResponse {
+    match @ {
+        Ok(r)  => r.into_response()
+        Err(e) => e.into_response()
+    }
+}

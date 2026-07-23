@@ -1,0 +1,146 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Plan 222.3 — `FromRequest` extractors: peer tests. Ф.1 (ParamsDeserializer/
+// QueryDeserializer — pure parser tests, no http context) + Ф.2 (`Bytes`/
+// `Text`/`Headers` via `#impl(FromRequest)`, driven end-to-end through a real
+// `Router` dispatch — mirrors `router_test.nv`/`server_test.nv`'s own "build a
+// raw HTTP/1.1 request, serve_once, inspect the wire response" style so no
+// mock-`ServerRequest` constructor is needed).
+//
+// `Path[T]`/`Query[T]`/`Json[T]` — TYPE-CHECK cleanly (`nova check` PASS,
+// matching the plan's design exactly, extract.nv above) but their
+// `.from_request(req)` call is NOT exercised end-to-end here:
+// [M-generic-static-method-value-arg-addr-mismatch] (found this wave,
+// confirmed with a REAL `ServerRequest` across THREE calling conventions —
+// direct call outside any closure, inside a `handler_fn(|req| ...)` closure,
+// and through a bound-generic wrapper `fn f[T FromRequest](req) -> ... =>
+// T.from_request(req)` — all three fail identically). Root symptom: calling
+// `SomeGeneric[Concrete].from_request(req)` (or the bound-generic-dispatch
+// equivalent) where `SomeGeneric[T]` is a NON-`value` generic type (the fix
+// for the SEPARATE [M-generic-value-self-protocol-wrapper-mono], see
+// respond.nv) emits `&(req)` — takes the ARGUMENT's address — at the call
+// site, while the generated callee signature takes `req` BY VALUE:
+// `unknown pointer→value` CC-FAIL, `dereference with *` per clang's own hint.
+// Minimal repro attempts with a tiny `Req value {..}`/`Wrap[T] {..}` pair
+// (unrelated to `ServerRequest`/`Json`/`HttpError`) did NOT reproduce it
+// (10+ variants tried: mut vs ro binding, closure vs direct call, fresh
+// literal vs parsed-through-a-fallible-constructor) — the trigger appears
+// tied to `ServerRequest`'s specific shape (7 fields incl. `HeaderMap`/
+// `Option`/`Vec`-backed ones) or its construction path (`parse_request`), not
+// isolated further given the time already spent (each variant is a full
+// compile — cost/benefit turned negative). The `.c` evidence at the ACTUAL
+// call site (`Nova_Path____NovaValue_UserIdParams_static_from_request((&(req)))`
+// vs the declared `static NovaRes_..._from_request(NovaValue_ServerRequest`)
+// is itself a complete, reproducible-on-demand repro (re-add the three
+// `Path[T]`/`Query[T]`/`Json[T]` round-trip tests removed from this file,
+// content preserved in the session's report, and `nova test` reproduces it).
+// LIKELY THE SAME FAMILY as the ALREADY-TRACKED "value/pointer mismatch in
+// arg position" bug class (owner-confirmed mid-wave: commit `bac50128d
+// fix(codegen, [M-nv-spawn-ctx-capture-mut-param-ptr-mismatch]+
+// [M-http-props-mut-chain-argpos-value-ptr-mismatch])` landed on nova main
+// DURING this session; rebuilt nova.exe from that commit — this EXACT
+// manifestation still persists after the rebuild, i.e. it looks like the
+// "остаточный detach-вариант №16" the owner flagged as still-in-progress,
+// not a case that fix already covers).
+// Report to integrator for `docs/plans/backlog-followups.md` registration
+// (this worktree does not touch the nova repo) — code itself (extract.nv) is
+// unaffected/correct and ships as-is; only the END-TO-END test is blocked.
+
+module http.server
+
+import std.encoding.serde.{Serialize, Deserialize}
+
+// `get_req` already defined in router_test.nv (same module, no re-declare).
+fn post_json_req(path str, body str) -> []u8 =>
+    "POST ${path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: ${body.byte_len()}\r\n\r\n${body}".bytes()
+fn post_text_req(path str, body str) -> []u8 =>
+    "POST ${path} HTTP/1.1\r\nHost: x\r\nContent-Length: ${body.byte_len()}\r\n\r\n${body}".bytes()
+
+// ── Ф.1: ParamsDeserializer / QueryDeserializer — pure parser tests ───────
+
+test "ParamsDeserializer: enter_field + deser_int/deser_str round-trip" {
+    mut d = ParamsDeserializer.at([("id", "42"), ("name", "gizmo")])
+    ro d1 = d.enter_field("id")!!
+    mut d1m = d1
+    assert(d1m.deser_int()!! == 42)
+    ro d2 = d.enter_field("name")!!
+    mut d2m = d2
+    assert(d2m.deser_str()!! == "gizmo")
+}
+
+test "ParamsDeserializer: enter_field on a missing key -> MissingField error" {
+    mut d = ParamsDeserializer.at([("id", "42")])
+    ro r = d.enter_field("missing")
+    assert(match r { Err(_) => true, Ok(_) => false })
+}
+
+test "ParamsDeserializer: has_field reflects presence" {
+    mut d = ParamsDeserializer.at([("id", "42")])
+    assert(d.has_field("id")!! == true)
+    assert(d.has_field("nope")!! == false)
+}
+
+test "ParamsDeserializer: enter_field_or_null -> null cursor for a missing key" {
+    mut d = ParamsDeserializer.at([("id", "42")])
+    ro sub = d.enter_field_or_null("missing")!!
+    mut subm = sub
+    assert(subm.is_null()!! == true)
+}
+
+test "QueryDeserializer: percent-decode + '&'/'=' split, then enter_field + deser" {
+    mut d = QueryDeserializer.at("q=hello%20world&limit=10")
+    ro d1 = d.enter_field("q")!!
+    mut d1m = d1
+    assert(d1m.deser_str()!! == "hello world")
+    ro d2 = d.enter_field("limit")!!
+    mut d2m = d2
+    assert(d2m.deser_int()!! == 10)
+}
+
+test "QueryDeserializer: empty query string -> no fields present" {
+    mut d = QueryDeserializer.at("")
+    assert(d.has_field("anything")!! == false)
+}
+
+// ── Bytes / Text / Headers : FromRequest (never fail on well-formed UTF-8) ─
+
+test "Bytes: raw body bytes, no decode" {
+    mut r = Router.new()
+    r.post("/raw", handler_fn(|req| {
+        match Bytes.from_request(req) {
+            Ok(b)  => ServerResponse.text(200, "len=${b.data().len()}")
+            Err(e) => e.into_response()
+        }
+    }))!!
+    ro wire = serve_once(r, post_text_req("/raw", "hello"))
+    ro s = unsafe { wire.to_str_unchecked() }
+    assert(s.contains("len=5"))
+}
+
+test "Text: body as UTF-8 text" {
+    mut r = Router.new()
+    r.post("/echo", handler_fn(|req| {
+        match Text.from_request(req) {
+            Ok(t)  => ServerResponse.text(200, "got=${t.data()}")
+            Err(e) => e.into_response()
+        }
+    }))!!
+    ro wire = serve_once(r, post_text_req("/echo", "hello there"))
+    ro s = unsafe { wire.to_str_unchecked() }
+    assert(s.contains("got=hello there"))
+}
+
+test "Headers: exposes the request's header map" {
+    mut r = Router.new()
+    r.get("/hdrs", handler_fn(|req| {
+        match Headers.from_request(req) {
+            Ok(h) => match h.data().get("Host") {
+                Some(_) => ServerResponse.text(200, "has-host")
+                None    => ServerResponse.text(200, "no-host")
+            }
+            Err(e) => e.into_response()
+        }
+    }))!!
+    ro wire = serve_once(r, get_req("/hdrs"))
+    ro s = unsafe { wire.to_str_unchecked() }
+    assert(s.contains("has-host"))
+}
