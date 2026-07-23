@@ -132,7 +132,12 @@ fn cors_apply(cfg Cors, next Handler, req ServerRequest) -> ServerResponse {
     if preflight {
         preflight_response(cfg, req, origin)
     } else {
-        decorate_simple(cfg, next(req), origin)
+        // Bind the rvalue to an addressable `mut` local before the call:
+        // `decorate_simple`'s 2nd param is `mut` (D246 canon (a)) — a
+        // temporary call-result can't bind directly to a `mut` param
+        // (E_MUT_ARG_NOT_MUTABLE, Plan 184 Р10 needs addressable storage).
+        mut resp = next(req)
+        decorate_simple(cfg, resp, origin)
     }
 }
 
@@ -151,9 +156,10 @@ fn Cors @allow_origin_value(origin str) -> str =>
 
 // Simple (non-preflight) response decoration. `Vary: origin` is appended even
 // for a disallowed origin — the answer still depends on the Origin header.
-// `resp0` is `mut` (D246 canon (a), in-out): the only call site (`@middleware`
-// above) hands `next(req)`'s freshly-returned rvalue straight in, so no
-// independent `resp` copy is needed.
+// `resp0` is `mut` (D246 canon (a), in-out): the only call site (`cors_apply`
+// above) binds `next(req)`'s rvalue to a `mut resp` local first (a temporary
+// can't address-bind to a `mut` param, E_MUT_ARG_NOT_MUTABLE) and passes
+// that through — no independent copy needed.
 fn decorate_simple(cfg Cors, mut resp0 ServerResponse, origin str) -> ServerResponse {
     resp0.header("Vary", vary_value(resp0, "origin"))
     if cfg.origin_allowed(origin) {
@@ -187,7 +193,11 @@ fn preflight_response(cfg Cors, req ServerRequest, origin str) -> ServerResponse
 // the requested method instead (tower-http rule); explicit list joins as-is.
 fn Cors @methods_value(req ServerRequest) -> str {
     if @any_methods {
-        if @credentials { safe_mirror(req.header("access-control-request-method") ?? "") } else { "*" }
+        // Bind to an addressable `mut` local first: `safe_mirror`'s param is
+        // `mut` (D246 canon (a)) — a `??`-expression rvalue can't bind
+        // directly to a `mut` param (E_MUT_ARG_NOT_MUTABLE).
+        mut v = req.header("access-control-request-method") ?? ""
+        if @credentials { safe_mirror(v) } else { "*" }
     } else {
         @methods.join(", ")
     }
@@ -198,7 +208,9 @@ fn Cors @methods_value(req ServerRequest) -> str {
 // always used here, same tower-http `AllowHeaders::mirror_request` shape).
 fn Cors @headers_value(req ServerRequest) -> str {
     if @any_headers {
-        safe_mirror(req.header("access-control-request-headers") ?? "")
+        // Same rationale as `@methods_value` above.
+        mut v = req.header("access-control-request-headers") ?? ""
+        safe_mirror(v)
     } else {
         @headers.join(", ")
     }
@@ -208,8 +220,9 @@ fn Cors @headers_value(req ServerRequest) -> str {
 // CR/LF/NUL/non-latin1 (would panic the total `resp.header` setter) → "".
 // `s` is `mut` (D246 canon (a), return-position identity passthrough on the
 // clean-scan path; `str` is NOT scalar-exempt — 2 fields, ptr+len). Both
-// call sites (`@methods_value`/`@headers_value` below) pass a fresh `??`-
-// expression rvalue, never a bound identifier.
+// call sites (`@methods_value`/`@headers_value` above) bind their own
+// single-use `mut v` local before calling (a `??`-expression rvalue can't
+// address-bind to a `mut` param, E_MUT_ARG_NOT_MUTABLE).
 fn safe_mirror(mut s str) -> str {
     for c in s.chars() {
         ro cp = c as int
