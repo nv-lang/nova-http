@@ -57,8 +57,8 @@ fn read_attempt(s mut TcpStream, deadline Monotonic) Net Time -> ReadAttempt {
     mut timed_out = false
     with Fail[TimeoutError] = |_e| { timed_out = true } {
         supervised(deadline: deadline) {
-            spawn consume ws = s.share() {
-                match ws.read_to_vec(65536) {
+            spawn consume shs = s.share() { // не `ws`: модуль http.ws затеняет локаль — [M-module-name-shadows-local] (221.1 №49)
+                match shs.read_to_vec(65536) {
                     Ok(chunk) => { ro _ = tx.try_send(chunk) }
                     Err(_)    => ()
                 }
