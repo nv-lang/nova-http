@@ -32,17 +32,17 @@
 module rt.serve_policy_smoke
 
 import std.net.{TcpListener, TcpStream, SocketAddr, real_net}
-import ../../server.{Router, ServerResponse, handler_fn}
+import ../../server.{Router, ServerRequest, ServerResponse}
 import ../../servernet.{ServerPolicy}
 import ../../serve.{serve_router}
 
 fn echo_routes() -> Router {
     mut r = Router.new()
-    r.get("/health", handler_fn(|_req| ServerResponse.text(200, "ok")))!!
-    r.post("/echo", handler_fn(|req| {
+    r.get("/health", fn(_req ServerRequest) -> ServerResponse => ServerResponse.text(200, "ok"))!!
+    r.post("/echo", fn(req ServerRequest) -> ServerResponse {
         ro body = unsafe { req.body_bytes().to_str_unchecked() }
         ServerResponse.text(200, body)
-    }))!!
+    })!!
     r
 }
 
