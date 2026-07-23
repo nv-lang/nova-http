@@ -1,0 +1,185 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Plan 222.4 — `Middleware`/`Router.@layer` pin tests: wrap-at-registration
+// order (real-chi: first `.layer()` = outermost, runs first — resolves the
+// plan draft's own admitted confusion, see middleware.nv banner), the
+// "layer only covers routes registered AFTER the call" chi rule, `@nest`
+// interaction (parent layers land OUTSIDE sub's own — plan §3), the
+// documented `@fallback` split (per-route 405 IS wrapped, global 404 is
+// NOT), and `@then` composition.
+//
+// `get_req`/`post_req` (router_test.nv), `serve_once`/`status_line`/
+// `resp_contains` (mux_test.nv) — same module (`http.server`) peer files,
+// no import/redeclare needed (same pattern those two files already share).
+
+module http.server
+
+// A middleware that PREPENDS `tag` onto a `x-order` response header (comma-
+// joined), reading the prior value (if any) off the response `next` already
+// produced. Prepend-on-return means the FIRST-entered (outermost) layer's
+// tag ends up FIRST in the final string, left-to-right == real execution
+// order — see file banner's trace in the comment below `mark`'s body.
+//
+// Trace for `r.layer(a); r.layer(b)` wrapping `h` (real-chi: `a` outer):
+//   a's wrapped-handler runs first, calls `next.handle(req)` (= b's
+//   wrapped-handler) BEFORE doing its own post-work; b's wrapped-handler
+//   likewise calls `next.handle(req)` (= raw `h`) first. `h` returns with NO
+//   `x-order` header. Unwinding: `b`'s post-work runs first (prev=None →
+//   "B"), THEN `a`'s post-work runs (prev="B" → prepend "A" → "A,B"). Final
+//   header = "A,B" — matches entry order.
+//
+// [M-16] (detach-capture, known live compiler bug — cited per task
+// instruction, not re-diagnosed): a TWO-level-deep nested closure
+// (`|next| handler_fn(|req| { ...uses tag AND next... })`, where the
+// innermost closure reaches past its direct parent to a grandparent's
+// capture) segfaulted at runtime (repro: `nova test`, exit
+// STATUS_ACCESS_VIOLATION, crash on the very first test using `mark`).
+// Workaround: hoist the inner closure into a named top-level fn
+// (`mark_handler`) so EVERY closure here captures from its OWN direct
+// enclosing scope only (one level), never reaching through a middle
+// closure to a grandparent's variable.
+fn mark_handler(tag str, next Handler) -> Handler =>
+    handler_fn(|req| {
+        mut resp = next.handle(req)
+        ro prev = match resp.headers.get("x-order") {
+            Some(hv) => hv.to_str()!!
+            None     => ""
+        }
+        ro combined = if prev == "" { tag } else { "${tag},${prev}" }
+        resp.header("x-order", combined)
+        resp
+    })
+
+// closure-light (`|next| ...`) failed to infer `next`'s type from
+// `Middleware.new`'s expected `fn(Handler) -> Handler` here (codegen'd the
+// param as `nova_int` — separate finding from the `[M-16]` segfault above,
+// worked around the same way `@then` (middleware.nv) already does: spell
+// out closure-FULL `fn(next Handler) -> Handler => …` explicitly).
+fn mark(tag str) -> Middleware => Middleware.new(fn(next Handler) -> Handler => mark_handler(tag, next))
+
+fn base_ok() -> Handler => handler_fn(|req| ServerResponse.text(200, "base"))
+
+// ── single layer: sanity ────────────────────────────────────────────────────
+
+test "middleware: a single layer wraps the handler" {
+    mut r = Router.new()
+    r.layer(mark("A"))
+    r.get("/x", base_ok())!!
+    ro wire = serve_once(r, get_req("/x"))
+    assert(status_line(wire) == "HTTP/1.1 200 OK")
+    assert(resp_contains(wire, "x-order: A"))
+}
+
+// ── order: first `.layer()` call = outermost, runs first (real-chi) ────────
+
+test "middleware: first .layer() call is outermost — r.layer(a); r.layer(b) -> a,b" {
+    mut r = Router.new()
+    r.layer(mark("A"))
+    r.layer(mark("B"))
+    r.get("/x", base_ok())!!
+    ro wire = serve_once(r, get_req("/x"))
+    assert(resp_contains(wire, "x-order: A,B"))
+}
+
+test "middleware: three layers compose in registration order" {
+    mut r = Router.new()
+    r.layer(mark("A"))
+    r.layer(mark("B"))
+    r.layer(mark("C"))
+    r.get("/x", base_ok())!!
+    ro wire = serve_once(r, get_req("/x"))
+    assert(resp_contains(wire, "x-order: A,B,C"))
+}
+
+// ── chain-style registration (`Router.@layer` returns `-> @`, D409) ────────
+
+test "middleware: Router.layer chains fluently (.layer(a).layer(b))" {
+    mut r = Router.new()
+    r.layer(mark("A")).layer(mark("B"))
+    r.get("/x", base_ok())!!
+    ro wire = serve_once(r, get_req("/x"))
+    assert(resp_contains(wire, "x-order: A,B"))
+}
+
+// ── chi rule: layer only covers routes registered AFTER the call ───────────
+
+test "middleware: routes registered BEFORE .layer() are NOT wrapped" {
+    mut r = Router.new()
+    r.get("/before", handler_fn(|req| ServerResponse.text(200, "before")))!!
+    r.layer(mark("A"))
+    r.get("/after", handler_fn(|req| ServerResponse.text(200, "after")))!!
+    ro wire_before = serve_once(r, get_req("/before"))
+    ro wire_after  = serve_once(r, get_req("/after"))
+    assert(!resp_contains(wire_before, "x-order"))
+    assert(resp_contains(wire_after, "x-order: A"))
+}
+
+// ── nest: parent's layers land OUTSIDE the sub-router's own (plan §3) ──────
+
+test "middleware: nest — parent layers wrap outside the sub-router's own layers" {
+    mut sub = Router.new()
+    sub.layer(mark("SUB"))
+    sub.get("/settings", handler_fn(|req| ServerResponse.text(200, "settings")))!!
+    mut r = Router.new()
+    r.layer(mark("PARENT"))
+    r.nest("/api", sub)!!
+    ro wire = serve_once(r, get_req("/api/settings"))
+    assert(status_line(wire) == "HTTP/1.1 200 OK")
+    assert(resp_contains(wire, "x-order: PARENT,SUB"))
+}
+
+// ── nest pitfall (plan §3): same sub-router nested into two different
+// parents does NOT cross-contaminate — value semantics, `@nest` never
+// mutates `sub` itself (see server_router.nv's `@nest` banner + this file's
+// `middleware.nv` banner) ────────────────────────────────────────────────────
+
+test "middleware: nesting the same sub-router into two parents stays independent" {
+    mut sub = Router.new()
+    sub.get("/x", handler_fn(|req| ServerResponse.text(200, "x")))!!
+    mut r1 = Router.new()
+    r1.layer(mark("R1"))
+    r1.nest("/a", sub)!!
+    mut r2 = Router.new()
+    r2.layer(mark("R2"))
+    r2.nest("/b", sub)!!
+    ro w1 = serve_once(r1, get_req("/a/x"))
+    ro w2 = serve_once(r2, get_req("/b/x"))
+    assert(resp_contains(w1, "x-order: R1"))
+    assert(!resp_contains(w1, "R2"))
+    assert(resp_contains(w2, "x-order: R2"))
+    assert(!resp_contains(w2, "R1"))
+}
+
+// ── @fallback split: per-route 405 IS wrapped, global 404 is NOT ───────────
+// (documented choice, middleware.nv banner: our `.layer()` behaves like
+// Axum's `route_layer` — covers routes actually registered via
+// `@route`/`@insert_segs`; `Router.@fallback` never reaches that function.)
+
+test "middleware: MethodRouter's per-route 405 fallback IS wrapped by layers" {
+    mut r = Router.new()
+    r.layer(mark("A"))
+    mut mr = get(base_ok())
+    mr.fallback(handler_fn(|req| ServerResponse.text(405, "custom method not allowed")))
+    r.route("/guarded", mr)!!
+    ro wire = serve_once(r, post_req("/guarded"))
+    assert(status_line(wire) == "HTTP/1.1 405 Method Not Allowed")
+    assert(resp_contains(wire, "x-order: A"))
+}
+
+test "middleware: Router's global 404 fallback is NOT wrapped by layers" {
+    mut r = Router.new()
+    r.layer(mark("A"))
+    r.fallback(handler_fn(|req| ServerResponse.text(404, "custom not found")))
+    ro wire = serve_once(r, get_req("/missing"))
+    assert(status_line(wire) == "HTTP/1.1 404 Not Found")
+    assert(!resp_contains(wire, "x-order"))
+}
+
+// ── `@then`: direct composition, equivalent to two sequential `.layer()` calls ─
+
+test "middleware: @then composes a external / b internal, same order as two .layer() calls" {
+    mut r = Router.new()
+    r.layer(mark("A").then(mark("B")))
+    r.get("/x", base_ok())!!
+    ro wire = serve_once(r, get_req("/x"))
+    assert(resp_contains(wire, "x-order: A,B"))
+}
