@@ -14,14 +14,14 @@ module http.server
 
 fn streaming_routes() -> Router {
     mut r = Router.new()
-    r.get("/events", handler_fn(|req| {
+    r.get("/events", fn(req ServerRequest) -> ServerResponse {
         ro chunks [][]u8 = ["a".bytes(), "bcd".bytes()]
         ServerResponse.stream(200, HeaderMap.new(), StreamBody.from_chunks(chunks))
-    }))!!
-    r.get("/sse", handler_fn(|req| {
+    })!!
+    r.get("/sse", fn(req ServerRequest) -> ServerResponse {
         ro chunks [][]u8 = [sse_event("tick", "1"), sse_event("tick", "2"), sse_event("done", "bye")]
         ServerResponse.sse(StreamBody.from_chunks(chunks))
-    }))!!
+    })!!
     r
 }
 
@@ -80,10 +80,10 @@ test "server: SSE response — text/event-stream headers + event/data framing" {
 
 test "server: empty stream (zero chunks) still writes head + terminator" {
     mut r = Router.new()
-    r.get("/empty", handler_fn(|req| {
+    r.get("/empty", fn(req ServerRequest) -> ServerResponse {
         ro chunks [][]u8 = []
         ServerResponse.stream(200, HeaderMap.new(), StreamBody.from_chunks(chunks))
-    }))!!
+    })!!
     ro req = "GET /empty HTTP/1.1\r\nHost: x\r\n\r\n".bytes()
     ro wire []u8 = serve_once(r, req)
     ro s = unsafe { wire.to_str_unchecked() }
@@ -131,7 +131,7 @@ test "server: streaming response driven by a ChanReader producer" {
         }
     })
     mut r = Router.new()
-    r.get("/chan", handler_fn(|req| ServerResponse.sse(producer)))!!
+    r.get("/chan", fn(req ServerRequest) -> ServerResponse => ServerResponse.sse(producer))!!
     ro req = "GET /chan HTTP/1.1\r\nHost: x\r\n\r\n".bytes()
     ro wire []u8 = serve_once(r, req)
     ro s = unsafe { wire.to_str_unchecked() }

@@ -82,9 +82,51 @@ module http.server
 #stable(since = "0.1")
 export type Middleware value { priv f fn(Handler) -> Handler }
 
-/// Wrap a closure as a `Middleware`.
+/// Wrap a closure as a `Middleware` (POWER form: the outer closure runs once
+/// per composition — use it for middleware with one-time setup work; for the
+/// common "wrap every request" case prefer the flat `middleware(...)` below,
+/// 222.4 §4а canon).
 #stable(since = "0.1")
 export fn Middleware.new(f fn(Handler) -> Handler) -> Middleware => { f }
+
+/// CANON form (222.4 §4а, owner decision 2026-07-23): build a middleware from
+/// ONE flat closure `fn(req, next)` — no nested `fn(next) -> Handler`
+/// ceremony. `next` is a plain `Handler` value: call it directly
+/// (`next(req)`), run code after it, or short-circuit by returning your own
+/// response without calling it.
+///
+/// ```nova
+/// ro logging = middleware(fn(req ServerRequest, next Handler) -> ServerResponse {
+///     ro resp = next(req)
+///     resp
+/// })
+/// ```
+///
+/// NB `Middleware` itself stays a record newtype over `fn(Handler) -> Handler`
+/// (NOT a newtype over this flat fn form): `Router.@layers` is a
+/// `[]Middleware`, and a Vec of a newtype-over-fn ELEMENT trips codegen
+/// (`copy_n_nonoverlapping` T-inference — `[M-vec-of-fn-newtype-codegen]`,
+/// probed 2026-07-23), so the flat form is a constructor, exactly the plan's
+/// §4а shape.
+#stable(since = "0.1")
+export fn middleware(f fn(ServerRequest, Handler) -> ServerResponse) -> Middleware {
+    ro g = f
+    Middleware.new(fn(next Handler) -> Handler => flat_handler(g, next))
+}
+
+// Hoisted one level per closure ([M-16] discipline, see `mark`'s old shape in
+// middleware_test.nv): the returned Handler-closure captures `g`/`n` from its
+// DIRECT enclosing scope and hands them to a top-level fn as PARAMS — calling
+// a CAPTURED fn value by identifier is the live [M-16] mis-codegen
+// (`nova_fn_g` bogus direct call), param call-through is fine (D52 кусок 3).
+fn flat_handler(f fn(ServerRequest, Handler) -> ServerResponse, next Handler) -> Handler {
+    ro g = f
+    ro n = next
+    fn(req ServerRequest) -> ServerResponse => flat_invoke(g, n, req)
+}
+
+fn flat_invoke(f fn(ServerRequest, Handler) -> ServerResponse, next Handler, req ServerRequest) -> ServerResponse =>
+    f(req, next)
 
 /// Apply this middleware to a concrete handler, producing the wrapped `Handler`.
 #stable(since = "0.1")
@@ -158,10 +200,11 @@ fn wrap_method_router(layers []Middleware, mr MethodRouter) -> MethodRouter {
 
 // The registration-time twin of dispatch's `method_not_allowed` path (same
 // response builder). `allow` is copied to a local before capture ([M-16]-family
-// param-capture discipline, see middleware/cors.nv `cors_handler`).
+// param-capture discipline, see middleware/cors.nv). The closure auto-lifts
+// into `Handler` in return position (D55 fn-genus coercion) — no wrapper call.
 fn default_405_handler(allow []str) -> Handler {
     ro a = allow
-    handler_fn(|_req| method_not_allowed(a))
+    fn(_req ServerRequest) -> ServerResponse => method_not_allowed(a)
 }
 
 /// Accumulate a middleware onto this router's layer chain. Baked into every

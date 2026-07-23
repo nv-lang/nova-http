@@ -25,7 +25,7 @@
 
 module middleware.compress
 
-import http.server.{Handler, handler_fn, Middleware, ServerRequest, ServerResponse}
+import http.server.{Handler, middleware, Middleware, ServerRequest, ServerResponse}
 import compress.{gzip_encode, CompressLevel}
 
 /// Compression config (fluent; finish with `@middleware()`).
@@ -52,7 +52,7 @@ export fn Compression mut @level(l CompressLevel) -> @ { @level = l }
 #stable(since = "0.1")
 export fn Compression @middleware() -> Middleware {
     ro cfg = @
-    Middleware.new(fn(next Handler) -> Handler => compress_handler(cfg, next))
+    middleware(fn(req ServerRequest, next Handler) -> ServerResponse => compress_apply(cfg, next, req))
 }
 
 /// Convenience: `compression(Compression.new())` → ready `Middleware`.
@@ -61,14 +61,10 @@ export fn compression(cfg Compression) -> Middleware => cfg.middleware()
 
 // ── internals ───────────────────────────────────────────────────────────────
 
-// Param → local copy before capture ([M-16]-family, cors.nv precedent).
-fn compress_handler(cfg Compression, next Handler) -> Handler {
-    ro c = cfg
-    handler_fn(|req| compress_apply(c, next, req))
-}
-
+// `next` arrives as a PARAM — `next(req)` is the safe D52 param call-through
+// ([M-16] discipline, cors.nv `cors_apply` precedent).
 fn compress_apply(cfg Compression, next Handler, req ServerRequest) -> ServerResponse {
-    ro resp0 = next.handle(req)
+    ro resp0 = next(req)
     if resp0.is_streaming() { return resp0 }
     if resp0.headers.contains("content-encoding") { return resp0 }
     if !compressible_type(resp0) { return resp0 }

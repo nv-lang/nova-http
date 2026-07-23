@@ -27,18 +27,19 @@ Public API is unchanged from `std.http` — only the module path moved
 ```nova
 import http.{Http}
 import http.client.{HttpClient}
-import http.server.{ServeMux, ServerResponse, handler_fn, serve_once}
+import http.server.{Router, ServerRequest, ServerResponse, serve_once}
 
 fn make_client() Http -> HttpClient {
     HttpClient.new()
 }
 
-fn make_mux() -> ServeMux {
-    ro mux = ServeMux.new()
-    mux.handle("/", handler_fn(fn(req) {
-        ServerResponse.text(200, "hello from nova-http")
-    }))
-    mux
+fn make_router() -> Router {
+    mut r = Router.new()
+    // A bare closure auto-lifts into `Handler` (newtype over
+    // `fn(ServerRequest) -> ServerResponse`, D52/D55) — no wrapper call.
+    r.get("/", fn(req ServerRequest) -> ServerResponse =>
+        ServerResponse.text(200, "hello from nova-http"))!!
+    r
 }
 ```
 

@@ -9,7 +9,7 @@
 module middleware.log_test
 
 import http.middleware.log.{Log, logger}
-import http.server.{Router, route_once, handler_fn, ServerResponse}
+import http.server.{Router, route_once, ServerResponse}
 import std.testing.handlers as th
 
 fn req(method str, path str, headers [](str, str)) -> []u8 {
@@ -33,7 +33,7 @@ fn hdr(resp ServerResponse, name str) -> str {
 fn routed(cfg Log) Time -> Router {
     mut r = Router.new()
     r.layer(logger(cfg))
-    r.get("/x", handler_fn(|_req| ServerResponse.text(200, "ok")))!!
+    r.get("/x", fn(_req ServerRequest) -> ServerResponse => ServerResponse.text(200, "ok"))!!
     r
 }
 

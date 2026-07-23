@@ -54,12 +54,12 @@ fn make_token_nbf(secret []u8, sub str, nbf_s f64) -> str {
 
 fn bearer_echo_router() -> Router {
     mut r = Router.new()
-    r.get("/who", handler_fn(|req| {
+    r.get("/who", fn(req ServerRequest) -> ServerResponse {
         match Bearer.from_request(req) {
             Ok(b)  => ServerResponse.text(200, "tok=${b.token()}")
             Err(e) => e.into_response()
         }
-    }))!!
+    })!!
     r
 }
 
@@ -83,12 +83,12 @@ test "Bearer: wrong scheme (Basic) -> 401" {
 
 fn basic_echo_router() -> Router {
     mut r = Router.new()
-    r.get("/basic", handler_fn(|req| {
+    r.get("/basic", fn(req ServerRequest) -> ServerResponse {
         match BasicAuth.from_request(req) {
             Ok(a)  => ServerResponse.text(200, "u=${a.user()} p=${a.pass()}")
             Err(e) => e.into_response()
         }
-    }))!!
+    })!!
     r
 }
 
@@ -117,7 +117,7 @@ test "BasicAuth: payload without ':' -> 401" {
 fn jwt_router(now_ms u64) -> Router {
     ro auth = JwtAuth.new(test_secret())
     mut r = Router.new()
-    r.get("/me", handler_fn(|req| {
+    r.get("/me", fn(req ServerRequest) -> ServerResponse {
         match auth.claims_at[UserClaims](req, now_ms) {
             Ok(c)  => {
                 ro cl = c.claims()
@@ -125,7 +125,7 @@ fn jwt_router(now_ms u64) -> Router {
             }
             Err(e) => e.into_response()
         }
-    }))!!
+    })!!
     r
 }
 
@@ -142,7 +142,7 @@ fn guarded_router(now_ms u64) -> Router {
     ro auth = JwtAuth.new(test_secret())
     mut r = Router.new()
     r.layer(require_jwt(auth, fn() -> u64 => now_ms))
-    r.get("/private", handler_fn(|req| ServerResponse.text(200, "in")))!!
+    r.get("/private", fn(req ServerRequest) -> ServerResponse => ServerResponse.text(200, "in"))!!
     r
 }
 
@@ -169,7 +169,7 @@ test "require_jwt: expired token -> 401" {
 
 test "CookieJar: request cookies parsed, by-name lookup" {
     mut r = Router.new()
-    r.get("/jar", handler_fn(|req| {
+    r.get("/jar", fn(req ServerRequest) -> ServerResponse {
         match CookieJar.from_request(req) {
             Ok(jar) => {
                 ro a = match jar.get("a") { Some(v) => v, None => "?" }
@@ -178,7 +178,7 @@ test "CookieJar: request cookies parsed, by-name lookup" {
             }
             Err(e) => e.into_response()
         }
-    }))!!
+    })!!
     ro wire = serve_once(r, get_req_h("/jar", "Cookie", "a=1; b=two"))
     assert(status_line(wire) == "HTTP/1.1 200 OK")
     assert(resp_contains(wire, "n=2 a=1 b=two"))
@@ -186,24 +186,24 @@ test "CookieJar: request cookies parsed, by-name lookup" {
 
 test "CookieJar: no Cookie header -> empty jar (not an error)" {
     mut r = Router.new()
-    r.get("/jar", handler_fn(|req| {
+    r.get("/jar", fn(req ServerRequest) -> ServerResponse {
         match CookieJar.from_request(req) {
             Ok(jar) => ServerResponse.text(200, "n=${jar.len()}")
             Err(e)  => e.into_response()
         }
-    }))!!
+    })!!
     ro wire = serve_once(r, get_req("/jar"))
     assert(resp_contains(wire, "n=0"))
 }
 
 test "set_cookie: Set-Cookie header serialized onto the response wire" {
     mut r = Router.new()
-    r.get("/set", handler_fn(|req| {
+    r.get("/set", fn(req ServerRequest) -> ServerResponse {
         ro c = SetCookie.parse("sid=xyz; Path=/; Max-Age=60; Secure; HttpOnly; SameSite=Lax")!!
         mut resp = ServerResponse.text(200, "ok")
         resp.set_cookie(c)
         resp
-    }))!!
+    })!!
     ro wire = serve_once(r, get_req("/set"))
     assert(status_line(wire) == "HTTP/1.1 200 OK")
     assert(resp_contains(wire, "set-cookie: sid=xyz"))
@@ -255,12 +255,12 @@ fn session_router() -> Router {
     ro cfg = SessionConfig.new().with_cookie_name("sess")
     mut r = Router.new()
     r.layer(session_layer(store, cfg, fn() -> u64 => 1_000, fn() -> str => "gen-1"))
-    r.get("/s", handler_fn(|req| {
+    r.get("/s", fn(req ServerRequest) -> ServerResponse {
         match req.param("session_id") {
             Some(sid) => ServerResponse.text(200, "sid=${sid}")
             None      => ServerResponse.text(200, "sid=?")
         }
-    }))!!
+    })!!
     r
 }
 

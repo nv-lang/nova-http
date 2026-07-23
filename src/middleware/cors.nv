@@ -21,13 +21,13 @@
 // setter can never trip on hostile input.
 //
 // Closure discipline ([M-16], middleware.nv/middleware_test.nv precedent):
-// the `Middleware.new(...)` closure calls the TOP-LEVEL `cors_handler`, so
+// the flat `middleware(...)` closure calls the TOP-LEVEL `cors_apply`, so
 // every closure captures only from its own direct enclosing scope (no
 // grandparent reach-through).
 
 module middleware.cors
 
-import http.server.{Handler, handler_fn, Middleware, ServerRequest, ServerResponse}
+import http.server.{Handler, middleware, Middleware, ServerRequest, ServerResponse}
 import std.text
 
 /// CORS policy (fluent config; finish with `@middleware()`).
@@ -107,7 +107,7 @@ export fn Cors @middleware() -> Middleware {
         panic("cors: Access-Control-Allow-Origin '*' cannot be combined with credentials (spec-forbidden)")
     }
     ro cfg = @
-    Middleware.new(fn(next Handler) -> Handler => cors_handler(cfg, next))
+    middleware(fn(req ServerRequest, next Handler) -> ServerResponse => cors_apply(cfg, next, req))
 }
 
 /// Convenience: `cors(Cors.permissive())` → ready `Middleware`.
@@ -116,24 +116,14 @@ export fn cors(cfg Cors) -> Middleware => cfg.middleware()
 
 // ── internals ───────────────────────────────────────────────────────────────
 
-// Top-level (not nested in `@middleware`) so the `handler_fn` closure captures
-// `cfg`/`next` from its DIRECT enclosing scope only ([M-16] discipline).
-//
-// [M-16]-family workaround (cited, not re-diagnosed; same file-local
-// discipline as middleware_test.nv): capturing the struct PARAM `cfg`
-// directly mis-codegens (param arrives as `NovaValue_Cors*`, the closure env
-// stores it as a value field, the body then dereferences the value —
-// CC-FAIL `indirection requires pointer operand`). Copying to a LOCAL first
-// (`ro c = cfg`) makes the capture a plain value capture, which codegens
-// correctly (repro: revert the copy, `nova test src/middleware`).
-fn cors_handler(cfg Cors, next Handler) -> Handler {
-    ro c = cfg
-    handler_fn(|req| cors_apply(c, next, req))
-}
-
+// Top-level (not nested in `@middleware`) so the flat closure captures `cfg`
+// from its DIRECT enclosing scope only and passes `next` through as a PARAM
+// ([M-16] discipline — a captured Handler must never be CALLED by identifier
+// inside a closure; here `next` is this fn's param, so `next(req)` is the
+// safe D52 param call-through).
 fn cors_apply(cfg Cors, next Handler, req ServerRequest) -> ServerResponse {
     ro origin = req.header("origin") ?? ""
-    if origin == "" { return next.handle(req) }        // not a CORS request
+    if origin == "" { return next(req) }               // not a CORS request
     // `req.method() == Method.Options` mis-codegens for the payload-carrying
     // `Method` enum (`->tag` emitted on a `nova_int` — CC-FAIL; workaround:
     // compare the canonical `@str()` form; repro: swap back, `nova test
@@ -142,7 +132,7 @@ fn cors_apply(cfg Cors, next Handler, req ServerRequest) -> ServerResponse {
     if preflight {
         preflight_response(cfg, req, origin)
     } else {
-        decorate_simple(cfg, next.handle(req), origin)
+        decorate_simple(cfg, next(req), origin)
     }
 }
 
