@@ -140,6 +140,29 @@ nova test src
 Some tests (`servernet/rt/*`, live socket smoke tests) bind real ports and
 may need a longer timeout (`--timeout 300`) than the default under load.
 
+## Gate
+
+The package gate (Plan 222 §9, owner decision 2026-07-23) is
+`scripts/gate.ps1` — run it before merging anything:
+
+```powershell
+# env NOVA_STD_PATH / NOVA_CG_INCLUDE / NOVA_RT_DIR set as above;
+# $env:NOVA optionally points at a specific nova.exe
+powershell -File scripts/gate.ps1            # optionally: -TestTimeout 300
+```
+
+Two mandatory steps, in order:
+
+1. **`nova check src --strict-effects`** — the whole package must type-check
+   with undeclared transitive effects as *errors*. Only the deliberate
+   `src/neg/*` EXPECT_COMPILE_ERROR fixtures may FAIL; any other FAIL is a
+   gate failure. Rationale: a package gate without `--strict-effects` does
+   not catch effect bombs that only detonate in a consumer compile-unit
+   built with the flag (precedent: the background/log default-sink
+   `E_UNDECLARED_TRANSITIVE_EFFECT` found by the flagship build, commit
+   4019173).
+2. **`nova test src`** — the full test suite over the C-codegen pipeline.
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at

@@ -79,21 +79,27 @@ export fn Log mut @request_id(on bool) -> @ { @request_id = on }
 #stable(since = "0.1")
 export fn Log mut @real_ip(on bool) -> @ { @real_ip = on }
 
-/// Build the middleware.
+/// Build the middleware. `Time` row: the per-request line measures elapsed
+/// time via `Monotonic.now()` (ambient default in prod; a test builds under
+/// `th.fixed_ms` — same row-declaration chain as `RateLimit.middleware()`,
+/// strict-effects package gate 222 §9).
 #stable(since = "0.1")
-export fn Log @middleware() -> Middleware {
+export fn Log @middleware() Time -> Middleware {
     ro cfg = @
     Middleware.new(fn(next Handler) -> Handler => log_handler(cfg, next))
 }
 
 /// Convenience: `logger(Log.new())` → ready `Middleware` (chi's name).
 #stable(since = "0.1")
-export fn logger(cfg Log) -> Middleware => cfg.middleware()
+export fn logger(cfg Log) Time -> Middleware => cfg.middleware()
 
 // ── internals ───────────────────────────────────────────────────────────────
 
 // Param → local copy before capture ([M-16]-family, cors.nv precedent).
-fn log_handler(cfg Log, next Handler) -> Handler {
+// `Time` row: the returned handler-closure calls `log_apply` (Time) — the
+// strict-effects capability walk attributes closure-body calls to the
+// enclosing named fn's row (same shape as `rl_handler`, ratelimit.nv).
+fn log_handler(cfg Log, next Handler) Time -> Handler {
     ro c = cfg
     handler_fn(|req| log_apply(c, next, req))
 }

@@ -240,3 +240,26 @@ export fn Result[R IntoResponse, E IntoResponse] consume @into_response() -> Ser
         Err(e) => e.into_response()
     }
 }
+
+/// BLANKET — auto-JSON (owner-go 2026-07-23, 222 §0в п.2, probe p1): ANY
+/// `T Serialize` becomes a `200 OK` `application/json` response — `Ok(user)`
+/// in a handler needs no `Json{}` wrapper (Axum's `Json(user)` ergonomics
+/// without the wrapper). D355 bare-typevar-receiver blanket; dispatch
+/// priority verified by probe p1 (branch p222-0v-probes): a CONCRETE impl on
+/// the same protocol (`str` → text/plain above) WINS over this blanket
+/// (D285), and the `Result[R,E]` generic-type impl above coexists with it
+/// (probe p1b — different receiver-class, no E_BLANKET_CONFLICT). Bare
+/// scalars are INCLUDED (owner decision): `Ok(42)` → JSON `42`.
+///
+/// DECLARATION ORDER MATTERS (pinned by respond_test's scalar pins): this
+/// blanket must come AFTER the `Result[R,E]` generic impl above — with the
+/// blanket declared FIRST, a PRIMITIVE receiver's blanket call (`42
+/// .into_response()`, direct or via the Result Ok-arm) mangles to the LAST
+/// generic impl's receiver head instead of the substituted typevar
+/// (`Nova_Result_consume_into_response(nova_int)` — undefined symbol,
+/// CC-FAIL; records are unaffected either way). Same order both probes used
+/// (blanket last). Reported to integrator (this worktree does not touch the
+/// nova repo).
+#impl(IntoResponse)
+export fn[T Serialize] T consume @into_response() -> ServerResponse =>
+    ServerResponse.json(StatusCode.ok(), @)
