@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// Plan 222.16 — LIVE-socket wiring proof: `http.servernet.handle_connection`
+// Plan 222.16 — LIVE-socket wiring proof: `http.serve.handle_connection_router` (222.7 callback-архитектура)
 // actually drains a response's `BackgroundTasks` when driving a real
 // connection (not just the pure/mock unit coverage in
 // `../../server/background_test.nv`). Mirrors `handle_connection_smoke.nv`'s
@@ -26,7 +26,7 @@ module rt.background_tasks_smoke
 
 import std.net.{TcpListener, TcpStream, SocketAddr, real_net}
 import ../../server.{Router, ServerResponse, BackgroundTasks}
-import ../../servernet.{handle_connection}
+import ../../serve.{handle_connection_router}
 
 fn routes(ran_tx ChanWriter[bool]) -> Router {
     mut r = Router.new()
@@ -61,7 +61,7 @@ test "servernet: BackgroundTasks attached to a live response actually drains" {
                 match lst.accept() {
                     Ok(consume srv) => {
                         consume s = srv
-                        match handle_connection(s, routes(ran_tx)) {
+                        match handle_connection_router(s, routes(ran_tx)) {
                             Ok(_)  => { ok_tx.try_send(true) }
                             Err(_) => ()
                         }
