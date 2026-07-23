@@ -447,7 +447,11 @@ export type Handler fn(ServerRequest) -> ServerResponse
 #stable(since = "0.1")
 export fn route_once(router Router, raw []u8) -> ServerResponse {
     match parse_request(raw) {
-        Ok(req) => router.dispatch(req)
+        // `mut req` (not bare `req`): `Router.@dispatch` takes `req` as a
+        // `mut` in-out param (D246 canon (a), server_router.nv); this
+        // binding is used exactly once, right here, so no independent copy
+        // is needed.
+        Ok(mut req) => router.dispatch(req)
         Err(_)  => ServerResponse.text(400, "400 bad request")
     }
 }

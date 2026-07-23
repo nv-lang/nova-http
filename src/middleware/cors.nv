@@ -151,15 +151,17 @@ fn Cors @allow_origin_value(origin str) -> str =>
 
 // Simple (non-preflight) response decoration. `Vary: origin` is appended even
 // for a disallowed origin — the answer still depends on the Origin header.
-fn decorate_simple(cfg Cors, resp0 ServerResponse, origin str) -> ServerResponse {
-    mut resp = resp0
-    resp.header("Vary", vary_value(resp, "origin"))
+// `resp0` is `mut` (D246 canon (a), in-out): the only call site (`@middleware`
+// above) hands `next(req)`'s freshly-returned rvalue straight in, so no
+// independent `resp` copy is needed.
+fn decorate_simple(cfg Cors, mut resp0 ServerResponse, origin str) -> ServerResponse {
+    resp0.header("Vary", vary_value(resp0, "origin"))
     if cfg.origin_allowed(origin) {
-        resp.header("Access-Control-Allow-Origin", cfg.allow_origin_value(origin))
-        if cfg.credentials { resp.header("Access-Control-Allow-Credentials", "true") }
-        if cfg.expose.len() > 0 { resp.header("Access-Control-Expose-Headers", cfg.expose.join(", ")) }
+        resp0.header("Access-Control-Allow-Origin", cfg.allow_origin_value(origin))
+        if cfg.credentials { resp0.header("Access-Control-Allow-Credentials", "true") }
+        if cfg.expose.len() > 0 { resp0.header("Access-Control-Expose-Headers", cfg.expose.join(", ")) }
     }
-    resp
+    resp0
 }
 
 // Preflight: answered by the middleware itself, `next` is never called
@@ -204,7 +206,11 @@ fn Cors @headers_value(req ServerRequest) -> str {
 
 // Mirror an UNTRUSTED request-header value into a response header: reject
 // CR/LF/NUL/non-latin1 (would panic the total `resp.header` setter) → "".
-fn safe_mirror(s str) -> str {
+// `s` is `mut` (D246 canon (a), return-position identity passthrough on the
+// clean-scan path; `str` is NOT scalar-exempt — 2 fields, ptr+len). Both
+// call sites (`@methods_value`/`@headers_value` below) pass a fresh `??`-
+// expression rvalue, never a bound identifier.
+fn safe_mirror(mut s str) -> str {
     for c in s.chars() {
         ro cp = c as int
         if cp == 0x0D || cp == 0x0A || cp == 0x00 || cp > 0xFF { return "" }

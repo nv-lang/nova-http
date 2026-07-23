@@ -276,7 +276,9 @@ export fn RequestBuilder mut @basic_auth(user str, pass str) -> @ {
 /// Materialize a `Request` without sending.
 #stable(since = "0.1")
 export fn RequestBuilder @build() -> Result[Request, HttpError] {
-    ro url0 = @url_input.to_url()?
+    // `mut` (not `ro`): `apply_query` takes `u` as a `mut` in-out param
+    // (D246 canon (a), see its own comment) — used exactly once, right below.
+    mut url0 = @url_input.to_url()?
     ro url1 = apply_query(url0, @query)
     ro headers = build_headers(@client, @header_ops, @content_type)?
     Ok(Request.new(@method, url1, headers, @body_bytes))
@@ -286,13 +288,18 @@ export fn RequestBuilder @build() -> Result[Request, HttpError] {
 /// Returns a must-consume `Response` (4xx/5xx included — use `error_for_status`).
 #stable(since = "0.1")
 export fn RequestBuilder consume @send() Http -> Result[Response, HttpError] {
-    ro url0 = @url_input.to_url()?
-    ro url1 = apply_query(url0, @query)
+    // `mut` (not `ro`): `apply_query` takes `u` as a `mut` in-out param
+    // (D246 canon (a)) — used exactly once, right below.
+    mut url0 = @url_input.to_url()?
+    // `mut` (not `ro`): `run_request` takes `url1`/`headers` as `mut` in-out
+    // params (D246 canon (a), see that fn's own comment) — this binding is
+    // never reused after the tail call below.
+    mut url1 = apply_query(url0, @query)
     ro scheme = url1.scheme
     if scheme != "http" && scheme != "https" {
         return Err(HttpError.new(InvalidUrl).with_url(url1))
     }
-    ro headers = build_headers(@client, @header_ops, @content_type)?
+    mut headers = build_headers(@client, @header_ops, @content_type)?
     run_request(@method, url1, headers, @body_bytes, @client.cfg_follow(), @client.cfg_max(),
                 @client.cfg_auto_decompress(), @client.cfg_max_decompressed())
 }
@@ -328,11 +335,13 @@ fn http_seam_send(host str, port int, secure bool, request str) Http -> Result[s
     Http.send(host, port, secure, request)
 }
 
-fn run_request(method0 Method, url0 Url, headers0 HeaderMap, body0 []u8, follow bool, max int, auto_decompress bool, max_decompressed int) Http -> Result[Response, HttpError] {
-    mut method = method0
-    mut url = url0
-    mut headers = headers0
-    mut body = body0
+// `method`/`url`/`headers`/`body` are all `mut` params (D246 canon (a)):
+// genuinely in-out — the redirect loop below reassigns each of them
+// (`method = Get`, `body = []u8.new()`, `headers = drop_body_headers(...)`,
+// `url = next`) as it walks the chain, not an independent-copy case. The one
+// call site (`@send` below) never reuses its own `url1`/`headers` bindings
+// after this call.
+fn run_request(mut method Method, mut url Url, mut headers HeaderMap, mut body []u8, follow bool, max int, auto_decompress bool, max_decompressed int) Http -> Result[Response, HttpError] {
     mut remaining = max
     mut i = 0
     while i <= max {
@@ -385,7 +394,11 @@ fn run_request(method0 Method, url0 Url, headers0 HeaderMap, body0 []u8, follow 
 // the body the caller actually sees). `br` (brotli) is decoded via Plan 179 Ф.2
 // (libbrotlidec C-FFI) [M-178-autodecompress-br]; on a build without the vendored
 // brotli lib the decode returns UnsupportedMethod → surfaced as a Protocol error.
-fn finalize_response(ver Version, st StatusCode, headers HeaderMap, body []u8, auto_decompress bool, max_decompressed int) -> Result[Response, HttpError] {
+// `headers` is `mut` (D246 canon (a)): passed into `rewrite_encoding_
+// headers`'s own `mut` param on the decode branches below; both callers
+// (`run_request` above) pass `parsed.headers` (a field access, not a bound
+// identifier), so this doesn't constrain them.
+fn finalize_response(ver Version, st StatusCode, mut headers HeaderMap, body []u8, auto_decompress bool, max_decompressed int) -> Result[Response, HttpError] {
     if !auto_decompress {
         return Ok(Response.new(ver, st, headers, body))
     }
@@ -440,13 +453,15 @@ fn content_encoding_lower(h HeaderMap) -> str {
 
 // Drop Content-Encoding + Transfer-Encoding and set Content-Length to the decoded
 // size — the returned headers now describe the decoded body (Go/reqwest behaviour).
-fn rewrite_encoding_headers(h HeaderMap, decoded_len int) -> HeaderMap {
-    mut hm = h
-    ro _ = hm.remove("content-encoding")
-    ro _ = hm.remove("transfer-encoding")
+// `h` is `mut` (D246 canon (a)): every call site (`finalize_response` below)
+// hands its own `mut headers` param through exactly once, no independent
+// copy needed.
+fn rewrite_encoding_headers(mut h HeaderMap, decoded_len int) -> HeaderMap {
+    ro _ = h.remove("content-encoding")
+    ro _ = h.remove("transfer-encoding")
     // Статически валидное имя заголовка — insert отказать не может.
-    ro _ = hm.insert("Content-Length", decoded_len.to_str())
-    hm
+    ro _ = h.insert("Content-Length", decoded_len.to_str())
+    h
 }
 
 fn build_headers(client HttpClient, ops []HeaderOp, content_type Option[str]) -> Result[HeaderMap, HttpError] {
@@ -475,7 +490,12 @@ fn build_headers(client HttpClient, ops []HeaderOp, content_type Option[str]) ->
     Ok(hm)
 }
 
-fn apply_query(u Url, params [](str, str)) -> Url {
+// `u` is `mut` (D246 canon (a)): the `params.len() == 0` early return hands
+// it straight back unchanged (identity passthrough — bare-generic-return
+// shape, `str`/value-record not scalar-exempt); both call sites (`@build`/
+// `@send` below) pass their own single-use `url0` binding, made `mut` there
+// for the same reason.
+fn apply_query(mut u Url, params [](str, str)) -> Url {
     if params.len() == 0 { return u }
     consume sb = StringBuilder.new()
     sb.cap(64)
@@ -533,21 +553,21 @@ fn method_is_get_head(m Method) -> bool {
     }
 }
 
-// Strip credentials on a cross-origin redirect hop (anti-leak, Q9).
-fn strip_sensitive(h HeaderMap) -> HeaderMap {
-    mut hm = h
-    ro _ = hm.remove("authorization")
-    ro _ = hm.remove("cookie")
-    hm
+// `h` is `mut` (D246 canon (a)): the one call site (`run_request`'s redirect
+// loop above) passes its own `mut headers` param through exactly once.
+fn strip_sensitive(mut h HeaderMap) -> HeaderMap {
+    ro _ = h.remove("authorization")
+    ro _ = h.remove("cookie")
+    h
 }
 
-// Drop body-framing headers when a redirect GET-ifies the request.
-fn drop_body_headers(h HeaderMap) -> HeaderMap {
-    mut hm = h
-    ro _ = hm.remove("content-length")
-    ro _ = hm.remove("content-type")
-    ro _ = hm.remove("transfer-encoding")
-    hm
+// Drop body-framing headers when a redirect GET-ifies the request. Same
+// rationale as `strip_sensitive` above.
+fn drop_body_headers(mut h HeaderMap) -> HeaderMap {
+    ro _ = h.remove("content-length")
+    ro _ = h.remove("content-type")
+    ro _ = h.remove("transfer-encoding")
+    h
 }
 
 // Resolve a Location value against the current URL (absolute / absolute-path /

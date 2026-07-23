@@ -66,13 +66,14 @@ test "headermap: case-insensitive, ordered, multi-value" {
 }
 
 test "headermap: insert replaces, remove returns" {
-    ro h = hm_build()!!
-    mut h2 = h
-    ro r1 = h2.insert("Set-Cookie", "z=9")   // replace both
-    assert(h2.get_all("set-cookie").len() == 1)
-    ro removed = h2.remove("Content-Type")
+    // `mut` from the start (D246 canon (a)) — this test-local is mutated
+    // right below; not shared with anything else.
+    mut h = hm_build()!!
+    ro r1 = h.insert("Set-Cookie", "z=9")   // replace both
+    assert(h.get_all("set-cookie").len() == 1)
+    ro removed = h.remove("Content-Type")
     assert(removed.len() == 1)
-    assert(!h2.contains("content-type"))
+    assert(!h.contains("content-type"))
 }
 
 test "headermap neg: CR/LF/NUL rejected (response-splitting defense)" {

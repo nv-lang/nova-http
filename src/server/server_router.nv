@@ -62,6 +62,12 @@ export type MethodRouter value {
 #stable(since = "0.1")
 export fn MethodRouter.new() -> MethodRouter => { routes: []MethodEntry.new(), fallback: None }
 
+/// Independent copy (D246 canon (b) — see `middleware.nv`'s `wrap_method_
+/// router` for the one call site and why an in-out `mut` param doesn't fit
+/// there). Explicit return type (NOT `-> Self` — [M-generic-value-self-
+/// return-transitive-cu-emission], №59).
+fn MethodRouter @clone() -> MethodRouter => { routes: @routes.clone(), @fallback }
+
 fn MethodRouter mut @add(method str, h Handler) -> @ { @routes.push(MethodEntry{method, handler: h}) }
 
 /// Add a `GET` handler to this route's method set.
@@ -305,7 +311,11 @@ fn Router mut @insert_segs(segs []str, path str, mr MethodRouter) -> Result[(), 
             }
         } else if is_param_seg(seg) {
             ro name = seg[1..seg.byte_len() - 1]
-            ro node = @nodes[idx]
+            // `mut` from the start (D246 canon (a)) — this local IS mutated
+            // in the `None` arm below (no separate `updated` copy needed);
+            // nothing outside this scope reads `node` after `@nodes[idx] =
+            // node` writes the result back.
+            mut node = @nodes[idx]
             match node.param_child {
                 Some(pe) => {
                     if pe.name != name { return Err(route_conflict_error(path)) }
@@ -314,22 +324,21 @@ fn Router mut @insert_segs(segs []str, path str, mr MethodRouter) -> Result[(), 
                 None => {
                     @nodes.push(RouteNode.new())
                     ro new_idx = @nodes.len() - 1
-                    mut updated = node
-                    updated.param_child = Some(ParamEdge{name, idx: new_idx})
-                    @nodes[idx] = updated
+                    node.param_child = Some(ParamEdge{name, idx: new_idx})
+                    @nodes[idx] = node
                     idx = new_idx
                 }
             }
         } else {
-            ro node = @nodes[idx]
+            // Same rationale as the param-segment arm above.
+            mut node = @nodes[idx]
             match find_literal_child(node, seg) {
                 Some(child_idx) => { idx = child_idx }
                 None => {
                     @nodes.push(RouteNode.new())
                     ro new_idx = @nodes.len() - 1
-                    mut updated = node
-                    updated.literal_children.push(LiteralEdge{seg, idx: new_idx})
-                    @nodes[idx] = updated
+                    node.literal_children.push(LiteralEdge{seg, idx: new_idx})
+                    @nodes[idx] = node
                     idx = new_idx
                 }
             }
@@ -493,23 +502,28 @@ fn Router @match_from(idx int, segs []str, i int) -> Option[MatchResult] {
 /// the matched handler, with `{name}`/`{*name}` captures attached as raw
 /// `ServerRequest.@params` (typed extraction is 222.3, layered on top).
 #stable(since = "0.1")
-export fn Router @dispatch(req ServerRequest) -> ServerResponse {
-    mut rq = req
-    ro segs = split_segments(rq.path())
+// `req` is `mut` (D246 canon (a), in-out): `@params(m.params)` below needs a
+// mutable receiver, and every caller (`route_once`/`route_once_with_
+// multipart_limits`, `server.nv`) passes its own `req`/`req0` binding through
+// exactly once, never reading it again afterward — no independent copy
+// needed, just a mut param instead of laundering a ro caller-side binding
+// into a local `mut rq = req`.
+export fn Router @dispatch(mut req ServerRequest) -> ServerResponse {
+    ro segs = split_segments(req.path())
     match @match_from(0, segs, 0) {
         Some(m) => {
-            rq.params(m.params)
-            ro reqm = rq.method().str()
+            req.params(m.params)
+            ro reqm = req.method().str()
             match m.methods.find_handler(reqm) {
-                Some(h) => h(rq)
+                Some(h) => h(req)
                 None => match m.methods.fallback() {
-                    Some(h) => h(rq)
+                    Some(h) => h(req)
                     None    => method_not_allowed(m.methods.allowed_methods())
                 }
             }
         }
         None => match @fallback {
-            Some(h) => h(rq)
+            Some(h) => h(req)
             None    => ServerResponse.text(404, "404 page not found")
         }
     }

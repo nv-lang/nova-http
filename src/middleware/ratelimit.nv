@@ -59,7 +59,12 @@ export fn RateLimit mut @per_client(on bool) -> @ { @per_client = on }
 #stable(since = "0.1")
 export fn RateLimit @middleware() Time -> Middleware {
     ro cfg = @
-    ro buckets = HashMap[str, TokenBucket].new()
+    // `mut` (not `ro`): this is the SHARED bucket table, captured by the
+    // closure below and threaded into `rl_apply` as a `mut` in-out param on
+    // every request (D246 canon (a) — genuinely in-out: mutations from one
+    // request must be visible to the next, the entire point of rate
+    // limiting, not an independent-copy case).
+    mut buckets = HashMap[str, TokenBucket].new()
     middleware(fn(req ServerRequest, next Handler) -> ServerResponse => rl_apply(cfg, buckets, next, req))
 }
 
@@ -73,9 +78,8 @@ export fn ratelimit(cfg RateLimit) Time -> Middleware => cfg.middleware()
 // ([M-16] discipline, see cors.nv `cors_apply`). The flat `middleware(...)`
 // closure above captures only the two locals (`cfg`, `buckets` — the SHARED
 // bucket table, one per built middleware value).
-fn rl_apply(cfg RateLimit, buckets0 HashMap[str, TokenBucket], next Handler, req ServerRequest) Time -> ServerResponse {
+fn rl_apply(cfg RateLimit, mut buckets HashMap[str, TokenBucket], next Handler, req ServerRequest) Time -> ServerResponse {
     ro key = if cfg.per_client { client_key(req) } else { "" }
-    mut buckets = buckets0
     mut bucket = match buckets.get(key) {
         Some(b) => b
         None    => {

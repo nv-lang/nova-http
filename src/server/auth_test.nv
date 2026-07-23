@@ -251,7 +251,9 @@ test "SessionData: set replaces an existing key" {
 // ── Ф.3: session_layer middleware e2e ──────────────────────────────────────
 
 fn session_router() -> Router {
-    ro store = MemorySessionStore.new(60_000)
+    // `mut` (not `ro`): `session_layer` takes `store` as a `mut` in-out
+    // param (D246 canon (a), see its own comment) — never reused after.
+    mut store = MemorySessionStore.new(60_000)
     ro cfg = SessionConfig.new().with_cookie_name("sess")
     mut r = Router.new()
     r.layer(session_layer(store, cfg, fn() -> u64 => 1_000, fn() -> str => "gen-1"))

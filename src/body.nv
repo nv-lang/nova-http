@@ -82,7 +82,7 @@ export fn Body consume @bytes() -> Result[[]u8, HttpError] {
     ro lim = @limit
     match @repr {
         InMemory(b) => guard_limit(b, lim)
-        Stream(r)   => guard_limit(drain_reader(r), lim)
+        Stream(mut r) => guard_limit(drain_reader(r), lim)
     }
 }
 
@@ -102,7 +102,7 @@ export fn Body consume @text() -> Result[str, HttpError] {
 export fn Body consume @drain() -> Result[(), HttpError] {
     match @repr {
         InMemory(_) => Ok(())
-        Stream(r)   => {
+        Stream(mut r) => {
             ro _ = drain_reader(r)
             Ok(())
         }
@@ -149,12 +149,11 @@ export fn BodyReader @close() -> Result[(), HttpError] => Ok(())
 
 // ── Внутренние хелперы ───────────────────────────────────────────────────────
 
-fn drain_reader(r BodyReader) -> []u8 {
+fn drain_reader(mut r BodyReader) -> []u8 {
     mut out = []u8.new()
-    mut rd = r
     mut running = true
-    while running && !rd.at_eof() {
-        match rd.next_chunk() {
+    while running && !r.at_eof() {
+        match r.next_chunk() {
             Ok(chunk) => { out.append(chunk); () }
             Err(_)    => { running = false }
         }
