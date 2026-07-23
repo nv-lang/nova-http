@@ -6,44 +6,17 @@
 // raw HTTP/1.1 request, serve_once, inspect the wire response" style so no
 // mock-`ServerRequest` constructor is needed).
 //
-// `PathParam[T]`/`Query[T]`/`Json[T]` — TYPE-CHECK cleanly (`nova check` PASS,
-// matching the plan's design exactly, extract.nv above) but their
-// `.from_request(req)` call is NOT exercised end-to-end here:
-// [M-generic-static-method-value-arg-addr-mismatch] (found this wave,
-// confirmed with a REAL `ServerRequest` across THREE calling conventions —
-// direct call outside any closure, inside a `handler_fn(|req| ...)` closure,
-// and through a bound-generic wrapper `fn f[T FromRequest](req) -> ... =>
-// T.from_request(req)` — all three fail identically). Root symptom: calling
-// `SomeGeneric[Concrete].from_request(req)` (or the bound-generic-dispatch
-// equivalent) where `SomeGeneric[T]` is a NON-`value` generic type (the fix
-// for the SEPARATE [M-generic-value-self-protocol-wrapper-mono], see
-// respond.nv) emits `&(req)` — takes the ARGUMENT's address — at the call
-// site, while the generated callee signature takes `req` BY VALUE:
-// `unknown pointer→value` CC-FAIL, `dereference with *` per clang's own hint.
-// Minimal repro attempts with a tiny `Req value {..}`/`Wrap[T] {..}` pair
-// (unrelated to `ServerRequest`/`Json`/`HttpError`) did NOT reproduce it
-// (10+ variants tried: mut vs ro binding, closure vs direct call, fresh
-// literal vs parsed-through-a-fallible-constructor) — the trigger appears
-// tied to `ServerRequest`'s specific shape (7 fields incl. `HeaderMap`/
-// `Option`/`Vec`-backed ones) or its construction path (`parse_request`), not
-// isolated further given the time already spent (each variant is a full
-// compile — cost/benefit turned negative). The `.c` evidence at the ACTUAL
-// call site (`Nova_Path____NovaValue_UserIdParams_static_from_request((&(req)))`
-// vs the declared `static NovaRes_..._from_request(NovaValue_ServerRequest`)
-// is itself a complete, reproducible-on-demand repro (re-add the three
-// `PathParam[T]`/`Query[T]`/`Json[T]` round-trip tests removed from this file,
-// content preserved in the session's report, and `nova test` reproduces it).
-// LIKELY THE SAME FAMILY as the ALREADY-TRACKED "value/pointer mismatch in
-// arg position" bug class (owner-confirmed mid-wave: commit `bac50128d
-// fix(codegen, [M-nv-spawn-ctx-capture-mut-param-ptr-mismatch]+
-// [M-http-props-mut-chain-argpos-value-ptr-mismatch])` landed on nova main
-// DURING this session; rebuilt nova.exe from that commit — this EXACT
-// manifestation still persists after the rebuild, i.e. it looks like the
-// "остаточный detach-вариант №16" the owner flagged as still-in-progress,
-// not a case that fix already covers).
-// Report to integrator for `docs/plans/backlog-followups.md` registration
-// (this worktree does not touch the nova repo) — code itself (extract.nv) is
-// unaffected/correct and ships as-is; only the END-TO-END test is blocked.
+// `PathParam[T]`/`Query[T]`/`Json[T]` round-trip tests (below, Ф.2b) were
+// blocked by `[M-generic-static-method-value-arg-addr-mismatch]` (221.1 №26:
+// `SomeGeneric[Concrete].from_request(req)` emitted `&(req)` — the
+// argument's address — at the call site while the generated callee took
+// `req` BY VALUE, `unknown pointer→value` CC-FAIL). CLOSED on nova main
+// (`9300db349` "four parallel generic mono-instance signature paths never
+// consulted the byref map", merged `4dc7c50f4`) — reran with a nova.exe
+// rebuilt from that commit, all three now PASS end-to-end.
+//
+// Ф.3 (222.3 §5, arity-overload handler registration) tests are further
+// below: `Router.@get`/`@post`/etc. with 0..N `FromRequest` extractors.
 
 module http.server
 
@@ -143,4 +116,124 @@ test "Headers: exposes the request's header map" {
     ro wire = serve_once(r, get_req("/hdrs"))
     ro s = unsafe { wire.to_str_unchecked() }
     assert(s.contains("has-host"))
+}
+
+// ── Ф.2b: PathParam[T] / Query[T] / Json[T] — round-trip through a real
+// Router dispatch (closes 221.1 №26, [M-generic-static-method-value-arg-
+// addr-mismatch]; see this file's banner) ──────────────────────────────────
+
+#impl(Serialize + Deserialize)
+type UserIdParams value { ro id int }
+
+#impl(Serialize + Deserialize)
+type SearchQuery value { ro q str, ro limit int }
+
+#impl(Serialize + Deserialize)
+type CreateItem value { ro name str, ro qty int }
+
+test "PathParam[T]: round-trip through Router dispatch" {
+    mut r = Router.new()
+    r.get("/users/{id}", handler_fn(|req| {
+        match PathParam[UserIdParams].from_request(req) {
+            Ok(p)  => ServerResponse.text(200, "id=${p.data().id}")
+            Err(e) => e.into_response()
+        }
+    }))!!
+    ro wire = serve_once(r, get_req("/users/42"))
+    ro s = unsafe { wire.to_str_unchecked() }
+    assert(s.contains("id=42"))
+}
+
+test "PathParam[T]: bad int -> HttpError, not a crash" {
+    mut r = Router.new()
+    r.get("/users/{id}", handler_fn(|req| {
+        match PathParam[UserIdParams].from_request(req) {
+            Ok(p)  => ServerResponse.text(200, "id=${p.data().id}")
+            Err(e) => e.into_response()
+        }
+    }))!!
+    ro wire = serve_once(r, get_req("/users/not-a-number"))
+    assert(status_line(wire) == "HTTP/1.1 400 Bad Request")
+}
+
+test "Query[T]: round-trip through Router dispatch" {
+    mut r = Router.new()
+    r.get("/search", handler_fn(|req| {
+        match Query[SearchQuery].from_request(req) {
+            Ok(q)  => ServerResponse.text(200, "q=${q.data().q} limit=${q.data().limit}")
+            Err(e) => e.into_response()
+        }
+    }))!!
+    ro wire = serve_once(r, get_req("/search?q=widgets&limit=10"))
+    ro s = unsafe { wire.to_str_unchecked() }
+    assert(s.contains("q=widgets limit=10"))
+}
+
+test "Json[T]: round-trip through Router dispatch" {
+    mut r = Router.new()
+    r.post("/items", handler_fn(|req| {
+        match Json[CreateItem].from_request(req) {
+            Ok(j)  => ServerResponse.text(200, "name=${j.data().name} qty=${j.data().qty}")
+            Err(e) => e.into_response()
+        }
+    }))!!
+    ro wire = serve_once(r, post_json_req("/items", "{\"name\":\"gizmo\",\"qty\":5}"))
+    ro s = unsafe { wire.to_str_unchecked() }
+    assert(s.contains("name=gizmo qty=5"))
+}
+
+test "Json[T]: malformed body -> HttpError, not a crash" {
+    mut r = Router.new()
+    r.post("/items", handler_fn(|req| {
+        match Json[CreateItem].from_request(req) {
+            Ok(j)  => ServerResponse.text(200, "name=${j.data().name}")
+            Err(e) => e.into_response()
+        }
+    }))!!
+    ro wire = serve_once(r, post_json_req("/items", "{not json"))
+    assert(status_line(wire) == "HTTP/1.1 400 Bad Request")
+}
+
+// ── Ф.3: PathParam + Query + Json composed on ONE route (222.3 §5 gate item
+// #4) — arity-overload SUGAR (`r.post[PathParam[X], Query[Y], Json[Z], R](…)`)
+// is BLOCKED (see extract.nv banner, [M-concrete-instance-arity-overload-
+// mangle]); this is the low-level `Handler` + manual per-extractor
+// composition the banner names as the surviving registration path —
+// `ServerRequest` is `value`, so all three extractors read it independently,
+// no ownership conflict. Also exercises: adding a NEW route to a `Router`
+// that ALSO carries plain (no-extractor) routes doesn't disturb 404/405
+// (shared `Router` with the plain `/health` route below). ─────────────────
+
+test "PathParam+Query+Json composed on one route; 404/405 unaffected on the same Router" {
+    mut r = Router.new()
+    r.get("/health", handler_fn(|req| ServerResponse.text(200, "ok")))!!
+    r.post("/items/{id}", handler_fn(|req| {
+        match PathParam[UserIdParams].from_request(req) {
+            Ok(p) => match Query[SearchQuery].from_request(req) {
+                Ok(q) => match Json[CreateItem].from_request(req) {
+                    Ok(j)  => ServerResponse.text(200, "id=${p.data().id} q=${q.data().q} name=${j.data().name}")
+                    Err(e) => e.into_response()
+                }
+                Err(e) => e.into_response()
+            }
+            Err(e) => e.into_response()
+        }
+    }))!!
+
+    // happy path: all three extractors succeed
+    ro wire = serve_once(r, post_json_req("/items/7?q=widgets&limit=1", "{\"name\":\"gizmo\",\"qty\":5}"))
+    ro s = unsafe { wire.to_str_unchecked() }
+    assert(s.contains("id=7 q=widgets name=gizmo"))
+
+    // the plain no-extractor route on the SAME Router is unaffected
+    ro wire_health = serve_once(r, get_req("/health"))
+    assert(status_line(wire_health) == "HTTP/1.1 200 OK")
+
+    // 404: no route matches at all
+    ro wire_404 = serve_once(r, get_req("/nope"))
+    assert(status_line(wire_404) == "HTTP/1.1 404 Not Found")
+
+    // 405: path matches (/items/{id}) but method doesn't (only POST registered)
+    ro wire_405 = serve_once(r, get_req("/items/7"))
+    assert(status_line(wire_405) == "HTTP/1.1 405 Method Not Allowed")
 }
