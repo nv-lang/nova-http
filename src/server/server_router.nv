@@ -502,28 +502,30 @@ fn Router @match_from(idx int, segs []str, i int) -> Option[MatchResult] {
 /// the matched handler, with `{name}`/`{*name}` captures attached as raw
 /// `ServerRequest.@params` (typed extraction is 222.3, layered on top).
 #stable(since = "0.1")
-// `req` is `mut` (D246 canon (a), in-out): `@params(m.params)` below needs a
-// mutable receiver, and every caller (`route_once`/`route_once_with_
-// multipart_limits`, `server.nv`) passes its own `req`/`req0` binding through
-// exactly once, never reading it again afterward — no independent copy
-// needed, just a mut param instead of laundering a ro caller-side binding
-// into a local `mut rq = req`.
-export fn Router @dispatch(mut req ServerRequest) -> ServerResponse {
-    ro segs = split_segments(req.path())
+// `req` param stays bare (`ro`, D176 default) — canon (a) (`mut` param) was
+// tried and REJECTED: it hits a live codegen gap calling a method with an
+// ordinary (non-receiver) `mut`-typed struct arg (see `ServerRequest.
+// @clone()`'s own comment, server.nv, for the exact repro/CC-FAIL text and
+// marker). (b) instead: `.clone()` (D230) an independent mutable copy —
+// `@params(m.params)` below needs a mutable receiver, and the clone is
+// scoped to this fn only.
+export fn Router @dispatch(req ServerRequest) -> ServerResponse {
+    mut rq = req.clone()
+    ro segs = split_segments(rq.path())
     match @match_from(0, segs, 0) {
         Some(m) => {
-            req.params(m.params)
-            ro reqm = req.method().str()
+            rq.params(m.params)
+            ro reqm = rq.method().str()
             match m.methods.find_handler(reqm) {
-                Some(h) => h(req)
+                Some(h) => h(rq)
                 None => match m.methods.fallback() {
-                    Some(h) => h(req)
+                    Some(h) => h(rq)
                     None    => method_not_allowed(m.methods.allowed_methods())
                 }
             }
         }
         None => match @fallback {
-            Some(h) => h(req)
+            Some(h) => h(rq)
             None    => ServerResponse.text(404, "404 page not found")
         }
     }
