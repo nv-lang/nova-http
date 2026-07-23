@@ -30,6 +30,48 @@ import http.{HttpError, HeaderMap}
 import std.encoding.json.{JsonValue}
 import std.encoding.serde.{Deserialize, DeError, JsonDeserializer}
 
+// ── arity-overload handler registration (plan §5) — BLOCKED, STOP+REPORT ──
+//
+// Plan §5 calls for `Router.@get`/`@post`/`@put`/`@delete`/`@patch` to gain
+// 0..4-extractor overloads (`fn(T1 FromRequest, ..., Tn) -> R IntoResponse`)
+// ALONGSIDE the existing `(path str, h Handler)` low-level form. NOT
+// implemented — hits `[M-concrete-instance-arity-overload-mangle]` (the
+// exact trap the plan names, "stop+report, NOT a workaround") at the
+// SMALLEST possible surface: adding a single NEW bound-generic overload
+// `Router mut @get[R IntoResponse](path str, h fn() -> R)` — even with ZERO
+// call sites anywhere — makes codegen fail on the PRE-EXISTING, unrelated,
+// non-generic `@get(path str, h Handler)` call sites already in this
+// package's own test suite:
+//   `codegen error: [E7001] cannot infer C type for closure-arg return type
+//   (R) for '.get()' on 'Router': neither the node_substs checker channel
+//   nor the closure body's own (param-bound) inference could resolve it —
+//   see M-196.5-b3-closure-param-bind.`
+// Root cause (read at `compiler-codegen/src/codegen/emit_c.rs:39590-39784`,
+// nova main `ca8026cf0`): the arg-type/closure-return inference block that
+// produces this error runs against `fn_decl` — codegen's OWN overload
+// pick for the call site — which here diverges from the checker's (correct)
+// pick: an EXISTING call passing a `Handler` VALUE (built via
+// `handler_fn(|req| ...)`, itself a `Call` expr, not a bare closure) gets
+// matched against the NEW `fn() -> R` overload's `TypeRef::Func` shape by
+// this codegen block, whose own closure-detection
+// (`ExprKind::ClosureLight` match at emit_c.rs:39624) only handles the arg
+// being a closure literal directly — it silently treats the wrong `fn_decl`
+// as ground truth instead of re-deriving/consulting the checker's actual
+// overload resolution for THIS call. Minimal repro (26 lines, no
+// Router/Handler/HttpError involved — isolates the class, not an
+// http-specific quirk): `Router`/`Handler` analogs with ONE non-generic
+// `@get(x int, h Handler)` + ONE unrelated/uncalled generic
+// `@get[R](x int, h fn() -> R)` — the FIRST overload's own call site then
+// CC-FAILs with the identical error. Reproduced against the nova.exe FRESH
+// off `ca8026cf0` (includes 221.1 №26's fix, `9300db349`, unrelated to this
+// bug) — this is a SEPARATE codegen gap, not a residual of №26.
+// Report to integrator for `docs/plans/backlog-followups.md` registration
+// (this worktree does not touch the nova repo) — §5 stays UNIMPLEMENTED;
+// the low-level `Router.@get(path, Handler)` + manual per-extractor
+// `T.from_request(req)` composition (already exercised end-to-end below and
+// in `extract_test.nv`) remains the only registration path until this
+// compiler gap is fixed.
+
 // ── FromRequest protocol ───────────────────────────────────────────────────
 
 /// Extract a typed value from a request. ALWAYS synchronous — unlike Axum's
