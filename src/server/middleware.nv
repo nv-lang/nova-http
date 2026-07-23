@@ -158,15 +158,17 @@ export fn Middleware @then(inner Middleware) -> Middleware {
 // loop iteration applies `layers[0]` around everything already built —
 // `layers[0]` (first `.layer()` call) ends up as the outermost wrap, i.e.
 // the one that runs first (real-chi order, see file banner).
-fn wrap_handler(layers []Middleware, h Handler) -> Handler {
-    mut wrapped = h
+// `h` is `mut` (D246 canon (a), in-out): every call site hands its own
+// binding through exactly once and never rereads it afterward, so there is
+// no need for the separate `wrapped` local this used to launder into.
+fn wrap_handler(layers []Middleware, mut h Handler) -> Handler {
     mut i = layers.len() - 1
     while i >= 0 {
         ro mw = layers[i]
-        wrapped = mw.apply(wrapped)
+        h = mw.apply(h)
         i -= 1
     }
-    wrapped
+    h
 }
 
 // Wrap every method-handler AND the per-route 405 `@fallback` held by `mr`
@@ -174,8 +176,17 @@ fn wrap_handler(layers []Middleware, h Handler) -> Handler {
 // `layers`. A no-op (returns `mr` unchanged) when there are no layers yet —
 // avoids an allocation/rebuild on the hot path for routers that never call
 // `.layer()`.
+// `mr` stays a bare (`ro`-bound) param here — canon (a) (`mut mr`, in-out)
+// was tried and REJECTED: it cascades into `@insert_segs`/`@route`
+// (server_router.nv), which is public API called with fluent RVALUE chains
+// (`r.route("/x", get(h).post(h2))`, `router_test.nv`) that have no
+// addressable storage to bind a `mut` param to (`E_MUT_ARG_NOT_MUTABLE`).
+// (b) instead: `.clone()` (D230) the ONE early-return path that would
+// otherwise hand the bare ro-bound `mr` back out to a `mut`-defaulted
+// caller binding (D184) — canon (c) doesn't fit either, the return type here
+// is genuinely `-> MethodRouter` (mut-default), not `-> ro MethodRouter`.
 fn wrap_method_router(layers []Middleware, mr MethodRouter) -> MethodRouter {
-    if layers.len() == 0 { return mr }
+    if layers.len() == 0 { return mr.clone() }
     mut wrapped_routes = []MethodEntry.new()
     for e in mr.routes {
         wrapped_routes.push(MethodEntry{method: e.method, handler: wrap_handler(layers, e.handler)})
@@ -192,7 +203,7 @@ fn wrap_method_router(layers []Middleware, mr MethodRouter) -> MethodRouter {
     // dispatch-time path, byte-for-byte as before. Pin-tested in
     // middleware_test.nv ("default 405 ... IS wrapped").
     ro wrapped_fallback = match mr.fallback {
-        Some(h) => Some(wrap_handler(layers, h))
+        Some(mut h) => Some(wrap_handler(layers, h))
         None    => Some(wrap_handler(layers, default_405_handler(mr.allowed_methods())))
     }
     { routes: wrapped_routes, fallback: wrapped_fallback }

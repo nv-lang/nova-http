@@ -172,8 +172,11 @@ test "servernet: WebSocketUpgrade.on_upgrade hijack is wired live through serve_
 // until exactly one complete WS frame is buffered, then decode it. `s` is a
 // mutable BORROW (free-fn `mut` param, NOT `consume`) — same shape
 // `ws/rt/socket_echo_smoke.nv`'s own `read_frame_inline` uses.
-fn read_frame_inline(mut s TcpStream, pre []u8) Net -> Frame {
-    mut fbuf = pre
+// `fbuf` is `mut` (D246 canon (a)): every call site already holds a `mut
+// fbuf` binding (accumulator reused/reset across the three frame reads
+// above), so no independent copy is needed — same in-out param the caller
+// was already relying on informally.
+fn read_frame_inline(mut s TcpStream, mut fbuf []u8) Net -> Frame {
     mut need = find_frame_hint(fbuf)
     while need.is_some() {
         match s.read_to_vec(4096) {

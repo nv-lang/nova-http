@@ -64,27 +64,28 @@ export fn compression(cfg Compression) -> Middleware => cfg.middleware()
 // `next` arrives as a PARAM — `next(req)` is the safe D52 param call-through
 // ([M-16] discipline, cors.nv `cors_apply` precedent).
 fn compress_apply(cfg Compression, next Handler, req ServerRequest) -> ServerResponse {
-    ro resp0 = next(req)
+    // `mut` from the start (D246 canon (a)) — mutated below (`.header(...)`);
+    // no separate `resp` copy needed, unlike the old ro→mut launder.
+    mut resp0 = next(req)
     if resp0.is_streaming() { return resp0 }
     if resp0.headers.contains("content-encoding") { return resp0 }
     if !compressible_type(resp0) { return resp0 }
     // Negotiable from here on: mark Vary even if this answer stays identity.
-    mut resp = resp0
-    resp.header("Vary", vary_value(resp0, "accept-encoding"))
-    if resp.body.len() < cfg.min_size { return resp }
-    if !accepts_gzip(req.header("accept-encoding") ?? "") { return resp }
-    match gzip_encode(resp.body, cfg.level) {
+    resp0.header("Vary", vary_value(resp0, "accept-encoding"))
+    if resp0.body.len() < cfg.min_size { return resp0 }
+    if !accepts_gzip(req.header("accept-encoding") ?? "") { return resp0 }
+    match gzip_encode(resp0.body, cfg.level) {
         Ok(gz) => {
-            if gz.len() >= resp.body.len() { return resp }   // not worth it
+            if gz.len() >= resp0.body.len() { return resp0 }   // not worth it
             // [M-fluent-value-init-local-deref] (221.1 №36): init mut-локали из
             // fluent-сеттера на value-типе — пятый непокрытый deref-сайт семьи
             // №9/№10; statement-форма до фикса:
-            mut out = resp
+            mut out = resp0
             out.body(gz)
             out.header("Content-Encoding", "gzip")
             out
         }
-        Err(_) => resp   // encoder failure never fails the request
+        Err(_) => resp0   // encoder failure never fails the request
     }
 }
 

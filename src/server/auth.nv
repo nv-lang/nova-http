@@ -489,30 +489,32 @@ fn none_str() -> Option[str] => None
 // a record literal inside the closure is missed by closure capture analysis —
 // `use of undeclared identifier` in emitted C; explicit `field: name` with
 // distinct names captures fine.)
-fn session_apply(store MemorySessionStore, cookie_name str, ttl_s int, sec bool,
+// `store`/`req` are both `mut` (D246 canon (a)): `store` is the SHARED
+// session store (`.save()` mutation must be visible on the NEXT request,
+// same rationale as `ratelimit.nv`'s bucket table — not an independent-copy
+// case); `req` is a plain in-out passthrough (`session_layer`'s closure
+// below hands its own `mut req` through exactly once, per branch).
+fn session_apply(mut store MemorySessionStore, cookie_name str, ttl_s int, sec bool,
                  honly bool, ssite SameSite, now_fn fn() -> u64,
-                 id_gen fn() -> str, next Handler, req ServerRequest) -> ServerResponse {
+                 id_gen fn() -> str, next Handler, mut req ServerRequest) -> ServerResponse {
     match session_id_of(req, cookie_name) {
         Some(sid) => {
             // Existing session cookie: expose the id to the handler via
             // the params channel (same [](str,str) channel path params use).
-            mut r2 = req
             mut ps = req.params
             ps.push(("session_id", sid))
-            r2.params(ps)
-            next(r2)
+            req.params(ps)
+            next(req)
         }
         None => {
             // No cookie: mint an id, eager-save an empty session, tell
             // the client (Set-Cookie with the config's secure defaults).
             ro sid = id_gen()
-            mut st = store
-            ro _ = st.save(sid, SessionData.new(), now_fn())
-            mut r2 = req
+            ro _ = store.save(sid, SessionData.new(), now_fn())
             mut ps = req.params
             ps.push(("session_id", sid))
-            r2.params(ps)
-            mut resp = next(r2)
+            req.params(ps)
+            mut resp = next(req)
             ro cookie = SetCookie {
                 name: cookie_name, value: sid, domain: none_str(), path: Some("/"),
                 max_age: Some(ttl_s), secure: sec, http_only: honly, same_site: ssite,
@@ -532,7 +534,11 @@ fn session_apply(store MemorySessionStore, cookie_name str, ttl_s int, sec bool,
 /// follow-up once generic-capture codegen is proven safe); `id_gen` supplies
 /// session-id entropy — its strength is the caller's responsibility.
 #stable(since = "0.1")
-export fn session_layer(store MemorySessionStore, cfg SessionConfig, now_fn fn() -> u64,
+// `store` is `mut` (D246 canon (a)): captured into the closure below and
+// threaded through as a `mut` in-out param (shared, mutating store) on every
+// request; the one caller (`auth_test.nv`) never reuses its own binding
+// after passing it here.
+export fn session_layer(mut store MemorySessionStore, cfg SessionConfig, now_fn fn() -> u64,
                         id_gen fn() -> str) -> Middleware {
     // Unpack OUTSIDE the closures (see session_handler note).
     ro cookie_name = cfg.cookie_name
@@ -540,9 +546,12 @@ export fn session_layer(store MemorySessionStore, cfg SessionConfig, now_fn fn()
     ro sec = cfg.secure
     ro honly = cfg.http_only
     ro ssite = cfg.same_site
-    ro st = store
+    // `mut` (not `ro`): the SHARED session store, threaded into `session_
+    // apply` as a `mut` in-out param every request (see that fn's own
+    // comment) — mirrors `ratelimit.nv`'s bucket table.
+    mut st = store
     ro nf = now_fn
     ro ig = id_gen
-    middleware(fn(req ServerRequest, next Handler) -> ServerResponse =>
+    middleware(fn(mut req ServerRequest, next Handler) -> ServerResponse =>
         session_apply(st, cookie_name, ttl_s, sec, honly, ssite, nf, ig, next, req))
 }

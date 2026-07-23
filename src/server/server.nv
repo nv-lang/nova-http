@@ -114,6 +114,26 @@ export type ServerRequest value {
     multipart_limits MultipartLimits // plain (no `ro`) — `@multipart_limits(v) -> @` reassigns it directly, same shape as `params` above
 }
 
+/// Independent copy (D230/D246 canon (b)). Field-shorthand shallow copy is
+/// sufficient here — `params`/`headers`/`body` are never mutated IN PLACE
+/// by any consumer of a clone (`Router.@dispatch`, server_router.nv, is the
+/// one caller: it only ever REASSIGNS the whole `params` field to a fresh
+/// `Vec` via the `@params(v)` setter, never appends into the shared one),
+/// so no per-field `.clone()` is needed to avoid aliasing.
+/// Canon (a) (`mut` PARAMETER) was tried FIRST for `@dispatch` and REJECTED:
+/// it hits a live codegen gap — calling a method with an ordinary
+/// (non-receiver) `mut`-typed struct argument omits the required
+/// address-of at the CALL site (`Nova_Router_method_dispatch(&(router),
+/// req)` compiles with `req` passed by value while the callee's own second
+/// param is `NovaValue_ServerRequest*`), CC-FAIL "passing
+/// NovaValue_ServerRequest to parameter of incompatible type
+/// NovaValue_ServerRequest *; take the address with &" — reproduced via
+/// `nova test src` (whole-package CU); only the RECEIVER slot (1st arg)
+/// reliably gets `&` at method-call sites.
+/// `[M-mut-nonreceiver-struct-param-method-call-missing-addressof]`
+fn ServerRequest @clone() -> ServerRequest =>
+    { @method, @target, @path, @query, @version, @headers, @params, @body, @multipart_limits }
+
 /// Request method.
 #stable(since = "0.1")
 export fn ServerRequest @method() -> Method => @method

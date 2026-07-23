@@ -62,6 +62,30 @@ export type MethodRouter value {
 #stable(since = "0.1")
 export fn MethodRouter.new() -> MethodRouter => { routes: []MethodEntry.new(), fallback: None }
 
+/// Independent copy (D246 canon (b) — see `middleware.nv`'s `wrap_method_
+/// router` for the one call site and why an in-out `mut` param doesn't fit
+/// there). Explicit return type (NOT `-> Self` — [M-generic-value-self-
+/// return-transitive-cu-emission], №59).
+///
+/// Manual for-loop rebuild, NOT `@routes.clone()` (`Vec[MethodEntry]`) —
+/// live codegen gap found via `nova test src`: `Vec[T].@clone()`'s
+/// generated per-element clone dispatch resolved `MethodEntry`'s (no
+/// `@clone()` of its own) element-clone call to `MethodRouter @clone()`
+/// instead (WRONG receiver type — the only other `@clone()` in this same
+/// module/file) — CC-FAIL "passing 'Nova_WriteBuffer *'/'NovaValue_
+/// MethodRouter' to parameter of incompatible type 'NovaValue_MethodEntry'"
+/// (the exact bogus type varies by which CU pulls this code in — always
+/// SOME unrelated same-CU type, never `MethodEntry`). A plain per-element
+/// `for`+`push` sidesteps `Vec.@clone()`'s per-element dispatch entirely —
+/// `MethodEntry`'s two fields (`str`/`Handler`) are cheap value copies,
+/// no per-element clone needed anyway.
+/// `[M-vec-clone-generic-element-clone-wrong-receiver-bleed]`
+fn MethodRouter @clone() -> MethodRouter {
+    mut out = []MethodEntry.new()
+    for e in @routes { out.push(e) }
+    { routes: out, @fallback }
+}
+
 fn MethodRouter mut @add(method str, h Handler) -> @ { @routes.push(MethodEntry{method, handler: h}) }
 
 /// Add a `GET` handler to this route's method set.
@@ -305,7 +329,11 @@ fn Router mut @insert_segs(segs []str, path str, mr MethodRouter) -> Result[(), 
             }
         } else if is_param_seg(seg) {
             ro name = seg[1..seg.byte_len() - 1]
-            ro node = @nodes[idx]
+            // `mut` from the start (D246 canon (a)) — this local IS mutated
+            // in the `None` arm below (no separate `updated` copy needed);
+            // nothing outside this scope reads `node` after `@nodes[idx] =
+            // node` writes the result back.
+            mut node = @nodes[idx]
             match node.param_child {
                 Some(pe) => {
                     if pe.name != name { return Err(route_conflict_error(path)) }
@@ -314,22 +342,21 @@ fn Router mut @insert_segs(segs []str, path str, mr MethodRouter) -> Result[(), 
                 None => {
                     @nodes.push(RouteNode.new())
                     ro new_idx = @nodes.len() - 1
-                    mut updated = node
-                    updated.param_child = Some(ParamEdge{name, idx: new_idx})
-                    @nodes[idx] = updated
+                    node.param_child = Some(ParamEdge{name, idx: new_idx})
+                    @nodes[idx] = node
                     idx = new_idx
                 }
             }
         } else {
-            ro node = @nodes[idx]
+            // Same rationale as the param-segment arm above.
+            mut node = @nodes[idx]
             match find_literal_child(node, seg) {
                 Some(child_idx) => { idx = child_idx }
                 None => {
                     @nodes.push(RouteNode.new())
                     ro new_idx = @nodes.len() - 1
-                    mut updated = node
-                    updated.literal_children.push(LiteralEdge{seg, idx: new_idx})
-                    @nodes[idx] = updated
+                    node.literal_children.push(LiteralEdge{seg, idx: new_idx})
+                    @nodes[idx] = node
                     idx = new_idx
                 }
             }
@@ -493,8 +520,15 @@ fn Router @match_from(idx int, segs []str, i int) -> Option[MatchResult] {
 /// the matched handler, with `{name}`/`{*name}` captures attached as raw
 /// `ServerRequest.@params` (typed extraction is 222.3, layered on top).
 #stable(since = "0.1")
+// `req` param stays bare (`ro`, D176 default) — canon (a) (`mut` param) was
+// tried and REJECTED: it hits a live codegen gap calling a method with an
+// ordinary (non-receiver) `mut`-typed struct arg (see `ServerRequest.
+// @clone()`'s own comment, server.nv, for the exact repro/CC-FAIL text and
+// marker). (b) instead: `.clone()` (D230) an independent mutable copy —
+// `@params(m.params)` below needs a mutable receiver, and the clone is
+// scoped to this fn only.
 export fn Router @dispatch(req ServerRequest) -> ServerResponse {
-    mut rq = req
+    mut rq = req.clone()
     ro segs = split_segments(rq.path())
     match @match_from(0, segs, 0) {
         Some(m) => {

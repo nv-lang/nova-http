@@ -94,7 +94,12 @@ fn read_header_phase(s mut TcpStream, policy ServerPolicy) Net Time -> HeaderPha
     mut acc []u8 = []u8.new()
     mut header_end = -1
     mut header_dl_set = false
-    mut header_dl Monotonic = idle_dl
+    // Placeholder value ONLY — never read while `header_dl_set` is false (the
+    // `dl` selector below reads `idle_dl` in that state), so recompute
+    // independently rather than laundering the `ro idle_dl` local into a
+    // `mut` binding (D246, [M-ro-launder-via-mut-binding]); overwritten with
+    // the real header deadline the moment the first byte arrives.
+    mut header_dl Monotonic = Monotonic.now() + policy.header_deadline()
     mut reading = true
     mut outcome_idle_timeout = false
     mut outcome_header_timeout = false
@@ -141,7 +146,11 @@ type BodyPhase enum
     | TimedOut
     | Malformed
 
-fn read_body_identity(s mut TcpStream, need int, already []u8, deadline Monotonic) Net Time -> BodyPhase {
+// `already` is `mut`-parameterized (not ro): the only call site (`read_one_
+// request` below) hands it in once and never reuses the caller's binding
+// afterward, so an in-out param is the cheapest fix (D246 canon (a)) — no
+// independent copy needed.
+fn read_body_identity(s mut TcpStream, need int, mut already []u8, deadline Monotonic) Net Time -> BodyPhase {
     mut acc = already
     mut reading = acc.len() < need
     mut timed_out = false
@@ -161,7 +170,9 @@ fn read_body_identity(s mut TcpStream, need int, already []u8, deadline Monotoni
     else { BodyPhase.Body(acc[0..need]) }
 }
 
-fn read_body_chunked(s mut TcpStream, already []u8, max_bytes int, deadline Monotonic) Net Time -> BodyPhase {
+// Same rationale as `read_body_identity` above — `already` is `mut` (in-out,
+// D246 canon (a)), the sole call site never reuses its own binding after.
+fn read_body_chunked(s mut TcpStream, mut already []u8, max_bytes int, deadline Monotonic) Net Time -> BodyPhase {
     mut buf = already
     mut out = WriteBuffer.new()
     mut pos = 0
@@ -427,7 +438,10 @@ export fn read_one_request(s mut TcpStream, policy ServerPolicy, served_count in
                     ro _ = s.write_all("HTTP/1.1 100 Continue\r\n\r\n".bytes())
                 }
                 ro body_start = header_end + 4
-                ro already []u8 = acc[body_start..acc.len()]
+                // `mut` (not `ro`): passed into a `mut already` param below
+                // (D246 canon (a) — in-out, never read again after either
+                // branch's single call), not laundered from a frozen source.
+                mut already []u8 = acc[body_start..acc.len()]
                 ro read_dl = Monotonic.now() + policy.read_deadline()
                 ro outcome = if chunked {
                     read_body_chunked(s, already, policy.max_body_bytes(), read_dl)
