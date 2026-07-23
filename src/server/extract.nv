@@ -47,10 +47,13 @@ export type FromRequest protocol {
 /// NOT `value` — [M-generic-value-self-protocol-wrapper-mono], see the note
 /// on `Json[T]` in respond.nv (same root cause, same fix).
 #stable(since = "0.1")
-export type Path[T] { priv data T }
+// HOTFIX [M-crossmodule-samename-typecheck-bleed] (221.1 №28): временно PathParam —
+// имя Path коллидирует со std/fs Path во флагман-CU (кодоген генерит .data на чужой
+// структуре); ВЕРНУТЬ имя Path после фикса №28 (Axum-паритет имени).
+export type PathParam[T] { priv data T }
 /// The decoded value (property accessor, D117 — not a bare field).
 #stable(since = "0.1")
-export fn Path[T] @data() -> T => @data
+export fn PathParam[T] @data() -> T => @data
 
 /// `?a=1&b=2` query-string, decoded into `T` (`#impl(Deserialize)`).
 /// NOT `value` — [M-generic-value-self-protocol-wrapper-mono], see the note
@@ -95,7 +98,7 @@ fn flat_find(pairs [](str, str), key str) -> Option[str] {
 }
 
 // A scalar read (`deser_int`/`deser_str`/…) with NO cursor set means `T`
-// itself is a bare scalar (not a record) — e.g. `Path[int]` with no named
+// itself is a bare scalar (not a record) — e.g. `PathParam[int]` with no named
 // field to enter first. NOT supported (documented simplification, plan §4
 // scope is record-shaped `T`; a bare-scalar single dynamic path segment would
 // need positional, not by-name, binding — different design question, out of
@@ -103,7 +106,7 @@ fn flat_find(pairs [](str, str), key str) -> Option[str] {
 fn flat_need_cur(cur Option[str]) -> Result[str, DeError] {
     match cur {
         Some(s) => Ok(s)
-        None    => Err(DeError.new(Custom("scalar deserialize requires entering a named field first (bare-scalar Path[T]/Query[T] over multiple params is not supported — use a record)")))
+        None    => Err(DeError.new(Custom("scalar deserialize requires entering a named field first (bare-scalar PathParam[T]/Query[T] over multiple params is not supported — use a record)")))
     }
 }
 
@@ -289,12 +292,12 @@ export fn Json[T Deserialize].from_request(req ServerRequest) -> Result[Json[T],
     }
 }
 
-/// `Path[T]` — decode the matched `{name}` path params into `T`.
+/// `PathParam[T]` — decode the matched `{name}` path params into `T`.
 #impl(FromRequest)
-export fn Path[T Deserialize].from_request(req ServerRequest) -> Result[Path[T], HttpError] {
+export fn PathParam[T Deserialize].from_request(req ServerRequest) -> Result[PathParam[T], HttpError] {
     mut d = ParamsDeserializer.new(req.params)
     match T.deserialize(d) {
-        Ok(v)  => Ok(Path{ data: v })
+        Ok(v)  => Ok(PathParam{ data: v })
         Err(e) => Err(HttpError.decode_error(e.to_str()))
     }
 }

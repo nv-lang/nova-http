@@ -6,7 +6,7 @@
 // raw HTTP/1.1 request, serve_once, inspect the wire response" style so no
 // mock-`ServerRequest` constructor is needed).
 //
-// `Path[T]`/`Query[T]`/`Json[T]` — TYPE-CHECK cleanly (`nova check` PASS,
+// `PathParam[T]`/`Query[T]`/`Json[T]` — TYPE-CHECK cleanly (`nova check` PASS,
 // matching the plan's design exactly, extract.nv above) but their
 // `.from_request(req)` call is NOT exercised end-to-end here:
 // [M-generic-static-method-value-arg-addr-mismatch] (found this wave,
@@ -31,7 +31,7 @@
 // call site (`Nova_Path____NovaValue_UserIdParams_static_from_request((&(req)))`
 // vs the declared `static NovaRes_..._from_request(NovaValue_ServerRequest`)
 // is itself a complete, reproducible-on-demand repro (re-add the three
-// `Path[T]`/`Query[T]`/`Json[T]` round-trip tests removed from this file,
+// `PathParam[T]`/`Query[T]`/`Json[T]` round-trip tests removed from this file,
 // content preserved in the session's report, and `nova test` reproduces it).
 // LIKELY THE SAME FAMILY as the ALREADY-TRACKED "value/pointer mismatch in
 // arg position" bug class (owner-confirmed mid-wave: commit `bac50128d
