@@ -265,10 +265,7 @@ export fn Router mut @route(path str, mr MethodRouter) -> Result[(), HttpError] 
 }
 
 fn Router mut @insert_segs(segs []str, path str, mr MethodRouter) -> Result[(), HttpError] {
-    match validate_pattern(path, segs) {
-        Ok(_)  => ()
-        Err(e) => return Err(e)
-    }
+    validate_pattern(path, segs)?
     mut idx = 0
     ro n = segs.len()
     mut i = 0

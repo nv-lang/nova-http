@@ -65,10 +65,7 @@ export fn json_decode_body[T Deserialize](body []u8) -> Result[T, HttpError] {
 /// ([M-176-io-forward-bounded-generic]).
 #stable(since = "0.1")
 export fn Response consume @json_as[T Deserialize]() -> Result[T, HttpError] {
-    ro body = match @bytes() {
-        Ok(b)  => b
-        Err(e) => return Err(e)
-    }
+    ro body = @bytes()?
     match body.to_str() {
         Ok(s) => match Json.parse(s) {
             Ok(v) => {
