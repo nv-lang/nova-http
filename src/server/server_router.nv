@@ -235,14 +235,19 @@ type CollectedRoute value { ro segs []str, ro methods MethodRouter }
 export type Router value {
     mut nodes    []RouteNode
     mut fallback Option[Handler]
+    // Middleware chain (Plan 222.4, `middleware.nv`) — accumulated by
+    // `@layer`, baked into handlers INSIDE `@insert_segs` at registration
+    // time. NOT consulted by `@dispatch`/`@fallback` directly (see
+    // `middleware.nv`'s banner for the `Router.@fallback` exemption).
+    mut layers   []Middleware
 }
 
-/// Empty router (a bare root node, no routes, no fallback).
+/// Empty router (a bare root node, no routes, no fallback, no layers).
 #stable(since = "0.1")
 export fn Router.new() -> Router {
     mut nodes []RouteNode = []RouteNode.new()
     nodes.push(RouteNode.new())
-    { nodes, fallback: None }
+    { nodes, fallback: None, layers: []Middleware.new() }
 }
 
 /// Global 404 handler (property write) — served when NO path in the trie
@@ -266,6 +271,13 @@ export fn Router mut @route(path str, mr MethodRouter) -> Result[(), HttpError] 
 
 fn Router mut @insert_segs(segs []str, path str, mr MethodRouter) -> Result[(), HttpError] {
     validate_pattern(path, segs)?
+    // Bake the currently-accumulated `@layers` into every method-handler +
+    // per-route `@fallback` of `mr` HERE — the single insertion point BOTH
+    // `@route` (fresh registration) AND `@nest` (re-inserting a sub-router's
+    // already-collected routes) funnel through, so both get "wrap at
+    // registration" for free (middleware.nv banner). `Router.@fallback`
+    // (global 404) is NOT touched — it never reaches `@insert_segs`.
+    ro wrapped_mr = wrap_method_router(@layers, mr)
     mut idx = 0
     ro n = segs.len()
     mut i = 0
@@ -277,7 +289,7 @@ fn Router mut @insert_segs(segs []str, path str, mr MethodRouter) -> Result[(), 
             match node.catchall {
                 Some(_) => return Err(route_conflict_error(path))
                 None    => {
-                    node.catchall = Some(CatchallEdge{name, methods: mr})
+                    node.catchall = Some(CatchallEdge{name, methods: wrapped_mr})
                     @nodes[idx] = node
                     return Ok(())
                 }
@@ -319,7 +331,7 @@ fn Router mut @insert_segs(segs []str, path str, mr MethodRouter) -> Result[(), 
     match node.methods {
         Some(_) => Err(route_conflict_error(path))
         None    => {
-            node.methods = Some(mr)
+            node.methods = Some(wrapped_mr)
             @nodes[idx] = node
             Ok(())
         }
