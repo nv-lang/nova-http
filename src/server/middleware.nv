@@ -138,11 +138,30 @@ fn wrap_method_router(layers []Middleware, mr MethodRouter) -> MethodRouter {
     for e in mr.routes {
         wrapped_routes.push(MethodEntry{method: e.method, handler: wrap_handler(layers, e.handler)})
     }
+    // No custom 405 override? When this route is covered by layers, MATERIALIZE
+    // the default `405 + Allow` as a fallback Handler and wrap it too (Plan
+    // 222.12 Ф.1 amendment to the 222.4 shape). Rationale: middleware that
+    // must see EVERY method hitting a registered route — CORS preflight
+    // (`OPTIONS` on a GET-only route) is the canonical case — otherwise dies
+    // on the dispatch-time generic 405, which no layer ever wraps. The wire
+    // bytes are IDENTICAL to dispatch's own `method_not_allowed` (same fn,
+    // `Allow` computed from the same method set — fixed at registration,
+    // exactly when this wrap runs); routes with no layers keep `None` and the
+    // dispatch-time path, byte-for-byte as before. Pin-tested in
+    // middleware_test.nv ("default 405 ... IS wrapped").
     ro wrapped_fallback = match mr.fallback {
         Some(h) => Some(wrap_handler(layers, h))
-        None    => None
+        None    => Some(wrap_handler(layers, default_405_handler(mr.allowed_methods())))
     }
     { routes: wrapped_routes, fallback: wrapped_fallback }
+}
+
+// The registration-time twin of dispatch's `method_not_allowed` path (same
+// response builder). `allow` is copied to a local before capture ([M-16]-family
+// param-capture discipline, see middleware/cors.nv `cors_handler`).
+fn default_405_handler(allow []str) -> Handler {
+    ro a = allow
+    handler_fn(|_req| method_not_allowed(a))
 }
 
 /// Accumulate a middleware onto this router's layer chain. Baked into every
