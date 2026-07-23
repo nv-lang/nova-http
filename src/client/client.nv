@@ -354,7 +354,7 @@ fn run_request(mut method Method, mut url Url, mut headers HeaderMap, mut body [
         ro raw = http_seam_send(host, port, secure, req)?
         ro parsed = parse_response(raw)?
         ro st = parsed.status
-        ro code = st.as_u16() as int
+        ro code = st.code()
         if follow && st.is_redirect() && code != 304 {
             match location_of(parsed.headers) {
                 Some(loc) => {

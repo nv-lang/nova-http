@@ -9,27 +9,68 @@
 
 module http
 
-/// HTTP status code (100..599).
+/// HTTP status code (100..599). Field is `int` (Nova's address-sized native
+/// integer), NOT `u16` — plan 222.5 §4а Q1 (`[M-statuscode-u16-cast-bounce]`):
+/// statuses aren't stored in bulk, so `u16`'s 6-byte saving is a wash, while
+/// the cost was real (7+ `.as_u16() as int` cast-bridges across the package,
+/// since `ServerResponse.status`/wire parsing all work in `int`). No `u16`
+/// anywhere in the public surface anymore either (owner correction
+/// 2026-07-24): the numeric accessor is the plain property `@code() -> int`
+/// (nv-coding-style same-name-by-arity convention), not an `as_*`-prefixed
+/// narrowing method — `u16` only ever appears at the true wire boundary
+/// (ASCII-digit parsing), never as internal storage or a public return type.
+// TODO `[M-assoc-const-out-of-body-syntax]`: named constants land here once
+// the parser accepts the out-of-body assoc-const form (D200, spec/decisions/
+// 02-types.md:8056 — "one door", in-body is NOT the canon; a prior draft of
+// this wave added in-body constants + retracted the factories below in the
+// SAME breath — reverted 2026-07-24, owner catch: out-of-body syntax isn't
+// parseable yet, so there is nothing to migrate factory call-sites TO). When
+// the parser lands: add `const StatusCode.OK StatusCode = { code: 200 }` (+
+// CREATED/NO_CONTENT/MOVED_PERMANENTLY/FOUND/NOT_MODIFIED/BAD_REQUEST/
+// UNAUTHORIZED/FORBIDDEN/NOT_FOUND/METHOD_NOT_ALLOWED/REQUEST_TIMEOUT/
+// PAYLOAD_TOO_LARGE/UPGRADE_REQUIRED/TOO_MANY_REQUESTS/
+// INTERNAL_SERVER_ERROR/BAD_GATEWAY/SERVICE_UNAVAILABLE), delete the named
+// factories below, migrate every call-site in the package to the constants
+// (D9 — one door, no const+wrapper-fn duplication).
 #stable(since = "0.1")
-export type StatusCode value { priv code u16 }
+export type StatusCode value { priv code int }
 
 /// Класс статуса (первая цифра).
 #stable(since = "0.1")
 export type StatusClass enum
     | Informational | Success | Redirection | ClientError | ServerError
 
-/// Сконструировать из u16; вне 100..599 → `Protocol`.
+/// Сконструировать из `int`; вне 100..599 → `Protocol`. (Was `u16` — §4а Q1;
+/// callers holding a wire-parsed number no longer need an `as u16` bridge.)
 #stable(since = "0.1")
-export fn StatusCode.new(code u16) -> Result[StatusCode, HttpError] {
+export fn StatusCode.new(code int) -> Result[StatusCode, HttpError] {
     if code < 100 || code > 599 {
         return Err(HttpError.protocol_error("status code out of range 100..599"))
     }
     Ok({ code })
 }
 
-/// Числовое значение.
+/// Unchecked construction from a raw `int` — NO 100..599 validation. Internal
+/// bridge for the DEPRECATED bare-`int` `ServerResponse` constructors
+/// (`server.nv`, soft migration — plan 222.5 §4а item 3): those overloads
+/// never validated their status before this unification either, so this
+/// preserves that exact (permissive) legacy behaviour instead of introducing
+/// a new panic/error path for the ~90 existing bare-int call-sites across the
+/// package. Prefer `StatusCode.new`/the named factories below for validated
+/// construction — this is NOT part of the normal public surface.
 #stable(since = "0.1")
-export fn StatusCode @as_u16() -> u16 => @code // [M-d410-as-to-migration]
+export fn StatusCode.from_int_unchecked(code int) -> StatusCode => { code }
+
+/// Числовое значение (property accessor over `priv code` — nv-coding-style
+/// same-name-by-arity convention, mirrors `Json[T] @data()`/`Response
+/// @status()` elsewhere in the package). Owner correction 2026-07-24: the
+/// former `@as_u16() -> u16` was a double violation — an `as_*`-prefixed
+/// name (against the property convention) that ALSO went stale the moment
+/// the field widened to `int` (§4а Q1) — a real narrowing cast had nothing
+/// left to narrow FROM once callers just wanted the field's own `int`.
+/// `[M-d410-as-to-migration]` — CLOSED here, this is the correct form.
+#stable(since = "0.1")
+export fn StatusCode @code() -> int => @code
 
 /// Класс статуса.
 #stable(since = "0.1")
@@ -129,6 +170,14 @@ export fn StatusCode @reason() -> str {
 
 // ── Именованные zero-arg фабрики (читаемость; НЕ top-level let — Q17) ─────────
 // Значения в 100..599 by-construction → конструируем напрямую.
+//
+// TEMPORARY (owner 2026-07-24): these STAY for now — deleting them requires
+// the assoc-const replacement first (`[M-assoc-const-out-of-body-syntax]`,
+// see the type's own TODO above), which the parser doesn't support yet. Once
+// it does: replace every literal body here with the matching
+// `StatusCode.CONST_NAME`, then delete these factories entirely and migrate
+// call-sites to the constants directly (D9 — one door; a const + a
+// zero-arg wrapper fn over the SAME value would be two).
 
 /// 200 OK.
 #stable(since = "0.1")
