@@ -135,7 +135,7 @@ export fn serialize_response(resp ServerResponse) -> []u8 {
     mut buf = WriteBuffer.new()
     buf.cap(128 + body.len())
     buf.write_str("HTTP/1.1 ")
-    buf.write_str(status.to_str())
+    buf.write_str(status.code().to_str())
     buf.write_str(" ")
     buf.write_str(reason_of(status))
     buf.write_str("\r\n")
@@ -181,7 +181,7 @@ export fn serialize_response_head(resp ServerResponse) -> []u8 {
     mut buf = WriteBuffer.new()
     buf.cap(160)
     buf.write_str("HTTP/1.1 ")
-    buf.write_str(status.to_str())
+    buf.write_str(status.code().to_str())
     buf.write_str(" ")
     buf.write_str(reason_of(status))
     buf.write_str("\r\n")
@@ -266,14 +266,15 @@ fn hex_char_lower(d int) -> u8 {
     if d < 10 { (0x30 + d) as u8 } else { (0x61 + d - 10) as u8 }
 }
 
-fn reason_of(status int) -> str {
-    match StatusCode.new(status as u16) {
-        Ok(sc) => {
-            ro r = sc.reason()
-            if r.byte_len() > 0 { r } else { "Status" }
-        }
-        Err(_) => "Status"
-    }
+// `status` is now the `ServerResponse` field's own `StatusCode` directly — no
+// more re-parse/re-validate round-trip (that only existed because `status`
+// used to be a bare `int`, plan 222.5 §4а item 3 unification). Same fallback
+// behaviour as before: an unmatched code (still possible via the deprecated
+// `ServerResponse` bare-`int` constructors' `StatusCode.from_int_unchecked`,
+// which does NOT validate) falls back to the generic "Status" reason.
+fn reason_of(status StatusCode) -> str {
+    ro r = status.reason()
+    if r.byte_len() > 0 { r } else { "Status" }
 }
 
 // ── byte helpers ────────────────────────────────────────────────────────────────

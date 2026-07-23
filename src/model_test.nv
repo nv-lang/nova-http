@@ -26,7 +26,7 @@ test "method neg: non-token rejected" {
 
 test "status: class + reason + range guard" {
     ro nf = StatusCode.not_found()
-    assert(nf.as_u16() == 404)
+    assert(nf.code() == 404)
     assert(nf.reason() == "Not Found")
     assert(nf.is_client_error())
     assert(match nf.class() { ClientError => true, _ => false })

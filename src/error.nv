@@ -174,7 +174,7 @@ export fn HttpError @to_str() -> str {
         Protocol(m)         => "protocol error: ${m}"
         InvalidUrl          => "invalid url"
         InvalidHeader       => "invalid header"
-        Status(c)           => "unexpected status ${c.as_u16()} ${c.reason()}"
+        Status(c)           => "unexpected status ${c.code()} ${c.reason()}"
         TooManyRedirects(n) => "too many redirects (${n})"
         BodyTooLarge        => "body too large"
         Closed              => "connection closed"

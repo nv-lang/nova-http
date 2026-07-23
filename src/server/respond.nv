@@ -47,39 +47,16 @@ export type IntoResponse protocol {
     consume @into_response() -> ServerResponse
 }
 
-// ── StatusCode-typed constructors (§4 — chinit «статус голым int»: adds a
-// `StatusCode`-accepting overload beside EVERY existing bare-`int` form, D84
-// axis-2 arg-type overload on a concrete namespace-static fn — same class as
-// `Response.new` already having 3-arg/4-arg overloads in message.nv). The
-// bare-`int` forms are NOT removed (migration happens site-by-site, plan §4)
-// but are the ones new call-sites should avoid. ─────────────────────────────
-
-/// `text/plain` response with a typed `StatusCode` (prefer this over the
-/// bare-`int` `ServerResponse.text(int, str)` — DEPRECATED for new call-sites,
-/// kept for source compat until sites migrate, plan 222.5 §4).
-#stable(since = "0.1")
-export fn ServerResponse.text(status StatusCode, s str) -> ServerResponse =>
-    ServerResponse.text(status.as_u16() as int, s)
-
-/// `text/html` response with a typed `StatusCode` (see `.text` note above).
-#stable(since = "0.1")
-export fn ServerResponse.html(status StatusCode, s str) -> ServerResponse =>
-    ServerResponse.html(status.as_u16() as int, s)
-
-/// Raw-bytes response with a typed `StatusCode` (see `.text` note above).
-#stable(since = "0.1")
-export fn ServerResponse.bytes(status StatusCode, content_type str, data []u8) -> ServerResponse =>
-    ServerResponse.bytes(status.as_u16() as int, content_type, data)
-
-/// Bodyless response with a typed `StatusCode` (see `.text` note above).
-#stable(since = "0.1")
-export fn ServerResponse.empty(status StatusCode) -> ServerResponse =>
-    ServerResponse.empty(status.as_u16() as int)
-
-/// Redirect response with a typed `StatusCode` (see `.text` note above).
-#stable(since = "0.1")
-export fn ServerResponse.redirect(status StatusCode, location str) -> ServerResponse =>
-    ServerResponse.redirect(status.as_u16() as int, location)
+// ── StatusCode-typed constructors (§4 — chinit «статус голым int») ─────────
+// MOVED to server.nv (plan 222.5 §4а item 3, unification wave): now that
+// `ServerResponse.status` itself is `StatusCode` (not `int`), the
+// `StatusCode`-typed overloads of `.text`/`.html`/`.bytes`/`.empty`/`.redirect`
+// ARE the canonical constructors declared right next to the struct — no more
+// `.as_u16() as int` delegation cast-bridge into a separate bare-`int` form
+// (`[M-statuscode-u16-cast-bounce]`, CLOSED here). The bare-`int` overloads
+// stay in server.nv too, now DEPRECATED (source-compat bridge over
+// `StatusCode.from_int_unchecked`, ~90 existing call-sites across the package
+// left untouched — soft migration, not a mass site-rewrite this wave).
 
 // ── Json[T] — response body wrapper (double duty, Axum-parity: the SAME type
 // also gets a `#impl(FromRequest)` in extract.nv, Plan 222.3, for the request

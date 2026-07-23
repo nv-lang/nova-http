@@ -42,7 +42,7 @@ test "response: delegating discharge (must-consume body)" {
     ro h = HeaderMap.new()
     consume resp = Response.new(StatusCode.ok(), h, "hi".bytes())
     assert(resp.is_success())
-    assert(resp.status().as_u16() == 200)
+    assert(resp.status().code() == 200)
     assert(resp.text()!! == "hi")
 }
 

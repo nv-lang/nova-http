@@ -20,7 +20,7 @@ test "client: GET round-trip via mock" {
     ro m = mock_http().on("GET", "/hello", MockResponse.new(200).text("world"))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
         ro resp = HttpClient.new().get("http://api.example.com/hello").send()!!
-        assert(resp.status().as_u16() == 200)
+        assert(resp.status().code() == 200)
         assert(resp.text()!! == "world")
     }
 }
@@ -32,7 +32,7 @@ test "client: POST round-trip, 201 + Location" {
             .post("http://ingest.example.com/v1/reports")
             .text("payload")
             .send()!!
-        assert(resp.status().as_u16() == 201)
+        assert(resp.status().code() == 201)
         assert(match resp.header("Location") { Some(l) => l == "/v1/reports/7", None => false })
         assert(match resp.drain() { Ok(_) => true, Err(_) => false })
     }
@@ -45,7 +45,7 @@ test "client: query builder + default headers" {
         b.default_header("Accept", "application/json")
         ro client = b.build()!!
         mut resp = client.get("http://x.example/search").query([("q", "a b&c")]).send()!!
-        assert(resp.status().as_u16() == 200)
+        assert(resp.status().code() == 200)
         assert(match resp.drain() { Ok(_) => true, Err(_) => false })
     }
 }
@@ -69,7 +69,7 @@ test "client: follows 301 redirect (same origin)" {
         .on("GET", "/b", MockResponse.new(200).text("final"))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
         ro resp = HttpClient.new().get("http://x.example/a").send()!!
-        assert(resp.status().as_u16() == 200)
+        assert(resp.status().code() == 200)
         assert(resp.text()!! == "final")
     }
 }
@@ -122,7 +122,7 @@ test "client: 404 is a valid Response (not an error)" {
     ro m = mock_http().on("GET", "/missing", MockResponse.new(404).text("nope"))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
         mut resp = HttpClient.new().get("http://x.example/missing").send()!!
-        assert(resp.status().as_u16() == 404)
+        assert(resp.status().code() == 404)
         assert(resp.status().is_client_error())
         assert(match resp.drain() { Ok(_) => true, Err(_) => false })
     }

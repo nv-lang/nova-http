@@ -222,7 +222,7 @@ export type StreamBody value { priv f fn() -> Option[[]u8] }
 /// are on the wire — see `background.nv`'s `BackgroundTasks`, Plan 222.16).
 #stable(since = "0.1")
 export type ServerResponse value {
-    ro status     int
+    ro status     StatusCode
     ro headers    HeaderMap
     body          []u8
     ro stream     Option[StreamBody]
@@ -240,47 +240,87 @@ export type ServerResponse value {
     upgrade       Option[fn(TcpStream) Net -> ()]
 }
 
+// ── Status constructors: StatusCode-typed = canonical, bare-`int` =
+// DEPRECATED soft-migration bridge (plan 222.5 §4а item 3, unification —
+// `ServerResponse.status` field is `StatusCode`, not `int`; the former
+// respond.nv `.as_u16() as int` delegation is gone — these ARE the
+// implementation now). The `int` overloads are NOT removed: ~90 existing
+// call-sites across the package (`server_router.nv`, `static.nv`,
+// `servernet/policy.nv`, middleware, tests, …) pass bare literals and stay
+// unmigrated this wave — `StatusCode.from_int_unchecked` preserves their
+// exact prior behaviour (no validation, same as before this unification). ──
+
 /// Response with a status code and empty body/headers.
 #stable(since = "0.1")
-export fn ServerResponse.new(status int) -> ServerResponse =>
+export fn ServerResponse.new(status StatusCode) -> ServerResponse =>
     { status, headers: HeaderMap.new(), body: []u8.new(), stream: None, background: None, upgrade: None }
+
+/// `ServerResponse.new` — DEPRECATED bare-`int` form, see the section banner above.
+#stable(since = "0.1")
+export fn ServerResponse.new(status int) -> ServerResponse =>
+    ServerResponse.new(StatusCode.from_int_unchecked(status))
 
 /// `text/plain; charset=utf-8` response.
 #stable(since = "0.1")
-export fn ServerResponse.text(status int, s str) -> ServerResponse {
+export fn ServerResponse.text(status StatusCode, s str) -> ServerResponse {
     mut h = HeaderMap.new()
     ro _ = h.insert("Content-Type", "text/plain; charset=utf-8") // статическое имя — не может отказать
     { status, headers: h, body: s.bytes(), stream: None, background: None, upgrade: None }
 }
 
+/// `ServerResponse.text` — DEPRECATED bare-`int` form, see the section banner above.
+#stable(since = "0.1")
+export fn ServerResponse.text(status int, s str) -> ServerResponse =>
+    ServerResponse.text(StatusCode.from_int_unchecked(status), s)
+
 /// `text/html; charset=utf-8` response.
 #stable(since = "0.1")
-export fn ServerResponse.html(status int, s str) -> ServerResponse {
+export fn ServerResponse.html(status StatusCode, s str) -> ServerResponse {
     mut h = HeaderMap.new()
     ro _ = h.insert("Content-Type", "text/html; charset=utf-8") // статическое имя — не может отказать
     { status, headers: h, body: s.bytes(), stream: None, background: None, upgrade: None }
 }
 
+/// `ServerResponse.html` — DEPRECATED bare-`int` form, see the section banner above.
+#stable(since = "0.1")
+export fn ServerResponse.html(status int, s str) -> ServerResponse =>
+    ServerResponse.html(StatusCode.from_int_unchecked(status), s)
+
 /// Raw-bytes response with an explicit Content-Type.
 #stable(since = "0.1")
-export fn ServerResponse.bytes(status int, content_type str, data []u8) -> ServerResponse {
+export fn ServerResponse.bytes(status StatusCode, content_type str, data []u8) -> ServerResponse {
     mut h = HeaderMap.new()
     ro _ = h.insert("Content-Type", content_type) // статическое имя — не может отказать
     { status, headers: h, body: data, stream: None, background: None, upgrade: None }
 }
 
+/// `ServerResponse.bytes` — DEPRECATED bare-`int` form, see the section banner above.
+#stable(since = "0.1")
+export fn ServerResponse.bytes(status int, content_type str, data []u8) -> ServerResponse =>
+    ServerResponse.bytes(StatusCode.from_int_unchecked(status), content_type, data)
+
 /// Bodyless response (204/304/…).
 #stable(since = "0.1")
-export fn ServerResponse.empty(status int) -> ServerResponse =>
+export fn ServerResponse.empty(status StatusCode) -> ServerResponse =>
     { status, headers: HeaderMap.new(), body: []u8.new(), stream: None, background: None, upgrade: None }
+
+/// `ServerResponse.empty` — DEPRECATED bare-`int` form, see the section banner above.
+#stable(since = "0.1")
+export fn ServerResponse.empty(status int) -> ServerResponse =>
+    ServerResponse.empty(StatusCode.from_int_unchecked(status))
 
 /// Redirect response (`Location: location`).
 #stable(since = "0.1")
-export fn ServerResponse.redirect(status int, location str) -> ServerResponse {
+export fn ServerResponse.redirect(status StatusCode, location str) -> ServerResponse {
     mut h = HeaderMap.new()
     ro _ = h.insert("Location", location) // статическое имя — не может отказать
     { status, headers: h, body: []u8.new(), stream: None, background: None, upgrade: None }
 }
+
+/// `ServerResponse.redirect` — DEPRECATED bare-`int` form, see the section banner above.
+#stable(since = "0.1")
+export fn ServerResponse.redirect(status int, location str) -> ServerResponse =>
+    ServerResponse.redirect(StatusCode.from_int_unchecked(status), location)
 
 // ── Streamed response body ([M-178-server-streaming]) ─────────────────────────
 //
@@ -329,8 +369,13 @@ export fn StreamBody.from_chunks(chunks [][]u8) -> StreamBody {
 /// length isn't known ahead of time; `ServerResponse.sse` below is the
 /// `text/event-stream` specialisation. `[M-178-server-streaming]`
 #stable(since = "0.1")
-export fn ServerResponse.stream(status int, headers HeaderMap, producer StreamBody) -> ServerResponse =>
+export fn ServerResponse.stream(status StatusCode, headers HeaderMap, producer StreamBody) -> ServerResponse =>
     { status, headers, body: []u8.new(), stream: Some(producer), background: None, upgrade: None }
+
+/// `ServerResponse.stream` — DEPRECATED bare-`int` form (see `.text`'s section banner above).
+#stable(since = "0.1")
+export fn ServerResponse.stream(status int, headers HeaderMap, producer StreamBody) -> ServerResponse =>
+    ServerResponse.stream(StatusCode.from_int_unchecked(status), headers, producer)
 
 /// `text/event-stream` (SSE) response — sets the standard no-cache headers and
 /// streams `producer`'s chunks as the raw SSE wire bytes (format each chunk
@@ -341,7 +386,7 @@ export fn ServerResponse.sse(producer StreamBody) -> ServerResponse {
     ro _ = h.insert("Content-Type", "text/event-stream; charset=utf-8") // статическое имя — не может отказать
     ro _ = h.insert("Cache-Control", "no-cache")
     ro _ = h.insert("X-Accel-Buffering", "no")
-    { status: 200, headers: h, body: []u8.new(), stream: Some(producer), background: None, upgrade: None }
+    { status: StatusCode.ok(), headers: h, body: []u8.new(), stream: Some(producer), background: None, upgrade: None }
 }
 
 /// Whether this response streams its body via a chunk producer (vs. a fixed
@@ -433,9 +478,16 @@ export fn ServerResponse mut @body(data []u8) -> @ {
     @body = data
 }
 
-/// Status code (borrow).
+/// Typed status (borrow). Mirrors client-side `Response @status()` (message.nv)
+/// — plan 222.5 §4а item 3 unification.
 #stable(since = "0.1")
-export fn ServerResponse @status_code() -> int => @status
+export fn ServerResponse @status() -> StatusCode => @status
+
+/// Status code as a raw `int` (borrow). Kept alongside `@status()` above —
+/// existing call-sites compare against bare int literals (`resp.status_code()
+/// == 200`); unchanged return type, now bridges from the typed field.
+#stable(since = "0.1")
+export fn ServerResponse @status_code() -> int => @status.code()
 
 // ── Handler (newtype over the fn type — Go HandlerFunc, D52/D55) ──────────────
 

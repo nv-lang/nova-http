@@ -75,7 +75,8 @@ export fn HeaderValue.from(s str) -> Result[HeaderValue, HttpError] { // [M-lint
 export fn HeaderValue @bytes() -> []u8 => @bytes
 
 /// Декодировать в `str`. non-ASCII/obs-text → `InvalidHeader` (fallible; для
-/// произвольных октетов бери `@as_bytes`).
+/// произвольных октетов бери `@bytes()` выше — стейл-имя `@as_bytes`
+/// поправлено, метода с таким именем в пакете никогда не было).
 #stable(since = "0.1")
 export fn HeaderValue @to_str() -> Result[str, HttpError] {
     for byte in @bytes {

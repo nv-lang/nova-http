@@ -79,7 +79,7 @@ fn MockResponse @to_wire() -> str {
     match @raw {
         Some(w) => w
         None    => {
-            ro sc = match StatusCode.new(@status as u16) {
+            ro sc = match StatusCode.new(@status) {
                 Ok(c)  => c
                 Err(_) => StatusCode.ok()
             }

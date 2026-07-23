@@ -83,7 +83,7 @@ fn serialize_response(status StatusCode, headers HeaderMap, body []u8) -> str {
     mut buf = WriteBuffer.new()
     buf.cap(128 + body.len())
     buf.write_str("HTTP/1.1 ")
-    buf.write_str((status.as_u16() as int).to_str())
+    buf.write_str(status.code().to_str())
     buf.write_str(" ")
     buf.write_str(status.reason())
     buf.write_str("\r\n")
@@ -258,7 +258,7 @@ fn parse_status_line(line []u8) -> Result[(Version, StatusCode), HttpError] {
         }
         code = code * 10 + (d - 0x30)
     }
-    ro status = StatusCode.new(code as u16)?
+    ro status = StatusCode.new(code)?
     Ok((version, status))
 }
 
