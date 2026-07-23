@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// [M-178-server-policy-surface] (owner decision 2026-07-22) — pure/unit
+// coverage of `policy.nv`'s byte-level helpers + `config.nv`'s
+// `ServerPolicy` builders. No Net/sockets needed (these are all pure
+// functions over raw bytes/ints/bools) — same-module private-fn access
+// (module `http.servernet`, matching `server/server_test.nv`'s own
+// same-module private-fn-test precedent).
+//
+// Live-socket coverage (keep-alive, body-cap → 413, chunked decode,
+// header-deadline → 408, admission control → 503) is in
+// `rt/serve_policy_smoke.nv` instead.
+//
+// Verification status (see the task report): `nova check` on this file is
+// clean. `nova test` could NOT be run to a PASS on this package at all
+// during this pass — confirmed PRE-EXISTING, independent of this work
+// (reproduced on the unmodified `nova-http` checkout too): the current
+// `nova-http` package is out of sync with the current main-repo compiler
+// (`E_STR_CONCAT_PLUS` in `server/mux_test.nv`, `E_CONSUME_KEYWORD_MISSING`
+// in `servernet/rt/handle_connection_smoke.nv` — both pre-date this branch).
+// A second, narrower, ALSO-confirmed defect
+// (`[M-nv-duration-record-field-debug-bytes-missing]`, isolated minimal
+// repro in the task report) additionally blocks any full build touching a
+// value/heap record with a `Duration` field — which `ServerPolicy` needs for
+// its deadline knobs. Both are compiler/std-level, outside this package's
+// remit to fix in-place.
+
+module http.servernet
+
+// ── ServerPolicy defaults + builders ──────────────────────────────────────
+
+test "ServerPolicy.new(): documented defaults" {
+    ro p = ServerPolicy.new()
+    assert(p.max_inflight() == 16)
+    assert(p.reject_with_503() == true)
+    assert(p.max_requests_per_conn() == 100)
+    assert(p.max_body_bytes() == 1048576)
+}
+
+test "ServerPolicy: mut @x(v) -> @ setters mutate in place, chain" {
+    mut p = ServerPolicy.new()
+    p.max_inflight(4)
+    p.reject_with_503(false)
+    p.max_requests_per_conn(10)
+    p.max_body_bytes(2048)
+    assert(p.max_inflight() == 4)
+    assert(p.reject_with_503() == false)
+    assert(p.max_requests_per_conn() == 10)
+    assert(p.max_body_bytes() == 2048)
+}
+
+// ── should_keep_alive ──────────────────────────────────────────────────────
+
+test "should_keep_alive: HTTP/1.1 default is keep-alive, no header" {
+    assert(should_keep_alive(false, None, 1, 100) == true)
+}
+
+test "should_keep_alive: HTTP/1.0 default is close, no header" {
+    assert(should_keep_alive(true, None, 1, 100) == false)
+}
+
+test "should_keep_alive: client Connection: close wins over HTTP/1.1 default" {
+    assert(should_keep_alive(false, Some("close"), 1, 100) == false)
+}
+
+test "should_keep_alive: client Connection: keep-alive wins over HTTP/1.0 default" {
+    assert(should_keep_alive(true, Some("keep-alive"), 1, 100) == true)
+}
+
+test "should_keep_alive: max_requests_per_conn forces close regardless of header" {
+    assert(should_keep_alive(false, Some("keep-alive"), 100, 100) == false)
+    assert(should_keep_alive(false, Some("keep-alive"), 101, 100) == false)
+    assert(should_keep_alive(false, Some("keep-alive"), 99, 100) == true)
+}
+
+// ── header inspection (is_chunked / expects_100_continue / connection_header_value / is_http10) ──
+
+fn raw(head str) -> ([]u8, int) {
+    ro full = "${head}\r\n\r\n".bytes()
+    (full, full.len() - 4)
+}
+
+test "is_chunked: true only when Transfer-Encoding: chunked is present" {
+    ro (b1, e1) = raw("POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked")
+    assert(is_chunked(b1, e1) == true)
+    ro (b2, e2) = raw("POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5")
+    assert(is_chunked(b2, e2) == false)
+}
+
+test "expects_100_continue: true only when Expect: 100-continue is present" {
+    ro (b1, e1) = raw("POST /x HTTP/1.1\r\nHost: h\r\nExpect: 100-continue")
+    assert(expects_100_continue(b1, e1) == true)
+    ro (b2, e2) = raw("POST /x HTTP/1.1\r\nHost: h")
+    assert(expects_100_continue(b2, e2) == false)
+}
+
+test "connection_header_value: Some(lowercased value) or None" {
+    ro (b1, e1) = raw("GET /x HTTP/1.1\r\nHost: h\r\nConnection: Close")
+    assert((connection_header_value(b1, e1) ?? "").contains("close"))
+    ro (b2, e2) = raw("GET /x HTTP/1.1\r\nHost: h")
+    assert(connection_header_value(b2, e2) == None)
+}
+
+test "is_http10: true for HTTP/1.0 request line, false for HTTP/1.1" {
+    ro (b1, e1) = raw("GET /x HTTP/1.0\r\nHost: h")
+    assert(is_http10(b1, e1) == true)
+    ro (b2, e2) = raw("GET /x HTTP/1.1\r\nHost: h")
+    assert(is_http10(b2, e2) == false)
+}
+
+// ── parse_chunk_size_line ─────────────────────────────────────────────────
+
+test "parse_chunk_size_line: hex sizes, chunk-ext ignored, empty -> None" {
+    assert(parse_chunk_size_line("5".bytes()) == Some(5))
+    assert(parse_chunk_size_line("a".bytes()) == Some(10))
+    assert(parse_chunk_size_line("ff".bytes()) == Some(255))
+    assert(parse_chunk_size_line("ff;foo=bar".bytes()) == Some(255))
+    assert(parse_chunk_size_line("".bytes()) == None)
+}
+
+// ── rebuild_framed_request (chunked -> identity-framed splice) ───────────
+
+test "rebuild_framed_request: chunked strips Transfer-Encoding, injects honest Content-Length" {
+    ro (b, e) = raw("POST /echo HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked")
+    ro body = "hello".bytes()
+    ro out = rebuild_framed_request(b, e, body, true)
+    ro s = unsafe { out.to_str_unchecked() }
+    assert(!s.contains("Transfer-Encoding"))
+    assert(s.contains("Content-Length: 5"))
+    assert(s.contains("hello"))
+    // Must be parseable by the UNCHANGED http.server parser (route_once) —
+    // exercised end-to-end in rt/serve_policy_smoke.nv's chunked test;
+    // here we only check the byte-level splice shape itself.
+}
+
+test "rebuild_framed_request: identity path is byte-identical passthrough" {
+    ro (b, e) = raw("POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 5")
+    ro body = "hello".bytes()
+    ro out = rebuild_framed_request(b, e, body, false)
+    ro s = unsafe { out.to_str_unchecked() }
+    assert(s.contains("Content-Length: 5"))
+    assert(s.contains("hello"))
+}

@@ -1,0 +1,238 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: serve.nv — the reusable library accept-loop + persistent
+// (keep-alive) per-connection driver `[M-178-server-policy-surface]`
+// (owner decision 2026-07-22: закрыть сейчас).
+//
+// This is the "serve(listener, handler)" the file-header of `servernet.nv`
+// itself flagged as missing (the flagship aggregator's own `main.nv` hand-
+// rolls its accept loop today for exactly that reason — see that file's
+// own `[M-187-nested-spawn-scope-var-cc-fail]`/
+// `[M-187-high-concurrency-connection-wedge]` notes, which this module
+// reuses the PROVEN shapes from: one `spawn` owns bind + the whole accept
+// loop, `detach consume stream { ... }` per accepted connection, a
+// `Semaphore` admission gate). `handle_connection` (`servernet.nv`,
+// single-shot `Connection: close`) is UNCHANGED — this is a new, additive
+// entry point; existing callers (the flagship aggregator, this package's
+// own `rt/*_smoke.nv` tests) keep working exactly as before.
+//
+// Deliverable 1 (accept-loop hardening): `serve()`'s own `Err(_) => { ...
+// back off; keep looping ... }` arm is the direct fix for the documented bug
+// (`main.nv`'s current `Err(_) => { running = false }` — a transient accept
+// error kills the WHOLE server). Admission control is the same shape as the
+// aggregator's own mitigation (`[M-187-high-concurrency-connection-wedge]`)
+// generalized into this package as a policy KNOB (`ServerPolicy.
+// max_inflight`/`reject_with_503`) instead of a hardcoded app-level constant.
+//
+// ADMISSION GATE = `Semaphore.try_acquire_permit() -> Option[Permit]` (owner
+// decision 2026-07-23, migrated same-day once the primitive landed —
+// `std/runtime/sync.nv`'s own doc-comment names "connection pool capacity"
+// as `Semaphore`'s canonical use case). WHY NOT a bare `AtomicInt` counter:
+// a handler panic unwinds the connection-handling fiber via `longjmp` — a
+// bare `ro _ = inflight.fetch_sub(1)` statement placed AFTER the panicking
+// call is simply never reached (longjmp jumps PAST it, no unwind-time hook
+// fires for an ordinary sequential statement) — the admission slot leaks
+// forever. `Some(consume p) => { consume p { ... } }` fixes this properly:
+// `p` (the `Permit`) lives in the CONNECTION's own scope and its `@cleanup`
+// fires on scope-exit — success, error, OR panic (D432) — releasing the
+// slot every time, no `defer`/bare-`release()` pairing needed at all
+// (superseding this file's EARLIER `defer sem.release()`-based attempt,
+// which itself had to route around a SEPARATE codegen defect — see
+// `release_after`'s own git-history note, now removed along with it).
+// `try_acquire_permit()` itself is non-blocking (`None` immediately on
+// exhaustion, per its own doc-comment "designed for admission control:
+// take slot or reject immediately") — exactly the non-parking semantics
+// admission needs; no `try_acquire() -> bool` + manual `release()` pairing
+// anymore.
+//
+// LAYER CONTRACT (Plan 222 §0а, refit 2026-07-23): same as `servernet.nv`'s
+// own note — `serve`/`serve_connection` take a byte-level callback
+// (`fn([]u8) -> ServerResponse`), NOT a `Router` — this module never imports
+// `Router`/`route_once` (layer 2). `server/server_serve.nv`'s `serve_router`
+// is the `Router`-taking convenience wrapper.
+
+module http.servernet
+
+import std.net.{TcpListener, TcpStream, NetError}
+import std.runtime.sync.{Semaphore}
+import std.time.duration
+import ../server.{ServerResponse, serialize_response}
+import ../server.{serialize_response_head, encode_chunk, encode_chunk_end}
+
+// ── Non-consuming response write (keep-alive: the stream survives to serve
+//    the NEXT request on success) — mirrors `handle_connection`'s own
+//    fixed/streaming split (`write_streaming`/`write_stream_chunks`), but
+//    those two take `consume` and unconditionally `@close()` the stream
+//    (correct for the single-shot handler, wrong here). ────────────────────
+
+fn write_response_keepalive(s mut TcpStream, resp ServerResponse) Net -> Result[(), NetError] {
+    if resp.is_streaming() {
+        write_streaming_keepalive(s, resp)
+    } else {
+        s.write_all(serialize_response(resp))
+    }
+}
+
+fn write_streaming_keepalive(s mut TcpStream, resp ServerResponse) Net -> Result[(), NetError] {
+    match s.write_all(serialize_response_head(resp)) {
+        Ok(_)  => write_stream_chunks_keepalive(s, resp)
+        Err(e) => Err(e)
+    }
+}
+
+fn write_stream_chunks_keepalive(s mut TcpStream, resp ServerResponse) Net -> Result[(), NetError] {
+    match resp.take_stream() {
+        None => Ok(())   // unreachable: caller checked @is_streaming()
+        Some(sb) => {
+            mut producer = sb
+            mut running = true
+            mut result Result[(), NetError] = Ok(())
+            while running {
+                match producer.next_chunk() {
+                    Some(chunk) => {
+                        match s.write_all(encode_chunk(chunk)) {
+                            Ok(_)  => ()
+                            Err(e) => { result = Err(e); running = false }
+                        }
+                    }
+                    None => {
+                        match s.write_all(encode_chunk_end()) {
+                            Ok(_)  => ()
+                            Err(e) => { result = Err(e) }
+                        }
+                        running = false
+                    }
+                }
+            }
+            result
+        }
+    }
+}
+
+// ── serve_connection: persistent (keep-alive) per-connection driver ───────
+//
+// Replaces `handle_connection`'s single-shot "read one, respond, close"
+// with a loop: read a GOVERNED request (`read_one_request`, `policy.nv` —
+// deadlines/body-cap/chunked-decode already applied), dispatch it through
+// `handler` (byte-level callback — see this file's own layer-contract note;
+// `server/server_serve.nv`'s `serve_router` is the `Router`-taking
+// convenience wrapper most callers actually want), force the wire
+// `Connection` header to match the keep-alive decision (the pure-core
+// serializer defaults to `close` whenever the response doesn't already set
+// one — `server/wire.nv` `serialize_response`/`serialize_response_head` —
+// so an explicit override here is what actually MAKES keep-alive happen on
+// the wire, no server.nv change needed), write it, and loop again if both
+// sides agreed to continue. `served_count` is the loop's own counter
+// (starts at 0, passed to `read_one_request` so `should_keep_alive` can
+// enforce `max_requests_per_conn`).
+#stable(since = "0.1")
+export fn serve_connection(consume stream TcpStream, handler fn([]u8) -> ServerResponse, policy ServerPolicy) Net Time -> Result[(), NetError] {
+    consume s = stream
+    mut served_count = 0
+    mut keep_going = true
+    mut final_result Result[(), NetError] = Ok(())
+    while keep_going {
+        match read_one_request(s, policy, served_count) {
+            Ready(raw, keep_alive) => {
+                served_count += 1
+                mut resp = handler(raw)
+                resp.header("Connection", if keep_alive { "keep-alive" } else { "close" })
+                match write_response_keepalive(s, resp) {
+                    Ok(_)  => { keep_going = keep_alive }
+                    Err(e) => { keep_going = false; final_result = Err(e) }
+                }
+            }
+            EarlyResponse(resp0) => {
+                mut resp = resp0
+                resp.header("Connection", "close")
+                ro _ = write_response_keepalive(s, resp)
+                keep_going = false
+            }
+            ConnectionDone => {
+                keep_going = false
+            }
+        }
+    }
+    s.close()
+    final_result
+}
+
+// ── serve: the reusable library accept loop ────────────────────────────────
+//
+// Shape mirrors the flagship aggregator's own `main()` accept loop (proven
+// against two documented codegen/runtime failure modes — see this file's
+// own header): exactly ONE `spawn` holds bind + the whole loop; each
+// accepted connection is handed to `detach consume stream { ... }`
+// (bounded-concurrent, not sequential); a `Semaphore.try_acquire_permit()`
+// (see this file's own header — panic-safe via the returned `Permit`'s own
+// `@cleanup`, NOT a bare counter) is the admission gate. Two hardening
+// fixes over that hand-rolled original (deliverable 1):
+//   - `Err(_)` from `accept()` no longer kills the loop — it backs off
+//     briefly and continues (a transient accept error, e.g. the OS FD table
+//     momentarily full, should not take the whole server down);
+//   - the admission-reject path now optionally answers with a real `503`
+//     (`policy.reject_with_503()`) instead of always just closing — a
+//     friendlier, retry-safe signal to a well-behaved client.
+//
+// The admission CHECK (`inflight.try_acquire_permit()`) runs INSIDE the
+// `detach { }` body, not before it — `detach consume c { ... }` only names
+// ONE explicit linear capture (D415 §4: "requires a block body — the
+// orphan fiber owns `c`"; no multi-name form, confirmed empirically), and
+// BOTH `stream` (`TcpStream consume`) and the `Permit` a successful
+// admission produces are linear values that need to cross into the SAME
+// orphan fiber. Obtaining the `Permit` fresh INSIDE the already-`detach`ed
+// body (rather than in the outer accept loop, then somehow moving TWO
+// linear values across the fiber boundary at once) sidesteps that
+// single-capture limit entirely — `p` never crosses a fiber boundary, it is
+// created and consumed by the SAME fiber throughout. Functionally
+// equivalent to a pre-detach check (same accept/reject responses over the
+// wire); the only difference is a rejected connection's own tiny `detach`
+// still gets spawned before it rejects — negligible cost for a bool check
+// + immediate close, not the "unbounded nested work" class of concern
+// `[M-187-high-concurrency-connection-wedge]` was actually about.
+#stable(since = "0.1")
+export fn serve(consume listener TcpListener, handler fn([]u8) -> ServerResponse, policy ServerPolicy) Net Time Detach {
+    consume lst = listener
+    // [M-nv-spawn-ctx-capture-mut-param-ptr-mismatch]: CLOSED (ОКНО-1,
+    // 2026-07-23, nova main f83d3d87f) — the residual variant this file
+    // used to route around (capturing a bare VALUE-type PARAMETER into a
+    // `detach { ... }` ctx after an earlier `ro`-receiver method call on it,
+    // e.g. `policy.max_inflight()` below) is fixed; `policy`/`handler`
+    // capture straight into `detach { }` with no local-rebind indirection
+    // needed anymore (confirmed by this file's own `nova test` run — see
+    // task report for the pass count).
+    mut inflight = Semaphore.new(policy.max_inflight())
+    mut running = true
+    while running {
+        match lst.accept() {
+            Ok(consume stream) => {
+                detach consume stream {
+                    match inflight.try_acquire_permit() {
+                        Some(consume p) => {
+                            // `p` lives in THIS connection's own scope —
+                            // `@cleanup` (D432) releases the slot on scope
+                            // exit, success OR panic, no defer/bare-release
+                            // pairing needed.
+                            consume p {
+                                ro _ = serve_connection(stream, handler, policy)
+                            }
+                        }
+                        None => {
+                            if policy.reject_with_503() {
+                                ro _ = stream.write_all("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".bytes())
+                            }
+                            stream.close()
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // Deliverable 1: transient accept error — back off briefly,
+                // KEEP LOOPING (do not exit). Mirrors the fixed-interval
+                // retry shape already proven in this codebase's own
+                // reconnect/backoff call sites; no unbounded busy-loop.
+                (20).to_millis().sleep()
+            }
+        }
+    }
+    lst.close()
+}

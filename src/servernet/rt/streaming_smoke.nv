@@ -15,7 +15,7 @@ module rt.streaming_smoke
 
 import std.net.{TcpListener, TcpStream, SocketAddr, real_net}
 import ../../server.{Router, ServerResponse, StreamBody, sse_event}
-import ../../servernet.{handle_connection}
+import ../../serve.{handle_connection_router}
 
 fn routes() -> Router {
     mut r = Router.new()
@@ -47,7 +47,7 @@ test "servernet: live SSE streaming round-trip over loopback" {
                 match lst.accept() {
                     Ok(consume srv) => {
                         consume s = srv
-                        match handle_connection(s, routes()) {
+                        match handle_connection_router(s, routes()) {
                             Ok(_)  => { ok_tx.try_send(true) }
                             Err(_) => ()
                         }

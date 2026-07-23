@@ -1,0 +1,451 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: policy.nv — governed request reading for `serve_connection`
+// (`serve.nv`): header/read/idle deadlines over `supervised(deadline:)`,
+// a request body-size cap (→ 413), chunked-request decode + `Expect:
+// 100-continue`, and the keep-alive-vs-close decision.
+// `[M-178-server-policy-surface]` (owner decision 2026-07-22).
+//
+// Byte-level helpers here intentionally DUPLICATE (not import — they are
+// module-private in `http.server`, a different module, so not reachable)
+// small pieces of `server/wire.nv`'s own CRLF/chunk-size scanning; they
+// reuse `servernet.nv`'s own private `dcrlf`/`content_length_of` directly
+// (same module, no import needed — same-module co-equal-file visibility,
+// same as `server.nv`/`wire.nv`'s own `parse_request` split).
+//
+// Scope note (explicit, not a marker — a deliberate simplification, not a
+// defect): HTTP/1.1 pipelining (a client sending a SECOND request before
+// reading the first response) is NOT supported by this hardening pass —
+// any bytes read past the end of the CURRENT request's frame (identity
+// Content-Length body OR the chunked terminator) are discarded, not carried
+// over to the next `read_one_request` call. Every mainstream HTTP/1.1
+// client (browsers, curl, most libraries) does not pipeline by default, so
+// this is a pragmatic bound on scope, not a correctness gap for the
+// overwhelming majority of real clients; a pipelining client sees its
+// later, already-sent bytes silently dropped (next read starts a fresh
+// socket read) rather than a served response — no established test in this
+// package's suite exercises pipelining, and the owner's 8-point brief for
+// this pass does not ask for it.
+
+module http.servernet
+
+import std.net.{TcpStream}
+import std.time.duration
+import ../server.{ServerResponse}
+
+// ── Single deadline-guarded read (deliverable 3 primitive) ────────────────
+//
+// One `read_to_vec` call raced against an ABSOLUTE `Monotonic` deadline via
+// a REAL `supervised(deadline:)` scope — the exact shape `examples/flagship/
+// aggregator/src/app/aggregate.nv`'s `fetch_guarded` already proves for
+// racing a `Net` op against a shared deadline, and `std/net/tcp_share_test.nv`
+// proves for a per-fiber `share()`-copy's auto-cleanup. `s.share()` inline
+// as the `spawn consume` initializer (mirrors that test's `spawn consume w1
+// = c.share() { ... }`) hands the CHILD fiber its own rc-counted alias for
+// exactly this one read; the fiber's own `Cleanup` impl (`TcpStream consume
+// @cleanup`) closes that share when the child exits (deadline-cancelled OR
+// finished normally) — the ORIGINAL `s` in the caller is untouched either
+// way (still open, rc decremented back down), so the same `s` can be reused
+// for the NEXT `read_attempt` (next header chunk, or the next request on a
+// keep-alive connection).
+type ReadAttempt enum
+    | Bytes([]u8)
+    | TimedOut
+    | Errored
+
+fn read_attempt(s mut TcpStream, deadline Monotonic) Net Time -> ReadAttempt {
+    ro (tx, rx) = Channel.new(1)
+    mut timed_out = false
+    with Fail[TimeoutError] = |_e| { timed_out = true } {
+        supervised(deadline: deadline) {
+            spawn consume ws = s.share() {
+                match ws.read_to_vec(65536) {
+                    Ok(chunk) => { ro _ = tx.try_send(chunk) }
+                    Err(_)    => ()
+                }
+            }
+        }
+    }
+    if timed_out {
+        ReadAttempt.TimedOut
+    } else {
+        match rx.try_recv() {
+            Some(chunk) => ReadAttempt.Bytes(chunk)
+            None        => ReadAttempt.Errored
+        }
+    }
+}
+
+// ── Header-block phase: idle-deadline (waiting for the first byte) THEN a
+//    fresh header-deadline (completing the block once it has started) ────
+
+// Variant named `Complete` (not `Ready`) — deliberately distinct from
+// `GovernedRead.Ready` below: after hitting one same-CU bare-name collision
+// already during this pass (`config.nv`'s own header note), enum-variant
+// names across sibling types in this module are kept distinct on purpose
+// rather than relying on match/construction being scoped correctly.
+type HeaderPhase enum
+    | Complete([]u8, int) // accumulated bytes, index of the CRLFCRLF terminator
+    | IdleTimeout          // no byte ever arrived — quiet close, not an error
+    | HeaderTimeout        // slowloris: some bytes arrived, block never completed
+    | Broken               // EOF/error mid-header — quiet close
+
+fn read_header_phase(s mut TcpStream, policy ServerPolicy) Net Time -> HeaderPhase {
+    ro idle_dl = Monotonic.now() + policy.idle_deadline()
+    mut acc []u8 = []u8.new()
+    mut header_end = -1
+    mut header_dl_set = false
+    mut header_dl Monotonic = idle_dl
+    mut reading = true
+    mut outcome_idle_timeout = false
+    mut outcome_header_timeout = false
+    while reading && header_end < 0 {
+        ro dl = if header_dl_set { header_dl } else { idle_dl }
+        match read_attempt(s, dl) {
+            Bytes(chunk) => {
+                if chunk.len() == 0 {
+                    reading = false
+                } else {
+                    acc.append(chunk)
+                    header_end = dcrlf(acc)
+                    if !header_dl_set {
+                        header_dl_set = true
+                        header_dl = Monotonic.now() + policy.header_deadline()
+                    }
+                }
+            }
+            TimedOut => {
+                reading = false
+                if header_dl_set { outcome_header_timeout = true } else { outcome_idle_timeout = true }
+            }
+            Errored => {
+                reading = false
+            }
+        }
+    }
+    if header_end >= 0 {
+        HeaderPhase.Complete(acc, header_end)
+    } else if outcome_header_timeout {
+        HeaderPhase.HeaderTimeout
+    } else if outcome_idle_timeout {
+        HeaderPhase.IdleTimeout
+    } else {
+        HeaderPhase.Broken
+    }
+}
+
+// ── Body phase: identity (Content-Length) or chunked, size-capped ────────
+
+type BodyPhase enum
+    | Body([]u8)
+    | TooLarge
+    | TimedOut
+    | Malformed
+
+fn read_body_identity(s mut TcpStream, need int, already []u8, deadline Monotonic) Net Time -> BodyPhase {
+    mut acc = already
+    mut reading = acc.len() < need
+    mut timed_out = false
+    mut broken = false
+    while reading {
+        match read_attempt(s, deadline) {
+            Bytes(chunk) => {
+                if chunk.len() == 0 { reading = false; broken = acc.len() < need }
+                else { acc.append(chunk); reading = acc.len() < need }
+            }
+            TimedOut => { reading = false; timed_out = true }
+            Errored  => { reading = false; broken = true }
+        }
+    }
+    if timed_out { BodyPhase.TimedOut }
+    else if broken { BodyPhase.Malformed }
+    else { BodyPhase.Body(acc[0..need]) }
+}
+
+fn read_body_chunked(s mut TcpStream, already []u8, max_bytes int, deadline Monotonic) Net Time -> BodyPhase {
+    mut buf = already
+    mut out = WriteBuffer.new()
+    mut pos = 0
+    mut decoded_len = 0
+    mut done = false
+    mut timed_out = false
+    mut broken = false
+    mut too_large = false
+    while !done && !timed_out && !broken && !too_large {
+        match find_crlf_from(buf, pos) {
+            Some(eol) => {
+                match parse_chunk_size_line(buf[pos..eol]) {
+                    Some(size) => {
+                        ro data_start = eol + 2
+                        ro data_end = data_start + size
+                        if size == 0 {
+                            done = true   // last-chunk; trailers (if any) ignored (CORE, matches client.wire's own decoder)
+                        } else if buf.len() >= data_end + 2 {
+                            out.write_bytes(buf[data_start..data_end])
+                            decoded_len = decoded_len + size
+                            if decoded_len > max_bytes {
+                                too_large = true
+                            } else {
+                                pos = data_end + 2
+                            }
+                        } else {
+                            match read_attempt(s, deadline) {
+                                Bytes(chunk) => { if chunk.len() == 0 { broken = true } else { buf.append(chunk) } }
+                                TimedOut => { timed_out = true }
+                                Errored  => { broken = true }
+                            }
+                        }
+                    }
+                    None => { broken = true }
+                }
+            }
+            None => {
+                match read_attempt(s, deadline) {
+                    Bytes(chunk) => { if chunk.len() == 0 { broken = true } else { buf.append(chunk) } }
+                    TimedOut => { timed_out = true }
+                    Errored  => { broken = true }
+                }
+            }
+        }
+    }
+    if too_large { BodyPhase.TooLarge }
+    else if timed_out { BodyPhase.TimedOut }
+    else if broken { BodyPhase.Malformed }
+    else { BodyPhase.Body(out.into_bytes()) }
+}
+
+// ── Raw-request rebuild: splice the decoded body back behind an honest
+//    Content-Length so the EXISTING (untouched) `http.server` parser
+//    (`route_once`/`parse_request`) can frame it exactly like an identity
+//    request — no `server.nv`/`wire.nv` change needed. For a chunked body
+//    the original `Transfer-Encoding` header line is stripped first:
+//    `HeaderMap.content_length()` HARD-ERRORS (RFC 7230 §3.3.3 smuggling
+//    defence, see `header.nv`) if BOTH headers are present, so leaving the
+//    original line in place would turn every successfully-decoded chunked
+//    request into a spurious 400. ──────────────────────────────────────────
+
+fn rebuild_framed_request(acc []u8, header_end int, body []u8, chunked bool) -> []u8 {
+    mut buf = WriteBuffer.new()
+    if chunked {
+        buf.write_bytes(headers_without_transfer_encoding(acc, header_end))
+        buf.write_str("Content-Length: ")
+        buf.write_str(body.len().to_str())
+        buf.write_str("\r\n\r\n")
+    } else {
+        buf.write_bytes(acc[0..header_end + 4])
+    }
+    buf.write_bytes(body)
+    buf.into_bytes()
+}
+
+// Rewrite the header block (request-line + every header line EXCEPT
+// `Transfer-Encoding`), each terminated by its own `\r\n` — NOT including
+// the final blank-line terminator or a `Content-Length` line; the caller
+// (`rebuild_framed_request`) appends `Content-Length: <n>\r\n\r\n` right
+// after, once it knows the decoded body's length.
+fn headers_without_transfer_encoding(acc []u8, header_end int) -> []u8 {
+    mut buf = WriteBuffer.new()
+    mut i = 0
+    mut first_line = true
+    while i < header_end {
+        ro eol = match find_crlf_bounded(acc, i, header_end) { Some(x) => x, None => header_end }
+        ro line []u8 = acc[i..eol]
+        if first_line {
+            buf.write_bytes(line)
+            buf.write_str("\r\n")
+            first_line = false
+        } else if !starts_with_ci(line, "transfer-encoding") {
+            buf.write_bytes(line)
+            buf.write_str("\r\n")
+        }
+        i = eol + 2
+    }
+    buf.into_bytes()
+}
+
+// ── Header inspection (byte-level, case-insensitive substring probes) ────
+
+fn header_value_contains(head_lower str, name str, needle str) -> bool {
+    match head_lower.find(name) {
+        Some(i) => {
+            ro rest_start = i + name.byte_len()
+            ro rest = head_lower[rest_start..head_lower.byte_len()]
+            ro line_end = match rest.find("\r\n") { Some(j) => j, None => rest.byte_len() }
+            rest[0..line_end].contains(needle)
+        }
+        None => false
+    }
+}
+
+fn lower_head(acc []u8, header_end int) -> str {
+    ro head_bytes []u8 = acc[0..header_end]
+    unsafe { head_bytes.to_str_unchecked() }.to_ascii_lower()
+}
+
+fn is_chunked(acc []u8, header_end int) -> bool =>
+    header_value_contains(lower_head(acc, header_end), "transfer-encoding:", "chunked")
+
+fn expects_100_continue(acc []u8, header_end int) -> bool =>
+    header_value_contains(lower_head(acc, header_end), "expect:", "100-continue")
+
+fn connection_header_value(acc []u8, header_end int) -> Option[str] {
+    ro head = lower_head(acc, header_end)
+    match head.find("connection:") {
+        Some(i) => {
+            ro rest_start = i + 11
+            ro rest = head[rest_start..head.byte_len()]
+            ro line_end = match rest.find("\r\n") { Some(j) => j, None => rest.byte_len() }
+            Some(rest[0..line_end])
+        }
+        None => None
+    }
+}
+
+fn is_http10(acc []u8, header_end int) -> bool {
+    ro head_bytes []u8 = acc[0..header_end]
+    ro head = unsafe { head_bytes.to_str_unchecked() }
+    ro line_end = match head.find("\r\n") { Some(j) => j, None => head.byte_len() }
+    head[0..line_end].contains("HTTP/1.0")
+}
+
+/// Keep-alive decision (deliverable 2): forced close once
+/// `max_requests_per_conn` is hit; else the client's own `Connection`
+/// header wins (`close`/`keep-alive`); else the version default
+/// (HTTP/1.1 keep-alive, HTTP/1.0 close).
+fn should_keep_alive(http10 bool, conn_hdr Option[str], served_count int, max_requests int) -> bool {
+    if served_count >= max_requests {
+        false
+    } else {
+        match conn_hdr {
+            Some(v) => {
+                if v.contains("close") { false }
+                else if v.contains("keep-alive") { true }
+                else { !http10 }
+            }
+            None => !http10
+        }
+    }
+}
+
+// ── byte helpers (private duplicates of server/wire.nv's own scans — see
+//    file header for why they are not imported) ─────────────────────────
+
+fn find_crlf_from(b []u8, from int) -> Option[int] {
+    ro n = b.len()
+    mut i = from
+    while i + 1 < n {
+        if (b[i] as int) == 0x0D && (b[i + 1] as int) == 0x0A { return Some(i) }
+        i += 1
+    }
+    None
+}
+
+// Bounded variant of `find_crlf_from` — never looks at/past `limit` (used to
+// split the HEADER block only, never spilling into body bytes that happen
+// to share the same accumulated buffer).
+fn find_crlf_bounded(b []u8, from int, limit int) -> Option[int] {
+    mut i = from
+    while i + 1 < limit {
+        if (b[i] as int) == 0x0D && (b[i + 1] as int) == 0x0A { return Some(i) }
+        i += 1
+    }
+    None
+}
+
+fn starts_with_ci(line []u8, prefix str) -> bool {
+    ro pb = prefix.bytes()
+    ro pn = pb.len()
+    if line.len() < pn { return false }
+    mut i = 0
+    while i < pn {
+        ro a = to_lower_byte(line[i] as int)
+        ro b = to_lower_byte(pb[i] as int)
+        if a != b { return false }
+        i += 1
+    }
+    true
+}
+
+fn to_lower_byte(c int) -> int {
+    if c >= 0x41 && c <= 0x5A { c + 0x20 } else { c }
+}
+
+// Parse a chunk-size line (hex, optional ";ext" ignored) — mirrors
+// `client/wire.nv`'s private `parse_chunk_size` (not reachable — different
+// module). Empty/no-hex-digit → None.
+fn parse_chunk_size_line(line []u8) -> Option[int] {
+    mut val = 0
+    mut seen = false
+    ro n = line.len()
+    mut i = 0
+    mut stop = false
+    while i < n && !stop {
+        ro c = line[i] as int
+        ro d = hex_digit_val(c)
+        if d >= 0 {
+            val = val * 16 + d
+            seen = true
+            i += 1
+        } else {
+            stop = true   // ';chunk-ext' or trailing junk — stop parsing digits
+        }
+    }
+    if seen { Some(val) } else { None }
+}
+
+fn hex_digit_val(c int) -> int {
+    if c >= 0x30 && c <= 0x39 { c - 0x30 }
+    else if c >= 0x61 && c <= 0x66 { c - 0x61 + 10 }
+    else if c >= 0x41 && c <= 0x46 { c - 0x41 + 10 }
+    else { -1 }
+}
+
+// ── read_one_request: the governed per-request read, combining every
+//    phase above — this is what `serve_connection` (`serve.nv`) calls in
+//    its persistent-connection loop. ────────────────────────────────────
+
+type GovernedRead enum
+    | Ready([]u8, bool)              // raw request bytes ready for route_once, keep_alive decision
+    | EarlyResponse(ServerResponse)  // 413/408/400 — write then close
+    | ConnectionDone                 // quiet close, nothing to write (idle timeout / peer gone)
+
+#stable(since = "0.1")
+export fn read_one_request(s mut TcpStream, policy ServerPolicy, served_count int) Net Time -> GovernedRead {
+    match read_header_phase(s, policy) {
+        IdleTimeout => GovernedRead.ConnectionDone
+        Broken      => GovernedRead.ConnectionDone
+        HeaderTimeout => GovernedRead.EarlyResponse(ServerResponse.text(408, "408 request timeout"))
+        Complete(acc, header_end) => {
+            ro http10 = is_http10(acc, header_end)
+            ro conn_hdr = connection_header_value(acc, header_end)
+            ro keep_alive = should_keep_alive(http10, conn_hdr, served_count + 1, policy.max_requests_per_conn())
+            ro chunked = is_chunked(acc, header_end)
+            ro declared_len = content_length_of(acc, header_end)
+            if !chunked && declared_len > policy.max_body_bytes() {
+                GovernedRead.EarlyResponse(ServerResponse.text(413, "413 payload too large"))
+            } else {
+                if expects_100_continue(acc, header_end) {
+                    ro _ = s.write_all("HTTP/1.1 100 Continue\r\n\r\n".bytes())
+                }
+                ro body_start = header_end + 4
+                ro already []u8 = acc[body_start..acc.len()]
+                ro read_dl = Monotonic.now() + policy.read_deadline()
+                ro outcome = if chunked {
+                    read_body_chunked(s, already, policy.max_body_bytes(), read_dl)
+                } else if declared_len == 0 {
+                    BodyPhase.Body([]u8.new())
+                } else {
+                    read_body_identity(s, declared_len, already, read_dl)
+                }
+                match outcome {
+                    Body(body) => {
+                        ro raw = rebuild_framed_request(acc, header_end, body, chunked)
+                        GovernedRead.Ready(raw, keep_alive)
+                    }
+                    TooLarge => GovernedRead.EarlyResponse(ServerResponse.text(413, "413 payload too large"))
+                    TimedOut => GovernedRead.EarlyResponse(ServerResponse.text(408, "408 request timeout"))
+                    Malformed => GovernedRead.EarlyResponse(ServerResponse.text(400, "400 bad request"))
+                }
+            }
+        }
+    }
+}
