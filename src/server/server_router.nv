@@ -66,7 +66,25 @@ export fn MethodRouter.new() -> MethodRouter => { routes: []MethodEntry.new(), f
 /// router` for the one call site and why an in-out `mut` param doesn't fit
 /// there). Explicit return type (NOT `-> Self` — [M-generic-value-self-
 /// return-transitive-cu-emission], №59).
-fn MethodRouter @clone() -> MethodRouter => { routes: @routes.clone(), @fallback }
+///
+/// Manual for-loop rebuild, NOT `@routes.clone()` (`Vec[MethodEntry]`) —
+/// live codegen gap found via `nova test src`: `Vec[T].@clone()`'s
+/// generated per-element clone dispatch resolved `MethodEntry`'s (no
+/// `@clone()` of its own) element-clone call to `MethodRouter @clone()`
+/// instead (WRONG receiver type — the only other `@clone()` in this same
+/// module/file) — CC-FAIL "passing 'Nova_WriteBuffer *'/'NovaValue_
+/// MethodRouter' to parameter of incompatible type 'NovaValue_MethodEntry'"
+/// (the exact bogus type varies by which CU pulls this code in — always
+/// SOME unrelated same-CU type, never `MethodEntry`). A plain per-element
+/// `for`+`push` sidesteps `Vec.@clone()`'s per-element dispatch entirely —
+/// `MethodEntry`'s two fields (`str`/`Handler`) are cheap value copies,
+/// no per-element clone needed anyway.
+/// `[M-vec-clone-generic-element-clone-wrong-receiver-bleed]`
+fn MethodRouter @clone() -> MethodRouter {
+    mut out = []MethodEntry.new()
+    for e in @routes { out.push(e) }
+    { routes: out, @fallback }
+}
 
 fn MethodRouter mut @add(method str, h Handler) -> @ { @routes.push(MethodEntry{method, handler: h}) }
 
