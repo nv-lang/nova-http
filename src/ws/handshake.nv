@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: ws/handshake.nv — WebSocket opening handshake, RFC 6455 §1.3/§4.
+// Peer of frame.nv in the SAME module (`http.ws`, СЛОЙ 1). Imports
+// `http.server.{ServerRequest}` for `is_upgrade_request` — `ServerRequest`
+// is СЛОЙ 0-1 (222.0 map, 2026-07-23 owner decision), same-or-lower layer,
+// so this import does NOT violate the "СЛОЙ N не импортирует >N" rule
+// (Router/FromRequest — СЛОЙ 2 — are never referenced here).
+
+module http.ws
+
+import http.server.{ServerRequest}
+import std.crypto.sha1.{Sha1}
+import std.encoding.base64.{Base64}
+
+/// RFC 6455 §1.3 fixed GUID — concatenated onto the client's
+/// `Sec-WebSocket-Key` before SHA-1, always this exact literal (not a
+/// secret, not configurable).
+fn ws_guid() -> str => "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+/// Compute `Sec-WebSocket-Accept` from a client's `Sec-WebSocket-Key`
+/// header value (RFC 6455 §1.3/§4.2.2 п.5.4): `base64(SHA1(key + GUID))`.
+/// SHA-1 here is a FIXED RFC transform, not a security boundary (plan §2
+/// note) — validates the key is well-formed base64 decoding to exactly 16
+/// bytes (RFC 6455 §4.1 п.7) before hashing, catching a malformed/absent
+/// key as `BadHandshake` rather than silently hashing garbage.
+#stable(since = "0.1")
+export fn ws_accept_key(client_key str) -> Result[str, WsError] {
+    if client_key.byte_len() == 0 {
+        return Err(WsError.BadHandshake("empty Sec-WebSocket-Key"))
+    }
+    match Base64.decode(client_key) {
+        Ok(decoded) => {
+            if decoded.len() != 16 {
+                return Err(WsError.BadHandshake("Sec-WebSocket-Key must decode to 16 bytes"))
+            }
+        }
+        Err(_) => return Err(WsError.BadHandshake("Sec-WebSocket-Key is not valid base64"))
+    }
+    mut buf = client_key.bytes().clone()
+    buf.append(ws_guid().bytes())
+    ro digest = Sha1.hash(buf)
+    Ok(Base64.encode(digest[0..20]))
+}
+
+/// Quick predicate: is `req` a well-formed WebSocket upgrade request (RFC
+/// 6455 §4.2.1)? Checks method + the four required headers; does NOT
+/// compute the accept key (that's `ws_accept_key`, called by the
+/// `WebSocketUpgrade` extractor once this predicate holds). `[M-http-cors-method-eq-cc-fail]`-style
+/// workaround: compare `@method().str()` (canonical string form), NOT
+/// `@method() == Method.Get` — the latter mis-codegens for the
+/// payload-carrying `Method` enum (`->tag` on a `nova_int`, live bug
+/// documented+worked-around already at `middleware/cors.nv` — same
+/// precedent applied here, not re-diagnosed).
+#stable(since = "0.1")
+export fn is_upgrade_request(req ServerRequest) -> bool {
+    if req.method().str() != "GET" {
+        return false
+    }
+    ro has_upgrade = match req.header("Upgrade") {
+        Some(v) => v.to_ascii_lower().contains("websocket")
+        None    => false
+    }
+    if !has_upgrade { return false }
+
+    ro has_conn_upgrade = match req.header("Connection") {
+        Some(v) => v.to_ascii_lower().contains("upgrade")
+        None    => false
+    }
+    if !has_conn_upgrade { return false }
+
+    ro version_ok = match req.header("Sec-WebSocket-Version") {
+        Some(v) => v == "13"
+        None    => false
+    }
+    if !version_ok { return false }
+
+    req.header("Sec-WebSocket-Key").is_some()
+}
