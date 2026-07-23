@@ -1,0 +1,132 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Plan 222 final-plumbing task 2 — LIVE-socket proof of recover-500
+// (`[M-servemux-recover-500]`): a handler panic mid-request is contained by
+// `serve_connection`'s Stop-supervision (`run_request`, servernet/serve.nv)
+// — the client gets a `500`, the connection's admission slot is NOT leaked
+// (the SAME connection serves a SECOND, normal request right after), and the
+// panic is logged through `ServerPolicy.panic_sink`.
+//
+// EXPECT_TIMEOUT_MS-marked (standalone per test-conventions.md — binds a
+// real loopback port, same discipline as this folder's other smokes).
+//
+// EXPECT_TIMEOUT_MS 30000
+
+module rt.recover500_smoke
+
+import std.net.{TcpListener, TcpStream, SocketAddr, real_net}
+import ../../server.{Router, ServerRequest, ServerResponse, route_once}
+import ../../servernet.{ServerPolicy, serve_connection}
+
+fn recover_routes() -> Router {
+    mut r = Router.new()
+    r.get("/health", fn(_req ServerRequest) -> ServerResponse => ServerResponse.text(200, "ok"))!!
+    r.get("/boom", fn(_req ServerRequest) -> ServerResponse {
+        // `[M-closure-panic-tail-expr-bigstruct-ret-mismatch]` (found writing
+        // this test): `panic(...)` as the SOLE/TAIL expression of a CLOSURE
+        // LITERAL (not a top-level named `fn` — that shape compiles fine)
+        // whose return type is a multi-field `value` struct (`ServerResponse`
+        // here) CC-FAILs: "returning 'nova_int' from a function with
+        // incompatible result type 'NovaValue_ServerResponse'" — `panic`'s C
+        // lowering is a comma-expression ending in a hardcoded `(nova_int)
+        // 0LL` dummy (`emit_c.rs`, the "cast-target" placeholder — a real
+        // value is never reached, but the STATIC C type of that placeholder
+        // is always `nova_int`), and the closure-literal-body codegen path
+        // (distinct from a named `fn`'s) uses that placeholder AS the C
+        // function's `return` value directly instead of casting/ignoring it
+        // for a big-struct return type. Isolated in an 11-line standalone
+        // repro (`Handler`/`Big` analogs, no `ServerResponse`/`http`
+        // involved). Workaround: `panic(...)` as a STATEMENT (not the tail
+        // expression) followed by a dummy trailing value of the right type —
+        // confirmed this compiles clean and panics correctly at runtime.
+        // Report to integrator for `docs/plans/backlog-followups.md` (this
+        // worktree does not touch the nova repo).
+        panic("boom: simulated handler panic")
+        ServerResponse.text(500, "unreachable")
+    })!!
+    r
+}
+
+fn make_handler(r Router) -> fn([]u8) -> ServerResponse =>
+    fn(raw []u8) -> ServerResponse { route_once(r, raw) }
+
+test "servernet: recover-500 — handler panic -> 500, connection stays alive for the NEXT request, panic logged" {
+    with Net = real_net() {
+        consume lst = match TcpListener.bind(SocketAddr.loopback(0)) {
+            Ok(consume l) => l
+            Err(_) => { assert(false); return }
+        }
+        ro port = lst.local_port()
+        assert(port > 0)
+
+        ro (server_ok_tx, server_ok_rx) = Channel.new(1)
+        ro (r1_tx, r1_rx) = Channel.new(1)
+        ro (r2_tx, r2_rx) = Channel.new(1)
+        // `ServerPolicy.panic_sink`'s callback runs on the SAME fiber that
+        // calls it (`run_request`, servernet/serve.nv) — the same fiber that
+        // owns `policy` itself (constructed inside this test's OWN server
+        // fiber below), so the CONTAINS-check happens locally, in-fiber; only
+        // the resulting `bool` crosses back to the test's main flow via a
+        // Channel — `str` itself is NOT word-safe (`nova_str` is a 2-word
+        // `{ptr, len}`, `vtables.h`) and would hit the SAME
+        // `E_CHANNEL_UNSOUND_ELEM_TYPE` class `run_request`'s own banner
+        // documents for `ServerResponse` — no need to even try sending it.
+        ro (log_ok_tx, log_ok_rx) = Channel.new(1)
+        ro router = recover_routes()
+
+        with Fail[TimeoutError] = |_e| {} {
+            supervised(timeout: 5.to_seconds()) {
+                spawn {
+                    match lst.accept() {
+                        Ok(consume srv) => {
+                            consume s = srv
+                            mut policy = ServerPolicy.new()
+                            ro logtx = log_ok_tx
+                            policy.panic_sink(fn(line str) {
+                                ro tx = logtx
+                                tx.try_send(line.contains("boom"))
+                            })
+                            match serve_connection(s, make_handler(router), policy) {
+                                Ok(_)  => { server_ok_tx.try_send(true) }
+                                Err(_) => { server_ok_tx.try_send(false) }
+                            }
+                        }
+                        Err(_) => { server_ok_tx.try_send(false) }
+                    }
+                }
+                spawn {
+                    match TcpStream.connect(SocketAddr.loopback(port)) {
+                        Ok(consume conn) => {
+                            consume cli = conn
+                            ro _ = cli.write_str("GET /boom HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                            match cli.read_to_vec(4096) {
+                                Ok(chunk) => { r1_tx.try_send(chunk) }
+                                Err(_)    => ()
+                            }
+                            ro _ = cli.write_str("GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                            match cli.read_to_vec(4096) {
+                                Ok(chunk) => { r2_tx.try_send(chunk) }
+                                Err(_)    => ()
+                            }
+                            cli.close()
+                        }
+                        Err(_) => ()
+                    }
+                }
+            }
+        }
+        lst.close()
+        server_ok_tx.close()
+        r1_tx.close()
+        r2_tx.close()
+        log_ok_tx.close()
+        ro r1 = r1_rx.try_recv() ?? []u8.new()
+        ro r2 = r2_rx.try_recv() ?? []u8.new()
+        ro s1 = unsafe { r1.to_str_unchecked() }
+        ro s2 = unsafe { r2.to_str_unchecked() }
+        assert(s1.contains("500"))
+        assert(s2.contains("HTTP/1.1 200 OK"))
+        assert(s2.contains("ok"))
+        assert(log_ok_rx.try_recv() ?? false) // panic text reached the sink
+        assert(server_ok_rx.try_recv() ?? false)
+    }
+}

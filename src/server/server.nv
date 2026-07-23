@@ -78,6 +78,7 @@
 module http.server
 
 import http.{Method, StatusCode, Version, HeaderMap, HttpError}
+import std.net.{TcpStream}
 
 // ── ServerRequest ─────────────────────────────────────────────────────────────
 
@@ -93,6 +94,24 @@ export type ServerRequest value {
     ro headers HeaderMap
     params     [](str, str)     // matched {name} path params (mut: set by ServeMux.@dispatch via @params(ps))
     ro body    []u8
+    // Multipart-parsing guardrails snapshot (`[M-222.11-multipart-limits-not-
+    // wired-to-serverpolicy]`, Plan 222 final-plumbing task 3): `MultipartLimits`
+    // lives in THIS module (multipart.nv, folder-peer sorting BEFORE server.nv —
+    // D78 sorted-peer order), so embedding it here needs no cross-module import.
+    // `http.server` cannot import `http.servernet`'s `ServerPolicy` directly
+    // (would make the two modules mutually dependent — see servernet.nv's own
+    // layer-contract banner for the confirmed A⇄B cycle symptom), so the
+    // policy → parser channel goes the OTHER way: `http.serve` (the one module
+    // allowed to import BOTH) reads `policy.multipart_limits()` and threads it
+    // down through `route_once_with_multipart_limits`/`router_callback_with_limits`
+    // (`server.nv`/`server_serve.nv`, both below) into THIS field, which
+    // `Multipart.from_request` (multipart.nv) then reads instead of a hardcoded
+    // `MultipartLimits.new()`. Defaults to `MultipartLimits.new()` wherever a
+    // request is built without going through that threading (`parse_request`,
+    // `wire.nv`) — every existing caller (`serve_once`, mock tests,
+    // `router_callback`/`handle_connection_router`'s single-shot path) keeps
+    // today's fixed defaults unchanged.
+    multipart_limits MultipartLimits // plain (no `ro`) — `@multipart_limits(v) -> @` reassigns it directly, same shape as `params` above
 }
 
 /// Request method.
@@ -147,6 +166,21 @@ export fn ServerRequest mut @params(ps [](str, str)) -> @ {
     @params = ps
 }
 
+/// The multipart-parsing limits snapshot in effect for this request (see the
+/// field's own doc-comment above) — read by `Multipart.from_request`
+/// (multipart.nv). Defaults to `MultipartLimits.new()` unless threaded
+/// through `route_once_with_multipart_limits`/`ServerPolicy`.
+#stable(since = "0.1")
+export fn ServerRequest @multipart_limits() -> MultipartLimits => @multipart_limits
+
+/// Attach a multipart-limits snapshot (used by
+/// `route_once_with_multipart_limits` below — not part of the normal
+/// request-parsing path, `parse_request` already fills in the default).
+#stable(since = "0.1")
+export fn ServerRequest mut @multipart_limits(v MultipartLimits) -> @ {
+    @multipart_limits = v
+}
+
 // `StreamBody` (streamed response body chunk-producer, `[M-178-server-streaming]`)
 // is declared here, ahead of `ServerResponse`, because `ServerResponse` embeds it
 // BY VALUE via `Option[StreamBody]` — a value-typed field must be a complete type
@@ -173,19 +207,30 @@ export type ServerResponse value {
     body          []u8
     ro stream     Option[StreamBody]
     background    Option[BackgroundTasks]
+    // ws-hijack hook (`[M-ws-on_upgrade-hijack-not-wired]`, Plan 222
+    // final-plumbing task 1): set by `WebSocketUpgrade.@on_upgrade`
+    // (ws_upgrade.nv, SAME module) — raw `TcpStream`, NOT `WebSocket`, so this
+    // core "wire model" file stays decoupled from `http.ws` (the WebSocket
+    // protocol layer imports DOWN into `http.server`'s types today —
+    // `ws_upgrade.nv` — not the other way around). `http.servernet.serve_connection`
+    // (serve.nv) checks `@take_upgrade()` AFTER writing this response's bytes
+    // (the 101 handshake) and, if set, hands the live socket to the hook
+    // INSTEAD OF the normal keep-alive continuation/close — same
+    // `Option[...]`-hook shape as `background` above (`@take_background`).
+    upgrade       Option[fn(TcpStream) Net -> ()]
 }
 
 /// Response with a status code and empty body/headers.
 #stable(since = "0.1")
 export fn ServerResponse.new(status int) -> ServerResponse =>
-    { status, headers: HeaderMap.new(), body: []u8.new(), stream: None, background: None }
+    { status, headers: HeaderMap.new(), body: []u8.new(), stream: None, background: None, upgrade: None }
 
 /// `text/plain; charset=utf-8` response.
 #stable(since = "0.1")
 export fn ServerResponse.text(status int, s str) -> ServerResponse {
     mut h = HeaderMap.new()
     ro _ = h.insert("Content-Type", "text/plain; charset=utf-8") // статическое имя — не может отказать
-    { status, headers: h, body: s.bytes(), stream: None, background: None }
+    { status, headers: h, body: s.bytes(), stream: None, background: None, upgrade: None }
 }
 
 /// `text/html; charset=utf-8` response.
@@ -193,7 +238,7 @@ export fn ServerResponse.text(status int, s str) -> ServerResponse {
 export fn ServerResponse.html(status int, s str) -> ServerResponse {
     mut h = HeaderMap.new()
     ro _ = h.insert("Content-Type", "text/html; charset=utf-8") // статическое имя — не может отказать
-    { status, headers: h, body: s.bytes(), stream: None, background: None }
+    { status, headers: h, body: s.bytes(), stream: None, background: None, upgrade: None }
 }
 
 /// Raw-bytes response with an explicit Content-Type.
@@ -201,20 +246,20 @@ export fn ServerResponse.html(status int, s str) -> ServerResponse {
 export fn ServerResponse.bytes(status int, content_type str, data []u8) -> ServerResponse {
     mut h = HeaderMap.new()
     ro _ = h.insert("Content-Type", content_type) // статическое имя — не может отказать
-    { status, headers: h, body: data, stream: None, background: None }
+    { status, headers: h, body: data, stream: None, background: None, upgrade: None }
 }
 
 /// Bodyless response (204/304/…).
 #stable(since = "0.1")
 export fn ServerResponse.empty(status int) -> ServerResponse =>
-    { status, headers: HeaderMap.new(), body: []u8.new(), stream: None, background: None }
+    { status, headers: HeaderMap.new(), body: []u8.new(), stream: None, background: None, upgrade: None }
 
 /// Redirect response (`Location: location`).
 #stable(since = "0.1")
 export fn ServerResponse.redirect(status int, location str) -> ServerResponse {
     mut h = HeaderMap.new()
     ro _ = h.insert("Location", location) // статическое имя — не может отказать
-    { status, headers: h, body: []u8.new(), stream: None, background: None }
+    { status, headers: h, body: []u8.new(), stream: None, background: None, upgrade: None }
 }
 
 // ── Streamed response body ([M-178-server-streaming]) ─────────────────────────
@@ -265,7 +310,7 @@ export fn StreamBody.from_chunks(chunks [][]u8) -> StreamBody {
 /// `text/event-stream` specialisation. `[M-178-server-streaming]`
 #stable(since = "0.1")
 export fn ServerResponse.stream(status int, headers HeaderMap, producer StreamBody) -> ServerResponse =>
-    { status, headers, body: []u8.new(), stream: Some(producer), background: None }
+    { status, headers, body: []u8.new(), stream: Some(producer), background: None, upgrade: None }
 
 /// `text/event-stream` (SSE) response — sets the standard no-cache headers and
 /// streams `producer`'s chunks as the raw SSE wire bytes (format each chunk
@@ -276,7 +321,7 @@ export fn ServerResponse.sse(producer StreamBody) -> ServerResponse {
     ro _ = h.insert("Content-Type", "text/event-stream; charset=utf-8") // статическое имя — не может отказать
     ro _ = h.insert("Cache-Control", "no-cache")
     ro _ = h.insert("X-Accel-Buffering", "no")
-    { status: 200, headers: h, body: []u8.new(), stream: Some(producer), background: None }
+    { status: 200, headers: h, body: []u8.new(), stream: Some(producer), background: None, upgrade: None }
 }
 
 /// Whether this response streams its body via a chunk producer (vs. a fixed
@@ -305,6 +350,23 @@ export fn ServerResponse mut @background(tasks BackgroundTasks) -> @ {
 /// see `background.nv`'s file banner for the graceful-shutdown TODO.
 #stable(since = "0.1")
 export fn ServerResponse @take_background() -> Option[BackgroundTasks] => @background
+
+/// Mark this response as a protocol upgrade: `h` gets the live `TcpStream`
+/// AFTER this response's bytes (the 101 handshake) are on the wire — the
+/// connection driver does NOT close/continue keep-alive on it afterward (see
+/// `@take_upgrade`'s own doc-comment / the `upgrade` field's banner above).
+/// Fluent setter (D117/D409), mirrors `@background` above.
+#stable(since = "0.1")
+export fn ServerResponse mut @upgrade(h fn(TcpStream) Net -> ()) -> @ {
+    @upgrade = Some(h)
+}
+
+/// Take the attached upgrade hook (`None` for an ordinary response). The
+/// connection driver (`http.servernet.serve_connection`, serve.nv) calls this
+/// AFTER writing this response's bytes to the socket; `Some(h)` means: hand
+/// the socket to `h` instead of the normal keep-alive continuation/close.
+#stable(since = "0.1")
+export fn ServerResponse @take_upgrade() -> Option[fn(TcpStream) Net -> ()] => @upgrade
 
 /// Format one SSE event's wire bytes (WHATWG SSE): optional `event:` line +
 /// one `data:` line per `\n`-separated line of `data` + the blank-line
@@ -386,6 +448,27 @@ export type Handler fn(ServerRequest) -> ServerResponse
 export fn route_once(router Router, raw []u8) -> ServerResponse {
     match parse_request(raw) {
         Ok(req) => router.dispatch(req)
+        Err(_)  => ServerResponse.text(400, "400 bad request")
+    }
+}
+
+/// Same as `route_once`, but overrides the request's `multipart_limits`
+/// snapshot before dispatch (`[M-222.11-multipart-limits-not-wired-to-
+/// serverpolicy]`) — the minimal-invasive channel from `ServerPolicy`
+/// (`http.servernet`, cannot be imported here — see `ServerRequest.
+/// multipart_limits`'s own doc-comment) down to `Multipart.from_request`.
+/// `router_callback_with_limits` (`server_serve.nv`) is the byte-level-
+/// callback adapter that closes over `limits` for `http.serve.serve_router`
+/// to use; ordinary callers keep using plain `route_once`/`router_callback`
+/// (default `MultipartLimits.new()`, unchanged).
+#stable(since = "0.1")
+export fn route_once_with_multipart_limits(router Router, raw []u8, limits MultipartLimits) -> ServerResponse {
+    match parse_request(raw) {
+        Ok(req0) => {
+            mut req = req0
+            req.multipart_limits(limits)
+            router.dispatch(req)
+        }
         Err(_)  => ServerResponse.text(400, "400 bad request")
     }
 }

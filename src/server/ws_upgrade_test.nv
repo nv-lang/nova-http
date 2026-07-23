@@ -69,7 +69,7 @@ test "WebSocketUpgrade.accept_response: echoes the offered protocol when given" 
     assert(proto_val == "chat")
 }
 
-test "WebSocketUpgrade.on_upgrade: shape-complete — returns a valid 101 response" {
+test "WebSocketUpgrade.on_upgrade: returns a valid 101 response (hook wiring itself is proven live in servernet/rt/ws_upgrade_hijack_smoke.nv)" {
     ro req = parse_request(ws_upgrade_req("dGhlIHNhbXBsZSBub25jZQ==", "Sec-WebSocket-Protocol: chat\r\n"))!!
     ro up = WebSocketUpgrade.from_request(req)!!
     ro resp = up.on_upgrade(|_ws| ())

@@ -9,26 +9,25 @@
 // depend on СЛОЙ 1. Does NOT import `http.servernet` — see the important
 // limitation below.
 //
-// ── `@on_upgrade` — SHAPE-COMPLETE, HIJACK NOT WIRED ────────────────────────
-// `[M-ws-on_upgrade-hijack-not-wired]`: a `FromRequest` extractor's
-// `.from_request(req ServerRequest)` only ever sees the BUFFERED request
-// value (`server.nv`'s `ServerRequest` carries no socket handle) — there is
-// currently no channel from an extractor to the connection's live
-// `TcpStream`. Actually handing that raw socket to `h` requires extending
-// `ServerResponse` (a new "this is an upgrade, here's the handler" marker)
-// AND `http.servernet.handle_connection` (recognize the marker, skip the
-// normal write-then-close, hand the stream to `WebSocket` instead) — both
-// OUT OF ZONE this wave (`servernet/**` untouched by instruction, tracked
-// for whoever wires Plan 222.7). `@on_upgrade` below therefore returns the
-// CORRECT wire response (a real client's handshake genuinely completes) but
-// does NOT invoke `h` — call `WebSocket.new`/`.with_limit` +
-// `.recv`/`.send`/`.close` directly against a live `TcpStream` today (see
-// `ws/rt/socket_echo_smoke.nv` for the fiber-per-connection shape this will
-// slot into once servernet is extended).
+// ── `@on_upgrade` — HIJACK WIRED (Plan 222 final-plumbing task 1) ──────────
+// `[M-ws-on_upgrade-hijack-not-wired]`: CLOSED. `ServerResponse` gained an
+// `upgrade Option[fn(TcpStream) Net -> ()]` hook field (`server.nv`, mirrors
+// `background`'s `@take_background` shape) — `@on_upgrade` below sets it to a
+// closure that wraps the handed-off `TcpStream` as a `WebSocket` and invokes
+// `h`. `http.servernet.serve_connection` (serve.nv) checks
+// `resp.take_upgrade()` AFTER writing this response's 101 bytes to the wire
+// and, if set, hands the live socket to the hook INSTEAD OF the normal
+// keep-alive continuation/close — see that fn's own comment for the
+// consume-flow shape. Live end-to-end proof: `servernet/rt/
+// ws_upgrade_hijack_smoke.nv` (HTTP upgrade request through `serve_connection`
+// → echo over the real socket) — `ws/rt/socket_echo_smoke.nv` stays as the
+// lower-level protocol-only proof (no `servernet` dependency, by design, see
+// that file's own banner).
 
 module http.server
 
 import http.{HttpError}
+import std.net.{TcpStream}
 import http.ws.{is_upgrade_request, ws_accept_key, WebSocket}
 
 /// Extractor: confirms `req` is a valid WebSocket upgrade request and
@@ -97,12 +96,21 @@ export fn WebSocketUpgrade @accept_response(proto Option[str]) -> ServerResponse
     resp
 }
 
-/// Complete the handshake, informationally handing `h` the socket-handler
-/// contract (plan §3 exact signature) — see the file banner:
-/// `[M-ws-on_upgrade-hijack-not-wired]`, `h` is NOT invoked this wave.
+/// Complete the handshake and wire `h` to the live socket (plan §3 exact
+/// signature): once `http.servernet.serve_connection` has written this
+/// response's 101 bytes, it hands the raw `TcpStream` to the hook installed
+/// below, which wraps it as a `WebSocket` (default 16 MiB message limit,
+/// `WebSocket.new`) and calls `h` — `h` owns the `WebSocket` from then on and
+/// is responsible for `@close()`ing it (D133 must-consume), same contract as
+/// `ws/rt/socket_echo_smoke.nv`'s own hand-rolled echo loop.
 #stable(since = "0.1")
-export fn WebSocketUpgrade consume @on_upgrade(h fn(WebSocket) -> ()) -> ServerResponse {
-    ro _ = h // not yet wired to a live socket — see file banner
+export fn WebSocketUpgrade consume @on_upgrade(h fn(WebSocket) Net -> ()) -> ServerResponse {
     ro proto = if @protocols.len() > 0 { Some(@protocols[0]) } else { None }
-    @accept_response(proto)
+    mut resp = @accept_response(proto)
+    ro hook = fn(stream TcpStream) Net -> () {
+        consume ws = WebSocket.new(stream)
+        h(ws)
+    }
+    resp.upgrade(hook)
+    resp
 }

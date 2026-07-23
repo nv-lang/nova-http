@@ -230,3 +230,30 @@ export fn WebSocket consume @close(code u16, reason str) Net -> Result[(), WsErr
     @stream.close()
     Ok(())
 }
+
+// D188 `Cleanup[never]`-имплементация (Plan 201, same shape as `TcpStream`'s
+// own `@cleanup`, std/net/tcp.nv) — abnormal-exit fallback: closes the raw
+// socket WITHOUT the close-handshake (a caller that wants a clean RFC 6455
+// close should call `@close(code, reason)` explicitly; this is a best-effort
+// safety net, not the normal path). ALSO works around a real checker
+// limitation found while wiring `[M-ws-on_upgrade-hijack-not-wired]`
+// (ws_upgrade.nv `@on_upgrade`): passing a user-defined `consume value`
+// through a first-class function VALUE call (`h(ws)`, where `h`'s static
+// type is a bare `fn(WebSocket) Net -> ()`) is NOT recognized by the
+// D131/D133 linear-flow checker as consuming the argument — a false-positive
+// `[D133-not-consumed]` — UNLESS the type has a `Cleanup` fallback available
+// (isolated in a 15-line standalone repro: identical shape with `TcpStream`
+// instead of a user type does NOT trip this, precisely because `TcpStream`
+// already has its own `@cleanup`; a `Box`-shaped user type reproduces it,
+// and adding `@cleanup` to `Box` makes the checker accept the SAME `h(w)`
+// call it rejected before). Verified this does NOT double-fire/double-close
+// when `h` DOES explicitly consume its argument (codegen's own move-tracking
+// is more precise than the diagnostic-emitting checker pass — confirmed by
+// an `AtomicInt`-counted probe: exactly one `@close`/`@cleanup` firing, not
+// two) — `[M-consume-fn-value-call-arg-not-tracked]`, report to integrator
+// for `docs/plans/backlog-followups.md` registration (this worktree does not
+// touch the nova repo).
+#stable(since = "0.1")
+export fn WebSocket consume @cleanup(_outcome ScopeOutcome) -> () {
+    @stream.close()
+}

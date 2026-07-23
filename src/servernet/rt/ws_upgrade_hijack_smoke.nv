@@ -1,0 +1,191 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Plan 222 final-plumbing task 1 — LIVE-socket proof that `WebSocketUpgrade.
+// @on_upgrade`'s hook is REALLY wired end-to-end through the real connection
+// driver (`http.servernet.serve_connection`), closing
+// `[M-ws-on_upgrade-hijack-not-wired]`: an HTTP upgrade request goes in over
+// a real loopback `TcpStream`, `serve_connection` writes the 101 response
+// and hands the LIVE socket to the route handler's `@on_upgrade` closure
+// (NOT the hand-rolled accept loop `ws/rt/socket_echo_smoke.nv` uses to
+// prove the protocol layer alone — see that file's own banner for why it
+// deliberately bypasses `servernet` — this smoke is the wiring proof that
+// file's banner says is still missing), and a real client speaks the raw WS
+// wire protocol against it (masked frames out, unmasked echo back).
+//
+// Client-side frame helpers/fixture key mirror `ws/rt/socket_echo_smoke.nv`
+// verbatim (same RFC 6455 §1.3 worked example) — this file's OWN job is only
+// the `servernet` wiring, not re-proving the protocol codec itself.
+//
+// EXPECT_TIMEOUT_MS-marked (standalone per test-conventions.md — binds a
+// real loopback port, same discipline as the other `servernet/rt/*` smokes).
+//
+// EXPECT_TIMEOUT_MS 30000
+
+module rt.ws_upgrade_hijack_smoke
+
+import std.net.{TcpListener, TcpStream, SocketAddr, real_net}
+import ../../server.{Router, ServerRequest, ServerResponse, WebSocketUpgrade, route_once}
+import ../../ws.{Frame, OpCode, Message, WebSocket, frame_len_hint}
+import ../../servernet.{ServerPolicy, serve_connection}
+
+fn test_client_key() -> str => "dGhlIHNhbXBsZSBub25jZQ=="
+
+fn find_crlfcrlf(b []u8) -> int {
+    ro n = b.len()
+    mut i = 0
+    while i + 3 < n {
+        if (b[i] as int) == 0x0D && (b[i + 1] as int) == 0x0A &&
+           (b[i + 2] as int) == 0x0D && (b[i + 3] as int) == 0x0A {
+            return i
+        }
+        i += 1
+    }
+    -1
+}
+
+fn find_frame_hint(b []u8) -> Option[int] => frame_len_hint(b)
+
+// ── server-side route: `WebSocketUpgrade` extractor + `@on_upgrade` echo ──
+
+fn ws_routes() -> Router {
+    mut r = Router.new()
+    r.get("/ws", fn(req ServerRequest) -> ServerResponse {
+        match WebSocketUpgrade.from_request(req) {
+            Ok(up) => up.on_upgrade(fn(ws WebSocket) Net -> () {
+                mut w = ws
+                mut running = true
+                while running {
+                    match w.recv() {
+                        Ok(Some(Message.Text(t)))   => { ro _ = w.send(Message.Text(t)) }
+                        Ok(Some(Message.Binary(b)))  => { ro _ = w.send(Message.Binary(b)) }
+                        Ok(Some(_))                  => ()   // Ping/Pong — already auto-handled inside recv()
+                        Ok(None)                     => { running = false }
+                        Err(_)                       => { running = false }
+                    }
+                }
+                ro _ = w.close(1000, "bye")
+            })
+            Err(e) => e.into_response()
+        }
+    })!!
+    r
+}
+
+fn make_handler(r Router) -> fn([]u8) -> ServerResponse =>
+    fn(raw []u8) -> ServerResponse { route_once(r, raw) }
+
+test "servernet: WebSocketUpgrade.on_upgrade hijack is wired live through serve_connection (HTTP upgrade -> real WS echo)" {
+    with Net = real_net() {
+        consume lst = match TcpListener.bind(SocketAddr.loopback(0)) {
+            Ok(consume l) => l
+            Err(_) => { assert(false); return }
+        }
+        ro port = lst.local_port()
+        assert(port > 0)
+
+        ro (server_ok_tx, server_ok_rx) = Channel.new(1)
+        ro (client_ok_tx, client_ok_rx) = Channel.new(1)
+        ro router = ws_routes()
+
+        supervised {
+            // ── server fiber: accept ONE connection, drive it through the
+            //    REAL keep-alive connection driver — this is the wiring
+            //    under test, not a hand-rolled loop. ────────────────────────
+            spawn {
+                match lst.accept() {
+                    Ok(consume srv) => {
+                        consume s = srv
+                        match serve_connection(s, make_handler(router), ServerPolicy.new()) {
+                            Ok(_)  => { server_ok_tx.try_send(true) }
+                            Err(_) => { server_ok_tx.try_send(false) }
+                        }
+                    }
+                    Err(_) => { server_ok_tx.try_send(false) }
+                }
+            }
+            // ── client fiber: raw WS wire protocol (simulates a browser),
+            //    verbatim shape of ws/rt/socket_echo_smoke.nv's own client. ──
+            spawn {
+                match TcpStream.connect(SocketAddr.loopback(port)) {
+                    Ok(consume conn) => {
+                        consume c0 = conn
+                        ro req = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${test_client_key()}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                        ro _ = c0.write_all(req.bytes())
+
+                        mut acc []u8 = []u8.new()
+                        mut header_end = -1
+                        mut reading = true
+                        while reading && header_end < 0 {
+                            match c0.read_to_vec(4096) {
+                                Ok(chunk) => {
+                                    if chunk.len() == 0 { reading = false }
+                                    else { acc.append(chunk); header_end = find_crlfcrlf(acc) }
+                                }
+                                Err(_) => { reading = false }
+                            }
+                        }
+                        ro head_bytes []u8 = acc[0..header_end]
+                        ro head_str = unsafe { head_bytes.to_str_unchecked() }
+                        mut all_ok = head_str.contains("101 Switching Protocols")
+                        all_ok = all_ok && head_str.to_ascii_lower().contains("connection: upgrade")
+
+                        // any WS frame bytes already buffered past the header
+                        // terminator (server pipelines nothing unsolicited, so
+                        // normally none) carry over into the frame reader below.
+                        mut fbuf []u8 = acc[header_end + 4..acc.len()]
+
+                        // 1) single-frame masked Text "hello" -> expect unmasked echo "hello"
+                        ro f1 = Frame.new(true, OpCode.Text, "hello".bytes())
+                        ro _w1 = c0.write_all(f1.encode(true))
+                        ro echo1 = read_frame_inline(c0, fbuf)
+                        all_ok = all_ok && echo1.payload() == "hello".bytes()
+                        fbuf = []u8.new()
+
+                        // 2) masked Binary -> expect unmasked echo
+                        ro f2 = Frame.new(true, OpCode.Binary, Vec[u8].of(9, 8, 7, 6))
+                        ro _w2 = c0.write_all(f2.encode(true))
+                        ro echo2 = read_frame_inline(c0, fbuf)
+                        all_ok = all_ok && echo2.payload() == Vec[u8].of(9, 8, 7, 6)
+                        fbuf = []u8.new()
+
+                        // 3) client-initiated close -> expect the close echoed back
+                        ro f3 = Frame.new(true, OpCode.Close, Vec[u8].of(0x03, 0xE8)) // code 1000
+                        ro _w3 = c0.write_all(f3.encode(true))
+                        ro echo3 = read_frame_inline(c0, fbuf)
+                        all_ok = all_ok && match echo3.opcode() { OpCode.Close => true, _ => false }
+
+                        c0.close()
+                        client_ok_tx.try_send(all_ok)
+                    }
+                    Err(_) => { client_ok_tx.try_send(false) }
+                }
+            }
+        }
+        lst.close()
+        server_ok_tx.close()
+        client_ok_tx.close()
+        assert(server_ok_rx.try_recv() ?? false)
+        assert(client_ok_rx.try_recv() ?? false)
+    }
+}
+
+// Accumulate bytes off `s` (starting from any already-buffered `pre` bytes)
+// until exactly one complete WS frame is buffered, then decode it. `s` is a
+// mutable BORROW (free-fn `mut` param, NOT `consume`) — same shape
+// `ws/rt/socket_echo_smoke.nv`'s own `read_frame_inline` uses.
+fn read_frame_inline(mut s TcpStream, pre []u8) Net -> Frame {
+    mut fbuf = pre
+    mut need = find_frame_hint(fbuf)
+    while need.is_some() {
+        match s.read_to_vec(4096) {
+            Ok(chunk) => {
+                if chunk.len() == 0 { need = None }
+                else { fbuf.append(chunk); need = find_frame_hint(fbuf) }
+            }
+            Err(_) => { need = None }
+        }
+    }
+    match Frame.decode(fbuf) {
+        Ok((f, _n)) => f
+        Err(_)      => Frame.new(true, OpCode.Close, []u8.new())
+    }
+}
