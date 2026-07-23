@@ -33,16 +33,16 @@ type Log effect {
     info(msg str) -> ()
 }
 
-type Handler value { priv f fn(Req) Db Log -> Resp }
-fn handler_fn(f fn(Req) Db Log -> Resp) -> Handler => { f }
-fn Handler @handle(req Req) Db Log -> Resp => (@f)(req)
+// newtype-over-fn WITH an effect row (D52/D55) — call it directly, no
+// constructor, no @handle: plain fns auto-lift into it (sub-effecting).
+type AppHandler fn(ServerRequest) Db Log -> ServerResponse
 ```
 
-Then define handlers with **narrower** effect rows — they widen for free:
+Then define handlers with **narrower** effect rows — they widen for free (a plain `fn` with a subset of the row auto-lifts into `AppHandler`):
 
 ```nova
 // Uses only Db — narrower than Handler's declared `Db Log` row.
-fn create_user(req Req) Db -> Resp {
+fn create_user(req ServerRequest) Db -> ServerResponse {
     match Db.find(req.id) {
         Some(name) => ServerResponse.text(200, name)
         None       => ServerResponse.text(404, "not found")
@@ -50,7 +50,7 @@ fn create_user(req Req) Db -> Resp {
 }
 
 // Uses both Db and Log — exact match.
-fn get_user_logged(req Req) Db Log -> Resp {
+fn get_user_logged(req ServerRequest) Db Log -> ServerResponse {
     Log.info("fetching user ${req.id}")
     match Db.find(req.id) {
         Some(name) => ServerResponse.text(200, name)
@@ -59,14 +59,14 @@ fn get_user_logged(req Req) Db Log -> Resp {
 }
 
 // Uses neither — the empty row widens to any declared row.
-fn health(req Req) -> Resp => ServerResponse.text(200, "ok")
+fn health(req ServerRequest) -> ServerResponse => ServerResponse.text(200, "ok")
 ```
 
 At dispatch time, wrap a **single** `with` pair around the entire router,
 not per-route:
 
 ```nova
-fn serve_app(r Router, req Req) -> Resp {
+fn serve_app(r Router, req ServerRequest) -> ServerResponse {
     with Db = effect Db {
         find(id int) -> Option[str] { /* real pool query */ }
     } {
