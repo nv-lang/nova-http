@@ -93,9 +93,22 @@ export fn Middleware @apply(next Handler) -> Handler => (@f)(next)
 /// Compose two middlewares: `a.then(b)` — `a` wraps OUTSIDE, `b` INSIDE (`a`
 /// runs first at request time, then `b`, then the eventual handler).
 /// `a.then(b).apply(h) == a.apply(b.apply(h))`.
+// [M-16] (detach-capture, known live compiler bug — cited per task
+// instruction, not re-diagnosed): capturing a RAW `fn(Handler) -> Handler`
+// local (e.g. `ro outer_f = @f`, then calling it as `outer_f(x)` inside a
+// nested closure) codegens a bogus direct call to a top-level function
+// literally named `nova_fn_outer_f` instead of invoking the captured
+// closure value — repro was a one-line change, reverted here. Workaround:
+// capture the whole `Middleware` VALUE (bare `@`, precedent:
+// `std/collections/linkedlist.nv`'s `match @ { ... }`) and invoke it via
+// `.apply(...)` method-call syntax (same shape as `inner.apply(next)` below,
+// which codegens correctly) instead of calling a captured raw fn-value by
+// identifier.
 #stable(since = "0.1")
-export fn Middleware @then(inner Middleware) -> Middleware =>
-    Middleware.new(fn(next Handler) -> Handler => @apply(inner.apply(next)))
+export fn Middleware @then(inner Middleware) -> Middleware {
+    ro outer = @
+    Middleware.new(fn(next Handler) -> Handler => outer.apply(inner.apply(next)))
+}
 
 // ── Router integration: wrap-at-registration ───────────────────────────────
 
@@ -107,7 +120,8 @@ fn wrap_handler(layers []Middleware, h Handler) -> Handler {
     mut wrapped = h
     mut i = layers.len() - 1
     while i >= 0 {
-        wrapped = layers[i].apply(wrapped)
+        ro mw = layers[i]
+        wrapped = mw.apply(wrapped)
         i -= 1
     }
     wrapped

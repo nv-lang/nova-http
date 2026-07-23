@@ -26,8 +26,19 @@ module http.server
 //   `x-order` header. Unwinding: `b`'s post-work runs first (prev=None →
 //   "B"), THEN `a`'s post-work runs (prev="B" → prepend "A" → "A,B"). Final
 //   header = "A,B" — matches entry order.
-fn mark(tag str) -> Middleware =>
-    Middleware.new(|next| handler_fn(|req| {
+//
+// [M-16] (detach-capture, known live compiler bug — cited per task
+// instruction, not re-diagnosed): a TWO-level-deep nested closure
+// (`|next| handler_fn(|req| { ...uses tag AND next... })`, where the
+// innermost closure reaches past its direct parent to a grandparent's
+// capture) segfaulted at runtime (repro: `nova test`, exit
+// STATUS_ACCESS_VIOLATION, crash on the very first test using `mark`).
+// Workaround: hoist the inner closure into a named top-level fn
+// (`mark_handler`) so EVERY closure here captures from its OWN direct
+// enclosing scope only (one level), never reaching through a middle
+// closure to a grandparent's variable.
+fn mark_handler(tag str, next Handler) -> Handler =>
+    handler_fn(|req| {
         mut resp = next.handle(req)
         ro prev = match resp.headers.get("x-order") {
             Some(hv) => hv.to_str()!!
@@ -36,7 +47,14 @@ fn mark(tag str) -> Middleware =>
         ro combined = if prev == "" { tag } else { "${tag},${prev}" }
         resp.header("x-order", combined)
         resp
-    }))
+    })
+
+// closure-light (`|next| ...`) failed to infer `next`'s type from
+// `Middleware.new`'s expected `fn(Handler) -> Handler` here (codegen'd the
+// param as `nova_int` — separate finding from the `[M-16]` segfault above,
+// worked around the same way `@then` (middleware.nv) already does: spell
+// out closure-FULL `fn(next Handler) -> Handler => …` explicitly).
+fn mark(tag str) -> Middleware => Middleware.new(fn(next Handler) -> Handler => mark_handler(tag, next))
 
 fn base_ok() -> Handler => handler_fn(|req| ServerResponse.text(200, "base"))
 
