@@ -1,0 +1,358 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// nova-http: multipart.nv — `multipart/form-data` parsing (Plan 222.11,
+// `polaris.multipart`). RFC 7578 buffered parser (body already fully in
+// memory, per 222.7's body-limit design) — mirrors Axum `extract::Multipart`
+// (over `multer`) in SHAPE (`Part{name,filename,content_type,bytes}`,
+// `Multipart{parts}`, `#impl(FromRequest)`) without a streaming/`multer`
+// equivalent (plan §4: buffered-only V1, no disk-streaming, no nested
+// `multipart/mixed`).
+//
+// Peer of extract.nv/server.nv/wire.nv in the SAME module (`http.server`) —
+// reuses their module-private byte-scanning helpers directly, no import
+// needed (folder-module peers share the module namespace, D78):
+// `find_crlf`/`find_double_crlf`/`index_of`/`trim_ows` (wire.nv, request/
+// header-line scanning) and `flat_find` (extract.nv, `[](str,str)` lookup —
+// same flat-pairs shape as the header name/value list collected here).
+//
+// `MultipartLimits` (plan §3) is a STANDALONE knob for now — 222.7
+// (`ServerPolicy`/body-size limit) has not landed in this worktree, so there
+// is no server-wide policy to plug a custom `MultipartLimits` through
+// `Multipart.from_request`'s implicit `MultipartLimits.new()` default.
+// `parse_multipart_body` below is exported specifically so a caller CAN
+// already pass custom limits by calling it directly instead of going
+// through `FromRequest`. `[M-222.11-multipart-limits-not-wired-to-serverpolicy]`
+// — TODO once 222.7 lands: compose (not duplicate) the two caps.
+
+module http.server
+
+import http.{HttpError, ContentType}
+import std.encoding.base64.{Base64}
+
+// ── Part / Multipart (plan §2) ─────────────────────────────────────────────
+
+/// One part of a `multipart/form-data` body.
+#stable(since = "0.1")
+export type Part value {
+    priv name         str
+    priv filename     Option[str]
+    priv content_type Option[str]
+    priv data         []u8
+}
+
+/// The part's `name` (`Content-Disposition: form-data; name="..."`).
+#stable(since = "0.1")
+export fn Part @name() -> str => @name
+/// The part's `filename`, if present (`Some` ⇒ this part is a file upload).
+#stable(since = "0.1")
+export fn Part @filename() -> Option[str] => @filename
+/// The part's own `Content-Type` header, if present.
+#stable(since = "0.1")
+export fn Part @content_type() -> Option[str] => @content_type
+/// The part's raw body bytes (`Content-Transfer-Encoding: base64` already
+/// decoded, plan §4).
+#stable(since = "0.1")
+export fn Part @bytes() -> []u8 => @data
+/// The part's body decoded as UTF-8 text. Invalid UTF-8 → typed `Protocol` error.
+#stable(since = "0.1")
+export fn Part @text() -> Result[str, HttpError] {
+    match @data.to_str() {
+        Ok(s)  => Ok(s)
+        Err(_) => Err(HttpError.protocol_error("multipart: part body is not valid UTF-8"))
+    }
+}
+
+/// A parsed `multipart/form-data` body.
+#stable(since = "0.1")
+export type Multipart value { priv parts []Part }
+
+/// All parts, in wire order.
+#stable(since = "0.1")
+export fn Multipart @parts() -> []Part => @parts
+
+/// The FIRST part with this `name` (field or file).
+#stable(since = "0.1")
+export fn Multipart @field(name str) -> Option[Part] {
+    for p in @parts {
+        if p.name() == name { return Some(p) }
+    }
+    None
+}
+
+/// ALL parts with this `name` (repeated fields — checkboxes/multi-select).
+#stable(since = "0.1")
+export fn Multipart @fields(name str) -> []Part {
+    mut out []Part = []
+    for p in @parts {
+        if p.name() == name { out.push(p) }
+    }
+    out
+}
+
+/// The FIRST part with this `name` that also carries a `filename` (i.e. is a
+/// file upload, not a plain field).
+#stable(since = "0.1")
+export fn Multipart @file(name str) -> Option[Part] {
+    for p in @parts {
+        if p.name() == name && p.filename().is_some() { return Some(p) }
+    }
+    None
+}
+
+// ── MultipartLimits (plan §3 — mandatory, conservative defaults; DoS guard) ─
+
+/// Guardrails against a malicious/oversized `multipart/form-data` body.
+/// Exceeding ANY of these maps to `HttpError.body_too_large()` → `413`
+/// (respond.nv `http_error_status`, plan §3 — превышение = 413, не опция).
+#stable(since = "0.1")
+export type MultipartLimits value {
+    priv max_parts     int
+    priv max_part_size int
+    priv max_total     int
+}
+
+/// Conservative defaults: 256 parts, 8 MiB/part, 32 MiB total (plan §3: "иначе
+/// загрузка файлов становится DoS-вектором").
+#stable(since = "0.1")
+export fn MultipartLimits.new() -> MultipartLimits => {
+    max_parts: 256,
+    max_part_size: 8 * 1024 * 1024,
+    max_total: 32 * 1024 * 1024,
+}
+
+/// Max number of parts.
+#stable(since = "0.1")
+export fn MultipartLimits @max_parts() -> int => @max_parts
+/// Mutating fleeting property (D117 AMEND-2).
+#stable(since = "0.1")
+export fn MultipartLimits mut @max_parts(v int) -> @ { @max_parts = v }
+
+/// Max bytes for any single part's (decoded) body.
+#stable(since = "0.1")
+export fn MultipartLimits @max_part_size() -> int => @max_part_size
+/// Mutating fleeting property (D117 AMEND-2).
+#stable(since = "0.1")
+export fn MultipartLimits mut @max_part_size(v int) -> @ { @max_part_size = v }
+
+/// Max cumulative bytes across all (decoded) part bodies.
+#stable(since = "0.1")
+export fn MultipartLimits @max_total() -> int => @max_total
+/// Mutating fleeting property (D117 AMEND-2).
+#stable(since = "0.1")
+export fn MultipartLimits mut @max_total(v int) -> @ { @max_total = v }
+
+// ── FromRequest impl (plan §2/Ф.2) ──────────────────────────────────────────
+
+/// `Multipart` — decode the whole body as `multipart/form-data`. Boundary
+/// comes from `Content-Type`; missing/non-multipart Content-Type or missing
+/// `boundary` parameter → typed `Protocol` error.
+#impl(FromRequest)
+export fn Multipart.from_request(req ServerRequest) -> Result[Multipart, HttpError] {
+    ro ct = match req.headers.content_type() {
+        Some(c) => c
+        None    => return Err(HttpError.protocol_error("multipart: missing Content-Type"))
+    }
+    if ct.mime.essence() != "multipart/form-data" {
+        return Err(HttpError.protocol_error("multipart: Content-Type is not multipart/form-data"))
+    }
+    ro boundary = match ct.boundary() {
+        Some(b) => b
+        None    => return Err(HttpError.protocol_error("multipart: missing boundary parameter"))
+    }
+    parse_multipart_body(req.body_bytes(), boundary, MultipartLimits.new())
+}
+
+// ── Parser (plan §Ф.1 — pure, byte-fixture-testable, no HTTP context) ──────
+
+/// Parse a `multipart/form-data` body (RFC 7578) given its `boundary` (from
+/// `Content-Type`) and `limits`. Exported so callers/tests can bypass
+/// `Multipart.from_request`'s fixed `MultipartLimits.new()` default.
+///
+/// Malformed input (no boundary delimiter at all, unterminated part headers,
+/// a part missing `name` in `Content-Disposition`, no final `--boundary--`,
+/// or a garbled transition after a boundary line) → typed `Protocol` error.
+/// Exceeding any `MultipartLimits` cap → `HttpError.body_too_large()` (413).
+#stable(since = "0.1")
+export fn parse_multipart_body(body []u8, boundary str, limits MultipartLimits) -> Result[Multipart, HttpError] {
+    ro n = body.len()
+    ro dash_boundary = "--${boundary}".bytes()
+    ro next_needle = "\r\n--${boundary}".bytes()
+
+    ro first = match find_bytes(body, dash_boundary, 0) {
+        Some(x) => x
+        None    => return Err(HttpError.protocol_error("multipart: boundary delimiter not found"))
+    }
+
+    mut pos = first + dash_boundary.len()
+    mut parts []Part = []
+    mut total_size = 0
+    mut running = true
+    mut closed = false
+
+    while running {
+        if pos + 2 <= n && (body[pos] as int) == 0x2D && (body[pos + 1] as int) == 0x2D {
+            // "--boundary--" — the close-delimiter; no more parts.
+            closed = true
+            running = false
+        } else if pos + 2 <= n && (body[pos] as int) == 0x0D && (body[pos + 1] as int) == 0x0A {
+            // "--boundary\r\n" — a part follows: headers, blank line, body.
+            if parts.len() >= limits.max_parts() {
+                return Err(HttpError.body_too_large())
+            }
+            ro headers_start = pos + 2
+            ro headers_end = match find_double_crlf(body, headers_start) {
+                Some(x) => x
+                None    => return Err(HttpError.protocol_error("multipart: part headers not terminated"))
+            }
+            ro hdrs = mp_header_lines(body[headers_start..headers_end])
+            ro body_start = headers_end + 4
+            ro found = match find_bytes(body, next_needle, body_start) {
+                Some(x) => x
+                None    => return Err(HttpError.protocol_error("multipart: final boundary missing"))
+            }
+            ro raw_part_body = body[body_start..found]
+
+            ro cd = flat_find(hdrs, "content-disposition")
+            ro (name_opt, filename_opt) = match cd {
+                Some(v) => parse_content_disposition(v)
+                None    => (None, None)
+            }
+            ro name = match name_opt {
+                Some(nm) => nm
+                None     => return Err(HttpError.protocol_error("multipart: part missing 'name' in Content-Disposition"))
+            }
+            ro content_type_opt = flat_find(hdrs, "content-type")
+            ro cte_opt = flat_find(hdrs, "content-transfer-encoding")
+            ro decoded_body = decode_part_body(cte_opt, raw_part_body)?
+
+            if decoded_body.len() > limits.max_part_size() {
+                return Err(HttpError.body_too_large())
+            }
+            total_size = total_size + decoded_body.len()
+            if total_size > limits.max_total() {
+                return Err(HttpError.body_too_large())
+            }
+
+            parts.push(Part { name, filename: filename_opt, content_type: content_type_opt, data: decoded_body })
+            pos = found + next_needle.len()
+        } else {
+            return Err(HttpError.protocol_error("multipart: malformed boundary transition"))
+        }
+    }
+
+    if !closed {
+        return Err(HttpError.protocol_error("multipart: no final boundary"))
+    }
+    Ok(Multipart { parts })
+}
+
+// ── internal helpers ─────────────────────────────────────────────────────
+
+// `Content-Transfer-Encoding: base64` — decode (plan §4: supported;
+// exotic encodings are NOT — pass through unchanged, same as absent CTE).
+fn decode_part_body(cte Option[str], raw []u8) -> Result[[]u8, HttpError] {
+    match cte {
+        Some(enc) => {
+            if enc.trim_ascii().to_ascii_lower() == "base64" {
+                ro cleaned = strip_ws(raw)
+                match Base64.decode(unsafe { cleaned.to_str_unchecked() }) {
+                    Ok(d)  => Ok(d)
+                    Err(_) => Err(HttpError.protocol_error("multipart: invalid base64 part body"))
+                }
+            } else {
+                Ok(raw)
+            }
+        }
+        None => Ok(raw)
+    }
+}
+
+// Drop CR/LF/space/tab — real-world base64 part bodies are often
+// line-wrapped (RFC 2045 §6.8 76-col folding).
+fn strip_ws(b []u8) -> []u8 {
+    mut out []u8 = []u8.new(cap: b.len())
+    for byte in b {
+        ro c = byte as int
+        if c != 0x0D && c != 0x0A && c != 0x20 && c != 0x09 {
+            out.push(byte)
+        }
+    }
+    out
+}
+
+// `form-data; name="foo"; filename="bar.txt"` → (Some("foo"), Some("bar.txt")).
+// The leading "form-data" segment has no "=" — `split_once` returns `None`
+// for it, silently skipped (matches `ContentType.parse`'s own param-loop
+// shape, mime.nv, module `http` — not reused directly since that module's
+// helpers are private to ITS module, not this one).
+fn parse_content_disposition(s str) -> (Option[str], Option[str]) {
+    mut name Option[str] = None
+    mut filename Option[str] = None
+    for seg in s.split(";") {
+        match seg.split_once("=") {
+            Some((k, v)) => {
+                ro key = k.trim_ascii().to_ascii_lower()
+                ro value = unquote_dq(v.trim_ascii())
+                if key == "name" { name = Some(value) }
+                else if key == "filename" { filename = Some(value) }
+            }
+            None => ()
+        }
+    }
+    (name, filename)
+}
+
+fn unquote_dq(s str) -> str {
+    if s.byte_len() >= 2 && s.starts_with("\"") && s.ends_with("\"") {
+        s[1..s.byte_len() - 1]
+    } else {
+        s
+    }
+}
+
+// Parse one part's header block (already excludes the trailing blank-line
+// terminator) into flat `(lowercased-name, trimmed-value)` pairs — reuses
+// `find_crlf`/`index_of`/`trim_ows` (wire.nv) and feeds `flat_find`
+// (extract.nv), both module-private peers in `http.server`.
+fn mp_header_lines(block []u8) -> [](str, str) {
+    mut out [](str, str) = []
+    ro n = block.len()
+    mut i = 0
+    while i < n {
+        ro eol = match find_crlf(block, i) { Some(x) => x, None => n }
+        ro line = block[i..eol]
+        if line.len() > 0 {
+            match index_of(line, 0x3A, 0) {
+                Some(colon) => {
+                    ro name_bytes []u8 = line[0..colon]
+                    ro name = unsafe { name_bytes.to_str_unchecked() }
+                    ro value_bytes = trim_ows(line[colon + 1..line.len()])
+                    ro value = unsafe { value_bytes.to_str_unchecked() }
+                    out.push((name.to_ascii_lower(), value))
+                }
+                None => ()
+            }
+        }
+        if eol >= n { i = n } else { i = eol + 2 }
+    }
+    out
+}
+
+// Naive substring search over bytes (boundary strings are short; buffered
+// bodies are already size-capped upstream — O(n·m) is not a concern here).
+fn find_bytes(hay []u8, needle []u8, from int) -> Option[int] {
+    ro hn = hay.len()
+    ro nn = needle.len()
+    if nn == 0 { return Some(from) }
+    mut i = from
+    while i + nn <= hn {
+        mut matched = true
+        mut j = 0
+        while matched && j < nn {
+            if (hay[i + j] as int) != (needle[j] as int) { matched = false }
+            j += 1
+        }
+        if matched { return Some(i) }
+        i += 1
+    }
+    None
+}

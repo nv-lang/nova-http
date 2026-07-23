@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Plan 222.11 — `multipart/form-data` (multipart.nv): peer tests. Ф.1 (pure
+// `parse_multipart_body` fixtures, incl. malicious ones — plan §6 gate) +
+// Ф.2 (`Multipart.from_request` end-to-end through a real `Router` dispatch,
+// same style as extract_test.nv's `Bytes`/`Text`/`Headers` tests — `Multipart`
+// is a NON-generic `value` type, so [M-generic-static-method-value-arg-addr-
+// mismatch] (extract_test.nv banner) does not apply here, confirmed below).
+
+module http.server
+
+// `get_req` (mux_test.nv/router_test.nv) already defined, same module — no
+// re-declare. Own helper for a raw multipart POST (binary-safe body, boundary
+// interpolated into Content-Type — extract_test.nv's `post_json_req`/
+// `post_text_req` are text-only and don't fit a byte body).
+fn post_multipart_req(path str, boundary str, body []u8) -> []u8 {
+    mut buf = WriteBuffer.new()
+    buf.write_str("POST ${path} HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data; boundary=${boundary}\r\nContent-Length: ${body.len()}\r\n\r\n")
+    buf.write_bytes(body)
+    buf.into_bytes()
+}
+
+// ── Ф.1: parse_multipart_body — pure byte-fixture tests ────────────────────
+
+fn two_part_body(boundary str) -> []u8 =>
+    ("--${boundary}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nHello World\r\n--${boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\nfile contents\r\n--${boundary}--\r\n").bytes()
+
+test "parse_multipart_body: two parts (field + file) round-trip" {
+    ro mp = parse_multipart_body(two_part_body("XBOUNDARY"), "XBOUNDARY", MultipartLimits.new())!!
+    assert(mp.parts().len() == 2)
+
+    ro title = mp.field("title")!!
+    assert(title.filename().is_none())
+    assert(title.text()!! == "Hello World")
+
+    ro file = mp.file("file")!!
+    assert(file.filename()!! == "a.txt")
+    assert(file.content_type()!! == "text/plain")
+    assert(file.text()!! == "file contents")
+
+    assert(mp.field("nope").is_none())
+    assert(mp.file("title").is_none())          // has no filename -> not a "file"
+}
+
+test "parse_multipart_body: fields() returns all parts sharing a name (checkbox-style)" {
+    ro body = ("--B\r\nContent-Disposition: form-data; name=\"tag\"\r\n\r\none\r\n--B\r\nContent-Disposition: form-data; name=\"tag\"\r\n\r\ntwo\r\n--B--\r\n").bytes()
+    ro mp = parse_multipart_body(body, "B", MultipartLimits.new())!!
+    ro tags = mp.fields("tag")
+    assert(tags.len() == 2)
+    assert(tags[0].text()!! == "one")
+    assert(tags[1].text()!! == "two")
+}
+
+test "parse_multipart_body: Content-Transfer-Encoding base64 is decoded" {
+    // "hello" -> base64 "aGVsbG8="
+    ro body = ("--B\r\nContent-Disposition: form-data; name=\"b64\"\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n--B--\r\n").bytes()
+    ro mp = parse_multipart_body(body, "B", MultipartLimits.new())!!
+    ro p = mp.field("b64")!!
+    assert(p.text()!! == "hello")
+}
+
+// ── malicious fixtures (plan §6 gate) ───────────────────────────────────────
+
+test "parse_multipart_body: missing final boundary -> typed Protocol error" {
+    // No trailing "--B--" terminator at all.
+    ro body = ("--B\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\nvalue").bytes()
+    ro r = parse_multipart_body(body, "B", MultipartLimits.new())
+    assert(match r { Err(_) => true, Ok(_) => false })
+}
+
+test "parse_multipart_body: part missing name in Content-Disposition -> typed Protocol error" {
+    ro body = ("--B\r\nContent-Disposition: form-data\r\n\r\nvalue\r\n--B--\r\n").bytes()
+    ro r = parse_multipart_body(body, "B", MultipartLimits.new())
+    assert(match r { Err(_) => true, Ok(_) => false })
+}
+
+test "parse_multipart_body: no boundary delimiter found at all -> typed Protocol error" {
+    ro body = "just some random bytes, no boundary here".bytes()
+    ro r = parse_multipart_body(body, "B", MultipartLimits.new())
+    assert(match r { Err(_) => true, Ok(_) => false })
+}
+
+test "parse_multipart_body: garbled transition after a boundary line -> typed Protocol error" {
+    // After "--B" comes neither "--" (close) nor "\r\n" (next part).
+    ro body = "--Bxx garbage after boundary".bytes()
+    ro r = parse_multipart_body(body, "B", MultipartLimits.new())
+    assert(match r { Err(_) => true, Ok(_) => false })
+}
+
+test "parse_multipart_body: max_parts exceeded -> body_too_large (413-mapped)" {
+    ro body = two_part_body("B") // 2 parts
+    mut lim = MultipartLimits.new()
+    lim.max_parts(1)
+    ro r = parse_multipart_body(body, "B", lim)
+    assert(match r { Err(e) => match e.kind { BodyTooLarge => true, _ => false }, Ok(_) => false })
+}
+
+test "parse_multipart_body: max_part_size exceeded -> body_too_large (413-mapped)" {
+    ro body = ("--B\r\nContent-Disposition: form-data; name=\"big\"\r\n\r\n0123456789\r\n--B--\r\n").bytes()
+    mut lim = MultipartLimits.new()
+    lim.max_part_size(5)
+    ro r = parse_multipart_body(body, "B", lim)
+    assert(match r { Err(e) => match e.kind { BodyTooLarge => true, _ => false }, Ok(_) => false })
+}
+
+test "parse_multipart_body: max_total exceeded across multiple parts -> body_too_large (413-mapped)" {
+    ro body = two_part_body("B") // "Hello World" (11) + "file contents" (13) = 24 bytes total
+    mut lim = MultipartLimits.new()
+    lim.max_total(15)
+    ro r = parse_multipart_body(body, "B", lim)
+    assert(match r { Err(e) => match e.kind { BodyTooLarge => true, _ => false }, Ok(_) => false })
+}
+
+test "MultipartLimits: conservative defaults (256 parts / 8 MiB part / 32 MiB total)" {
+    ro lim = MultipartLimits.new()
+    assert(lim.max_parts() == 256)
+    assert(lim.max_part_size() == 8 * 1024 * 1024)
+    assert(lim.max_total() == 32 * 1024 * 1024)
+}
+
+// ── Ф.2: Multipart.from_request — end-to-end through a real Router dispatch ─
+
+test "Multipart.from_request: decodes a real multipart/form-data POST body" {
+    mut r = Router.new()
+    r.post("/upload", handler_fn(|req| {
+        match Multipart.from_request(req) {
+            Ok(mp) => {
+                ro title = mp.field("title")!!
+                ro file = mp.file("file")!!
+                ServerResponse.text(200, "title=${title.text()!!} file=${file.filename()!!}")
+            }
+            Err(e) => e.into_response()
+        }
+    }))!!
+    ro wire = serve_once(r, post_multipart_req("/upload", "XBOUNDARY", two_part_body("XBOUNDARY")))
+    ro s = unsafe { wire.to_str_unchecked() }
+    assert(s.contains("title=Hello World file=a.txt"))
+}
+
+test "Multipart.from_request: non-multipart Content-Type -> typed Protocol error (400)" {
+    mut r = Router.new()
+    r.post("/upload", handler_fn(|req| {
+        match Multipart.from_request(req) {
+            Ok(_)  => ServerResponse.text(200, "unexpected-ok")
+            Err(e) => e.into_response()
+        }
+    }))!!
+    ro wire = serve_once(r, "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello".bytes())
+    ro s = unsafe { wire.to_str_unchecked() }
+    assert(s.contains("HTTP/1.1 400"))
+}
+
+test "Multipart.from_request: multipart Content-Type without boundary -> typed Protocol error (400)" {
+    mut r = Router.new()
+    r.post("/upload", handler_fn(|req| {
+        match Multipart.from_request(req) {
+            Ok(_)  => ServerResponse.text(200, "unexpected-ok")
+            Err(e) => e.into_response()
+        }
+    }))!!
+    ro wire = serve_once(r, "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data\r\nContent-Length: 0\r\n\r\n".bytes())
+    ro s = unsafe { wire.to_str_unchecked() }
+    assert(s.contains("HTTP/1.1 400"))
+}
