@@ -61,9 +61,11 @@ export fn Request @headers() -> HeaderMap => @headers
 /// Разрядить тело → байты (потребляет Request).
 #stable(since = "0.1")
 export fn Request consume @body_bytes() -> Result[[]u8, HttpError] { @body.bytes() }
+
 /// Дочитать и отбросить тело (потребляет Request).
 #stable(since = "0.1")
 export fn Request consume @drain() -> Result[(), HttpError] { @body.drain() }
+
 /// Взять потоковый ридер тела (потребляет Request).
 #stable(since = "0.1")
 export fn Request consume @into_reader() -> BodyReader { @body.into_reader() }
@@ -114,12 +116,15 @@ export fn Response @is_success() -> bool => @status.is_success()
 /// достать тело — must-consume.
 #stable(since = "0.1")
 export fn Response consume @bytes() -> Result[[]u8, HttpError] { @body.bytes() }
+
 /// Разрядить тело → UTF-8 строка (потребляет Response).
 #stable(since = "0.1")
 export fn Response consume @text() -> Result[str, HttpError] { @body.text() }
+
 /// Дочитать и отбросить тело → conn в пул (потребляет Response).
 #stable(since = "0.1")
 export fn Response consume @drain() -> Result[(), HttpError] { @body.drain() }
+
 /// Взять потоковый ридер тела (потребляет Response; ручной pull).
 #stable(since = "0.1")
 export fn Response consume @into_reader() -> BodyReader { @body.into_reader() }

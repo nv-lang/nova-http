@@ -94,6 +94,7 @@ export type FromRequest protocol {
 // имя Path коллидирует со std/fs Path во флагман-CU (кодоген генерит .data на чужой
 // структуре); ВЕРНУТЬ имя Path после фикса №28 (Axum-паритет имени).
 export type PathParam[T] value { priv data T }
+
 /// The decoded value (property accessor, D117 — not a bare field).
 #stable(since = "0.1")
 export fn PathParam[T] @data() -> T => @data
@@ -103,6 +104,7 @@ export fn PathParam[T] @data() -> T => @data
 /// on `Json[T]` in respond.nv (same root cause, same fix).
 #stable(since = "0.1")
 export type Query[T] value { priv data T }
+
 /// The decoded value (property accessor, D117 — not a bare field).
 #stable(since = "0.1")
 export fn Query[T] @data() -> T => @data
@@ -110,6 +112,7 @@ export fn Query[T] @data() -> T => @data
 /// The raw request body, unparsed.
 #stable(since = "0.1")
 export type Bytes value { priv data []u8 }
+
 /// The raw bytes (property accessor, D117 — not a bare field).
 #stable(since = "0.1")
 export fn Bytes @data() -> []u8 => @data
@@ -117,6 +120,7 @@ export fn Bytes @data() -> []u8 => @data
 /// The request body as UTF-8 text.
 #stable(since = "0.1")
 export type Text value { priv data str }
+
 /// The decoded text (property accessor, D117 — not a bare field).
 #stable(since = "0.1")
 export fn Text @data() -> str => @data
@@ -124,6 +128,7 @@ export fn Text @data() -> str => @data
 /// The request's headers.
 #stable(since = "0.1")
 export type Headers value { priv data HeaderMap }
+
 /// The header map (property accessor, D117 — not a bare field).
 #stable(since = "0.1")
 export fn Headers @data() -> HeaderMap => @data
@@ -208,6 +213,7 @@ export fn ParamsDeserializer mut @deser_bytes() -> Result[[]u8, DeError] {
     ro s = flat_need_cur(@cur)?
     Ok(s.bytes())
 }
+
 #stable(since = "0.1")
 export fn ParamsDeserializer mut @is_null() -> Result[bool, DeError] => Ok(@cur.is_none())
 #stable(since = "0.1")
@@ -220,6 +226,7 @@ export fn ParamsDeserializer mut @enter_field(key str) -> Result[ParamsDeseriali
         None    => Err(DeError.new(MissingField(key)))
     }
 }
+
 #stable(since = "0.1")
 export fn ParamsDeserializer mut @enter_field_or_null(key str) -> Result[ParamsDeserializer, DeError] =>
     Ok({ @pairs, cur: flat_find(@pairs, key) })
@@ -237,12 +244,14 @@ export fn ParamsDeserializer mut @seq_len() -> Result[int, DeError] =>
 export fn ParamsDeserializer mut @enter_index(i int) -> Result[ParamsDeserializer, DeError] {
     if i == 0 && @cur.is_some() { Ok(@) } else { Err(DeError.new(Other("sequence index out of range"))) }
 }
+
 #stable(since = "0.1")
 export fn ParamsDeserializer mut @map_keys() -> Result[[]str, DeError] {
     mut out []str = []str.new()
     for (k, _) in @pairs { out.push(k) }
     Ok(out)
 }
+
 #stable(since = "0.1")
 export fn ParamsDeserializer mut @enter_key(key str) -> Result[ParamsDeserializer, DeError] => @enter_field(key)
 
@@ -272,6 +281,7 @@ export fn QueryDeserializer mut @deser_bytes() -> Result[[]u8, DeError] {
     ro s = flat_need_cur(@cur)?
     Ok(s.bytes())
 }
+
 #stable(since = "0.1")
 export fn QueryDeserializer mut @is_null() -> Result[bool, DeError] => Ok(@cur.is_none())
 #stable(since = "0.1")
@@ -284,6 +294,7 @@ export fn QueryDeserializer mut @enter_field(key str) -> Result[QueryDeserialize
         None    => Err(DeError.new(MissingField(key)))
     }
 }
+
 #stable(since = "0.1")
 export fn QueryDeserializer mut @enter_field_or_null(key str) -> Result[QueryDeserializer, DeError] =>
     Ok({ @pairs, cur: flat_find(@pairs, key) })
@@ -298,12 +309,14 @@ export fn QueryDeserializer mut @seq_len() -> Result[int, DeError] =>
 export fn QueryDeserializer mut @enter_index(i int) -> Result[QueryDeserializer, DeError] {
     if i == 0 && @cur.is_some() { Ok(@) } else { Err(DeError.new(Other("sequence index out of range"))) }
 }
+
 #stable(since = "0.1")
 export fn QueryDeserializer mut @map_keys() -> Result[[]str, DeError] {
     mut out []str = []str.new()
     for (k, _) in @pairs { out.push(k) }
     Ok(out)
 }
+
 #stable(since = "0.1")
 export fn QueryDeserializer mut @enter_key(key str) -> Result[QueryDeserializer, DeError] => @enter_field(key)
 

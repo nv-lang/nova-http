@@ -39,15 +39,19 @@ export fn Mime @subtype() -> str => @msub
 /// `text/plain`.
 #stable(since = "0.1")
 export fn Mime.text_plain() -> Mime => { mtype: "text", msub: "plain" }
+
 /// `application/json`.
 #stable(since = "0.1")
 export fn Mime.application_json() -> Mime => { mtype: "application", msub: "json" }
+
 /// `application/octet-stream`.
 #stable(since = "0.1")
 export fn Mime.application_octet() -> Mime => { mtype: "application", msub: "octet-stream" }
+
 /// `text/html`.
 #stable(since = "0.1")
 export fn Mime.text_html() -> Mime => { mtype: "text", msub: "html" }
+
 /// `application/x-www-form-urlencoded`.
 #stable(since = "0.1")
 export fn Mime.form_urlencoded() -> Mime => { mtype: "application", msub: "x-www-form-urlencoded" }

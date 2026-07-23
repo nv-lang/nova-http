@@ -133,51 +133,67 @@ export fn StatusCode @reason() -> str {
 /// 200 OK.
 #stable(since = "0.1")
 export fn StatusCode.ok() -> StatusCode => { code: 200 }
+
 /// 201 Created.
 #stable(since = "0.1")
 export fn StatusCode.created() -> StatusCode => { code: 201 }
+
 /// 204 No Content.
 #stable(since = "0.1")
 export fn StatusCode.no_content() -> StatusCode => { code: 204 }
+
 /// 301 Moved Permanently.
 #stable(since = "0.1")
 export fn StatusCode.moved_permanently() -> StatusCode => { code: 301 }
+
 /// 302 Found.
 #stable(since = "0.1")
 export fn StatusCode.found() -> StatusCode => { code: 302 }
+
 /// 304 Not Modified.
 #stable(since = "0.1")
 export fn StatusCode.not_modified() -> StatusCode => { code: 304 }
+
 /// 307 Temporary Redirect.
 #stable(since = "0.1")
 export fn StatusCode.temporary_redirect() -> StatusCode => { code: 307 }
+
 /// 308 Permanent Redirect.
 #stable(since = "0.1")
 export fn StatusCode.permanent_redirect() -> StatusCode => { code: 308 }
+
 /// 400 Bad Request.
 #stable(since = "0.1")
 export fn StatusCode.bad_request() -> StatusCode => { code: 400 }
+
 /// 401 Unauthorized.
 #stable(since = "0.1")
 export fn StatusCode.unauthorized() -> StatusCode => { code: 401 }
+
 /// 403 Forbidden.
 #stable(since = "0.1")
 export fn StatusCode.forbidden() -> StatusCode => { code: 403 }
+
 /// 404 Not Found.
 #stable(since = "0.1")
 export fn StatusCode.not_found() -> StatusCode => { code: 404 }
+
 /// 405 Method Not Allowed.
 #stable(since = "0.1")
 export fn StatusCode.method_not_allowed() -> StatusCode => { code: 405 }
+
 /// 429 Too Many Requests.
 #stable(since = "0.1")
 export fn StatusCode.too_many_requests() -> StatusCode => { code: 429 }
+
 /// 500 Internal Server Error.
 #stable(since = "0.1")
 export fn StatusCode.internal_error() -> StatusCode => { code: 500 }
+
 /// 502 Bad Gateway.
 #stable(since = "0.1")
 export fn StatusCode.bad_gateway() -> StatusCode => { code: 502 }
+
 /// 503 Service Unavailable.
 #stable(since = "0.1")
 export fn StatusCode.service_unavailable() -> StatusCode => { code: 503 }

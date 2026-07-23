@@ -67,15 +67,19 @@ fn MethodRouter mut @add(method str, h Handler) -> @ { @routes.push(MethodEntry{
 /// Add a `GET` handler to this route's method set.
 #stable(since = "0.1")
 export fn MethodRouter mut @get(h Handler) -> @ { @add("GET", h) }
+
 /// Add a `POST` handler to this route's method set.
 #stable(since = "0.1")
 export fn MethodRouter mut @post(h Handler) -> @ { @add("POST", h) }
+
 /// Add a `PUT` handler to this route's method set.
 #stable(since = "0.1")
 export fn MethodRouter mut @put(h Handler) -> @ { @add("PUT", h) }
+
 /// Add a `DELETE` handler to this route's method set.
 #stable(since = "0.1")
 export fn MethodRouter mut @delete(h Handler) -> @ { @add("DELETE", h) }
+
 /// Add a `PATCH` handler to this route's method set.
 #stable(since = "0.1")
 export fn MethodRouter mut @patch(h Handler) -> @ { @add("PATCH", h) }
@@ -110,15 +114,19 @@ fn MethodRouter @allowed_methods() -> []str {
 /// Start a method-chain with a `GET` handler (`get(h).post(h2)` composability).
 #stable(since = "0.1")
 export fn get(h Handler) -> MethodRouter { mut mr = MethodRouter.new(); mr.get(h); mr }
+
 /// Start a method-chain with a `POST` handler.
 #stable(since = "0.1")
 export fn post(h Handler) -> MethodRouter { mut mr = MethodRouter.new(); mr.post(h); mr }
+
 /// Start a method-chain with a `PUT` handler.
 #stable(since = "0.1")
 export fn put(h Handler) -> MethodRouter { mut mr = MethodRouter.new(); mr.put(h); mr }
+
 /// Start a method-chain with a `DELETE` handler.
 #stable(since = "0.1")
 export fn delete(h Handler) -> MethodRouter { mut mr = MethodRouter.new(); mr.delete(h); mr }
+
 /// Start a method-chain with a `PATCH` handler.
 #stable(since = "0.1")
 export fn patch(h Handler) -> MethodRouter { mut mr = MethodRouter.new(); mr.patch(h); mr }
@@ -255,6 +263,7 @@ export fn Router.new() -> Router {
 /// override below).
 #stable(since = "0.1")
 export fn Router mut @fallback(h Handler) -> @ { @fallback = Some(h) }
+
 /// Global 404 handler (property read).
 #stable(since = "0.1")
 export fn Router @fallback() -> Option[Handler] => @fallback
@@ -356,21 +365,25 @@ fn Router mut @insert_segs(segs []str, path str, mr MethodRouter) -> Result[(), 
 export fn Router mut @get(path str, h Handler) -> Result[(), HttpError] {
     mut mr = MethodRouter.new(); mr.get(h); @route(path, mr)
 }
+
 /// Register a single `POST` handler at `path`.
 #stable(since = "0.1")
 export fn Router mut @post(path str, h Handler) -> Result[(), HttpError] {
     mut mr = MethodRouter.new(); mr.post(h); @route(path, mr)
 }
+
 /// Register a single `PUT` handler at `path`.
 #stable(since = "0.1")
 export fn Router mut @put(path str, h Handler) -> Result[(), HttpError] {
     mut mr = MethodRouter.new(); mr.put(h); @route(path, mr)
 }
+
 /// Register a single `DELETE` handler at `path`.
 #stable(since = "0.1")
 export fn Router mut @delete(path str, h Handler) -> Result[(), HttpError] {
     mut mr = MethodRouter.new(); mr.delete(h); @route(path, mr)
 }
+
 /// Register a single `PATCH` handler at `path`.
 #stable(since = "0.1")
 export fn Router mut @patch(path str, h Handler) -> Result[(), HttpError] {
