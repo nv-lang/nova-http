@@ -23,31 +23,14 @@ test "str.into_response(): 200 text/plain with the string as body" {
 
 // ── StatusCode : IntoResponse ──────────────────────────────────────────────
 
-// `[M-assoc-const-chained-method-call-p67]` (found this wave, 2026-07-24):
-// a method call chained DIRECTLY onto a bare out-of-body assoc-const access
-// (`StatusCode.NOT_FOUND.into_response()`, no intermediate binding) ICEs
-// codegen — `emit_c.rs:56742 [P67-LEGACY] Path call return type unknown (no
-// method segment)`. Isolated minimal repro (20 lines, standalone package,
-// unrelated to Json/HttpError): `type Widget value { code int }` + `const
-// Widget.OK Widget = { code: 200 }` + a protocol `@m() -> int` impl'd on
-// `Widget` + `Widget.OK.m()` — reproduces standalone. Root-caused (not
-// guessed) via bisection: PASSES with the const alone (unused), PASSES with
-// the const used as a plain call ARGUMENT (`Status(StatusCode.FORBIDDEN)`
-// below, line ~108, `HttpError.new(Status(StatusCode.UNAUTHORIZED))` in
-// auth.nv), PASSES with 6 other `StatusCode.CONST` sites in THIS file used
-// as call arguments — FAILS only for this exact "const value, then a
-// further `.method()` call directly on it" shape. Likely cause: the parser/
-// lowering flattens the whole dotted chain (`Type`, `CONST`, `method`) into
-// a single 3-segment `Path` node ahead of the trailing call, instead of
-// `(Member(Path[Type,CONST], "method"))()` — the emit_c legacy Path-call
-// return-type inference only handles `parts.len()==2`. Workaround (applied
-// here): bind the const to a local first — breaks the 3-segment chain into
-// a 2-segment `Path` (local ident lookup) + a separate `Member` call, which
-// hits the ALREADY-working method-call inference path instead. Reported to
-// integrator (this worktree does not touch the nova repo).
+// A method call chained DIRECTLY onto a bare out-of-body assoc-const
+// (`StatusCode.NOT_FOUND.into_response()`, no intermediate binding) — this
+// once ICE'd codegen (`[M-assoc-const-chained-method-call-p67]`); fixed in
+// the nova compiler (3-segment `Path[Type,CONST,method]` call now resolves
+// as a method on the const value). The direct-chain form below is the
+// package-side confirmation of that fix.
 test "StatusCode.into_response(): bodyless response at that status" {
-    ro sc = StatusCode.NOT_FOUND
-    ro resp = sc.into_response()
+    ro resp = StatusCode.NOT_FOUND.into_response()
     assert(resp.status_code() == 404)
     assert(resp.body.len() == 0)
 }
@@ -55,14 +38,11 @@ test "StatusCode.into_response(): bodyless response at that status" {
 // ── StatusCode named constants (plan 222.5 §4а-РЕШЕНИЕ, out-of-body form) ──
 
 test "StatusCode.OK equals the equivalent StatusCode.new(200)! value" {
-    // `.code()`/`.into_response()` etc chained DIRECTLY onto a bare const hits
-    // `[M-assoc-const-chained-method-call-p67]` (see the marker above) — bind
-    // to a local first (same workaround).
     ro ok = StatusCode.OK
     ro nf = StatusCode.NOT_FOUND
     assert(ok == StatusCode.new(200)!!)
     assert(nf == StatusCode.new(404)!!)
-    assert(ok.code() == 200)
+    assert(StatusCode.OK.code() == 200)   // direct chain on a bare assoc-const (p67 fix)
     assert(ok != nf)
 }
 
