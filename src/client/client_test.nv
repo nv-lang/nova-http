@@ -25,10 +25,10 @@ test "HttpClientBuilder: mutating chain applies BOTH settings on one instance" {
         mut b = HttpClient.builder()
         b.default_header("X-Trace", "abc")
         b.user_agent("nova-test/1.0")
-        ro client = b.into_build()!!
-        consume r1 = client.get("http://x.example/echo-header").into_send()!!
+        ro client = b.into_client()!!
+        consume r1 = client.get("http://x.example/echo-header").send()!!
         assert(r1.into_text()!! == "abc")
-        consume r2 = client.get("http://x.example/echo-ua").into_send()!!
+        consume r2 = client.get("http://x.example/echo-ua").send()!!
         assert(r2.into_text()!! == "nova-test/1.0")
     }
 }

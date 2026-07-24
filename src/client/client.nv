@@ -10,7 +10,7 @@
 // Landed (CORE, plaintext HTTP/1.1):
 //   · HttpClient + HttpClientBuilder (default headers, redirect policy, UA).
 //   · RequestBuilder: get/post/put/delete/patch/head + request; header/append_header,
-//     query, body/text/json(dynamic)/form, bearer_auth/basic_auth; into_send/into_build.
+//     query, body/text/json(dynamic)/form, bearer_auth/basic_auth; send/into_client.
 //   · Redirect following (limit + TooManyRedirects; 303/301/302→GET-ify;
 //     307/308 preserve; cross-origin Authorization+Cookie strip).
 //   · Content-Length (identity) + Transfer-Encoding: chunked (wire.nv).
@@ -147,7 +147,7 @@ export fn HttpClientBuilder mut @max_decompressed(max_bytes int) -> @ {
 /// Finalize the client. Fallible for parity with the full builder (tls/proxy);
 /// CORE construction never fails.
 #stable(since = "0.1")
-export fn HttpClientBuilder consume @into_build() -> Result[HttpClient, HttpError] =>
+export fn HttpClientBuilder consume @into_client() -> Result[HttpClient, HttpError] =>
     Ok({ @default_headers, @follow_redirects, @max_redirects, @user_agent, @auto_decompress, @max_decompressed })
 
 // ── verb shortcuts ───────────────────────────────────────────────────────────
@@ -204,7 +204,7 @@ export type RequestBuilder value {
 // RequestBuilder → мутирующие свойства (D117 AMEND-2, `mut @x(v) -> @`, auto
 // self-return D409). Копирующая форма shallow-copy'ила heap-backed
 // `header_ops`/`query`/`body_bytes`. Беглые цепочки
-// (`client.get(u).header(..).into_send()`) корректны после 184 Ф.2.
+// (`client.get(u).header(..).send()`) корректны после 184 Ф.2.
 
 /// Set a header (replace all prior values of this name).
 #stable(since = "0.1")
@@ -287,7 +287,11 @@ export fn RequestBuilder @build() -> Result[Request, HttpError] {
 /// Send the request (round-trip through the `Http` seam), following redirects.
 /// Returns a must-consume `Response` (4xx/5xx included — use `error_for_status`).
 #stable(since = "0.1")
-export fn RequestBuilder consume @into_send() Http -> Result[Response, HttpError] {
+// send = ЭФФЕКТНОЕ ДЕЙСТВИЕ (Http round-trip), не конверсия владения: ось §1а
+// into_* покрывает конверсии, не сетевые действия (приёмка волны №79;
+// кандидат — эффект-исключение в сам линт W_CONSUME_NAKED_NAME).
+// nova:allow W_CONSUME_NAKED_NAME -- effectful action, not a conversion
+export fn RequestBuilder consume @send() Http -> Result[Response, HttpError] {
     // `mut` (not `ro`): `apply_query` takes `u` as a `mut` in-out param
     // (D246 canon (a)) — used exactly once, right below.
     mut url0 = @url_input.to_url()?
@@ -309,22 +313,22 @@ export fn RequestBuilder consume @into_send() Http -> Result[Response, HttpError
 
 /// One-shot GET (script convenience).
 #stable(since = "0.1")
-export fn get(url str) Http -> Result[Response, HttpError] => HttpClient.new().get(url).into_send()
+export fn get(url str) Http -> Result[Response, HttpError] => HttpClient.new().get(url).send()
 /// One-shot HEAD.
 #stable(since = "0.1")
-export fn head(url str) Http -> Result[Response, HttpError] => HttpClient.new().head(url).into_send()
+export fn head(url str) Http -> Result[Response, HttpError] => HttpClient.new().head(url).send()
 /// One-shot DELETE.
 #stable(since = "0.1")
-export fn delete(url str) Http -> Result[Response, HttpError] => HttpClient.new().delete(url).into_send()
+export fn delete(url str) Http -> Result[Response, HttpError] => HttpClient.new().delete(url).send()
 /// One-shot POST with a byte body.
 #stable(since = "0.1")
-export fn post(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().post(url).body(body).into_send()
+export fn post(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().post(url).body(body).send()
 /// One-shot PUT with a byte body.
 #stable(since = "0.1")
-export fn put(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().put(url).body(body).into_send()
+export fn put(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().put(url).body(body).send()
 /// One-shot PATCH with a byte body.
 #stable(since = "0.1")
-export fn patch(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().patch(url).body(body).into_send()
+export fn patch(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().patch(url).body(body).send()
 
 // ── request execution + redirect loop ───────────────────────────────────────
 

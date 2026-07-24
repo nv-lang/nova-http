@@ -41,7 +41,7 @@ test "decompress: gzip body is transparently decoded" {
     ro m = mock_http().on("GET", "/g",
         MockResponse.new(200).header("Content-Encoding", "gzip").body(gz(payload)))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
-        ro resp = HttpClient.new().get("http://x.example/g").into_send()!!
+        ro resp = HttpClient.new().get("http://x.example/g").send()!!
         assert(resp.into_text()!! == payload)
     }
 }
@@ -53,7 +53,7 @@ test "decompress: deflate (zlib) body decoded, Content-Encoding dropped" {
     ro m = mock_http().on("GET", "/d",
         MockResponse.new(200).header("Content-Encoding", "deflate").body(zl(payload)))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
-        ro resp = HttpClient.new().get("http://x.example/d").into_send()!!
+        ro resp = HttpClient.new().get("http://x.example/d").send()!!
         // Header now describes the DECODED body (Content-Encoding stripped).
         assert(match resp.header("content-encoding") { Some(_) => false, None => true })
         assert(resp.into_text()!! == payload)
@@ -70,8 +70,8 @@ test "decompress: disabled → body stays gzip-compressed" {
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
         mut b = HttpClient.builder()
         b.no_decompress()
-        ro client = b.into_build()!!
-        ro resp = client.get("http://x.example/r").into_send()!!
+        ro client = b.into_client()!!
+        ro resp = client.get("http://x.example/r").send()!!
         // Body is returned verbatim (still gzip), Content-Encoding preserved.
         assert(match resp.header("content-encoding") { Some(e) => e == "gzip", None => false })
         assert(resp.into_bytes()!!.len() == compressed.len())
@@ -92,8 +92,8 @@ test "decompress: gzip bomb past max_decompressed → Err(BodyTooLarge)" {
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
         mut b = HttpClient.builder()
         b.max_decompressed(256)
-        ro client = b.into_build()!!
-        ro res = client.get("http://x.example/bomb").into_send()
+        ro client = b.into_client()!!
+        ro res = client.get("http://x.example/bomb").send()
         assert(match res {
             Ok(resp) => { ro _ = resp.drain(); false }
             Err(e)   => match e.kind { BodyTooLarge => true, _ => false }
