@@ -24,3 +24,8 @@ nova.local.toml
 # 2026-07-23) — `cargo build --release --target-dir <this>/target-cli`,
 # built straight from nova main's own sources; not the repo's own artifact.
 target-cli/
+
+# Machine-local nova_rt scaffold (nova test resolves compiler-codegen/nova_rt/
+# — incl. the libuv checkout — relative to the repo under test; copied from
+# the nova main repo on this machine, never committed).
+compiler-codegen/
