@@ -50,7 +50,7 @@ export type RedirectPolicy enum NoFollow | Limited(int)
 type HeaderKV value { ro name str, ro value str }
 
 // Default decompressed-body cap (DoS/bomb guard, D334): 64 MiB. Overridable via
-// `HttpClientBuilder.max_decompressed(n)`; a per-request `with_limit` on the Body
+// `HttpClientBuilder.max_decompressed(n)`; a per-request `.limit()` on the Body
 // is a separate, complementary guard on the DECODED size.
 const DEFAULT_MAX_DECOMPRESSED = 67108864
 

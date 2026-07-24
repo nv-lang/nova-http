@@ -42,7 +42,7 @@ export type HeaderValue value { priv bytes []u8 }
 
 /// Из сырых байт. CR/LF/NUL → `InvalidHeader` (anti-injection).
 ///
-/// Имя `to_header_value_bytes`, НЕ `to_header_value` — одноимённые расширения
+/// Имя `into_header_value` (consume, перенос владения байтов — §1а); str-дверь = `to_header_value` — одноимённые расширения
 /// на РАЗНЫХ конкретных ресиверах (`[]u8`/`str`) компилятор не codegen'ит
 /// корректно: `method_receivers` single-key last-wins резолвит ЛЮБОЙ вызов
 /// `.to_header_value()` в ПОСЛЕДНЮЮ объявленную перегрузку
@@ -53,7 +53,7 @@ export type HeaderValue value { priv bytes []u8 }
 /// байтовой формы); `[]u8`-форма несёт различимое имя.
 /// `[M-samename-extension-method-recv-type-collision]`
 #stable(since = "0.1")
-export fn []u8 @to_header_value_bytes() -> Result[HeaderValue, HttpError] {
+export fn []u8 consume @into_header_value() -> Result[HeaderValue, HttpError] {
     for byte in @ {
         if is_forbidden_octet(byte) {
             return Err(HttpError.invalid_header("CR/LF/NUL in header value"))
@@ -66,7 +66,7 @@ export fn []u8 @to_header_value_bytes() -> Result[HeaderValue, HttpError] {
 /// codepoint > 0xFF → `InvalidHeader`.
 ///
 /// Имя `to_header_value` — первичная форма, см. маркер
-/// `[M-samename-extension-method-recv-type-collision]` на `[]u8 @to_header_value_bytes()` выше.
+/// `[M-samename-extension-method-recv-type-collision]` на `[]u8 consume @into_header_value()` выше.
 #stable(since = "0.1")
 export fn str @to_header_value() -> Result[HeaderValue, HttpError] {
     mut buf = WriteBuffer.new()
@@ -167,7 +167,7 @@ export fn HeaderMap mut @append(name str, value str) -> Result[(), HttpError] {
 #stable(since = "0.1")
 export fn HeaderMap mut @append_bytes(name str, value []u8) -> Result[(), HttpError] {
     ro hn = name.to_header_name()?
-    ro hv = value.to_header_value_bytes()?
+    ro hv = value.into_header_value()?
     @entries.push(HeaderEntry { name: hn, value: hv })
     Ok(())
 }

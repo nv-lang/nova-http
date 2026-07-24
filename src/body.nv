@@ -61,7 +61,13 @@ export fn Body.empty() -> Body => { repr: InMemory([]u8.new()), limit: -1 }
 /// несёт различимое имя `to_body_utf8` ниже, а не тот же `to_body`.
 /// `[M-samename-extension-method-recv-type-collision]`
 #stable(since = "0.1")
-export fn []u8 @to_body() -> Body => { repr: InMemory(@), limit: -1 }
+// ИНТЕРИМ (аудит владельца 2026-07-25): канон — `consume @into_body()` (перенос
+// владения, zero-copy), но имя-близнец с `BodyReader consume @into_body` бьёт
+// [M-samename-extension-method-recv-type-collision] (№92, ПОДТВЕРЖДЕНО пробой:
+// E_RECV_METHOD_MISMATCH single-key last-wins). До фикса №92 — честный `to_*`
+// с явной копией (§1а: to_ отдаёт НЕЗАВИСИМОЕ значение; прежний alias `InMemory(@)`
+// был нарушением — расшаривал буфер под именем копии). После №92: -> consume @into_body.
+export fn []u8 @to_body() -> Body => { repr: InMemory(@clone()), limit: -1 }
 
 /// Тело из строки (UTF-8-байты). Имя `to_body_utf8`, НЕ `to_body` — см. маркер
 /// `[M-samename-extension-method-recv-type-collision]` на `[]u8 @to_body()` выше.
@@ -77,21 +83,24 @@ export fn BodyReader consume @into_body() -> Body => { repr: Stream(@), limit: -
 
 /// In-memory ридер над списком чанков (для тестов/прокси; pure Nova).
 ///
-/// Receiver написан generic-формой `Vec[T] @to_body_reader()` (T НЕ used иначе),
-/// НЕ конкретной `[][]u8`/`Vec[[]u8] @to_body_reader()` — обе конкретные формы
+/// Receiver написан generic-формой `Vec[T] consume @into_body_reader()` (T НЕ used иначе),
+/// НЕ конкретной `[][]u8`/`Vec[[]u8]` — обе конкретные формы
 /// компилятор не резолвит на call-site (`[E7320] no field or method
-/// to_body_reader on type Vec`, изолированный repro подтвердил: single-level
+/// метод on type Vec`, изолированный repro подтвердил: single-level
 /// `[]u8 @m()` резолвится, двойной `[][]u8 @m()`/`Vec[[]u8] @m()` — нет).
 /// `T` привязывается к `[]u8` через return-type-констрейнт поля `chunks`
 /// (`{ chunks: @, .. }` требует `Vec[T] == [][]u8`) — та же call-site
 /// безопасность, что и у конкретной формы. `[M-nested-vec-concrete-extension-unresolved]`
-export fn Vec[T] @to_body_reader() -> BodyReader => { chunks: @, pos: 0 }
+export fn Vec[T] consume @into_body_reader() -> BodyReader => { chunks: @, pos: 0 }
 
 // ── Max-size guard (DoS/OOM-защита) ──────────────────────────────────────────
 
-/// Ограничить материализацию: `bytes`/`text` → `BodyTooLarge` при превышении.
+/// Лимит чтения тела (байт; -1 = без лимита). Property-сеттер по арности
+/// (D84/D117-амендмент: поля = одноимённые методы-свойства; аудит владельца
+/// 2026-07-25 — прежний `consume @with_limit` был обходной формой: wither
+/// не нужен, лимит правится на месте, линейность Body не задета).
 #stable(since = "0.1")
-export fn Body consume @with_limit(max_bytes int) -> Body => { @repr, limit: max_bytes }
+export fn Body mut @limit(max_bytes int) -> @ { @limit = max_bytes }
 
 // ── Потребляющие методы (Response-side; разряжают must-consume) ───────────────
 
@@ -110,9 +119,12 @@ export fn Body consume @into_bytes() -> Result[[]u8, HttpError] {
 #stable(since = "0.1")
 export fn Body consume @into_text() -> Result[str, HttpError] {
     ro bytes = @into_bytes()?
-    match utf8_to_str(bytes) {
+    // std-дверь []u8 @to_str() (D410 «на источнике») — локальный utf8-валидатор
+    // не нужен (аудит владельца 2026-07-25: url-хелпер оправдан позицией ошибки,
+    // body позицию не несёт).
+    match bytes.to_str() {
         Ok(s)  => Ok(s)
-        Err(_) => Err(HttpError.protocol_error("body is not valid UTF-8; use bytes()"))
+        Err(_) => Err(HttpError.protocol_error("body is not valid UTF-8; use into_bytes()"))
     }
 }
 
@@ -132,7 +144,7 @@ export fn Body consume @drain() -> Result[(), HttpError] {
 #stable(since = "0.1")
 export fn Body consume @into_reader() -> BodyReader {
     match @repr {
-        InMemory(b) => single_chunk(b).to_body_reader()
+        InMemory(b) => single_chunk(b).into_body_reader()
         Stream(r)   => r
     }
 }
