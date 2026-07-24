@@ -23,16 +23,66 @@ test "str.into_response(): 200 text/plain with the string as body" {
 
 // ── StatusCode : IntoResponse ──────────────────────────────────────────────
 
+// `[M-assoc-const-chained-method-call-p67]` (found this wave, 2026-07-24):
+// a method call chained DIRECTLY onto a bare out-of-body assoc-const access
+// (`StatusCode.NOT_FOUND.into_response()`, no intermediate binding) ICEs
+// codegen — `emit_c.rs:56742 [P67-LEGACY] Path call return type unknown (no
+// method segment)`. Isolated minimal repro (20 lines, standalone package,
+// unrelated to Json/HttpError): `type Widget value { code int }` + `const
+// Widget.OK Widget = { code: 200 }` + a protocol `@m() -> int` impl'd on
+// `Widget` + `Widget.OK.m()` — reproduces standalone. Root-caused (not
+// guessed) via bisection: PASSES with the const alone (unused), PASSES with
+// the const used as a plain call ARGUMENT (`Status(StatusCode.FORBIDDEN)`
+// below, line ~108, `HttpError.new(Status(StatusCode.UNAUTHORIZED))` in
+// auth.nv), PASSES with 6 other `StatusCode.CONST` sites in THIS file used
+// as call arguments — FAILS only for this exact "const value, then a
+// further `.method()` call directly on it" shape. Likely cause: the parser/
+// lowering flattens the whole dotted chain (`Type`, `CONST`, `method`) into
+// a single 3-segment `Path` node ahead of the trailing call, instead of
+// `(Member(Path[Type,CONST], "method"))()` — the emit_c legacy Path-call
+// return-type inference only handles `parts.len()==2`. Workaround (applied
+// here): bind the const to a local first — breaks the 3-segment chain into
+// a 2-segment `Path` (local ident lookup) + a separate `Member` call, which
+// hits the ALREADY-working method-call inference path instead. Reported to
+// integrator (this worktree does not touch the nova repo).
 test "StatusCode.into_response(): bodyless response at that status" {
-    ro resp = StatusCode.not_found().into_response()
+    ro sc = StatusCode.NOT_FOUND
+    ro resp = sc.into_response()
     assert(resp.status_code() == 404)
     assert(resp.body.len() == 0)
+}
+
+// ── StatusCode named constants (plan 222.5 §4а-РЕШЕНИЕ, out-of-body form) ──
+
+test "StatusCode.OK equals the equivalent StatusCode.new(200)! value" {
+    // `.code()`/`.into_response()` etc chained DIRECTLY onto a bare const hits
+    // `[M-assoc-const-chained-method-call-p67]` (see the marker above) — bind
+    // to a local first (same workaround).
+    ro ok = StatusCode.OK
+    ro nf = StatusCode.NOT_FOUND
+    assert(ok == StatusCode.new(200)!!)
+    assert(nf == StatusCode.new(404)!!)
+    assert(ok.code() == 200)
+    assert(ok != nf)
+}
+
+test "StatusCode constants usable directly in text/json response constructors" {
+    ro text_resp = ServerResponse.text(StatusCode.CREATED, "created")
+    assert(text_resp.status == StatusCode.CREATED)
+    assert(text_resp.status_code() == 201)
+    assert(unsafe { text_resp.body.to_str_unchecked() } == "created")
+
+    ro json_resp = ServerResponse.json(StatusCode.OK, RespWidget{ name: "const", qty: 9 })
+    assert(json_resp.status == StatusCode.OK)
+    assert(json_resp.status_code() == 200)
+    ro body = unsafe { json_resp.body.to_str_unchecked() }
+    assert(body.contains("const"))
 }
 
 // ── ServerResponse : IntoResponse (identity) ───────────────────────────────
 
 test "ServerResponse.into_response(): identity passthrough" {
-    ro built = ServerResponse.text(StatusCode.created(), "made it")
+    ro built = ServerResponse.text(StatusCode.CREATED, "made it")
     ro resp = built.into_response()
     assert(resp.status_code() == 201)
     assert(unsafe { resp.body.to_str_unchecked() } == "made it")
@@ -41,19 +91,19 @@ test "ServerResponse.into_response(): identity passthrough" {
 // ── StatusCode-typed constructors (§4 chinit "статус голым int") ──────────
 
 test "ServerResponse.text(StatusCode, str): matches the bare-int form's status" {
-    ro resp = ServerResponse.text(StatusCode.ok(), "typed")
+    ro resp = ServerResponse.text(StatusCode.OK, "typed")
     assert(resp.status_code() == 200)
     assert(unsafe { resp.body.to_str_unchecked() } == "typed")
 }
 
 test "ServerResponse.empty(StatusCode): bodyless at the typed status" {
-    ro resp = ServerResponse.empty(StatusCode.no_content())
+    ro resp = ServerResponse.empty(StatusCode.NO_CONTENT)
     assert(resp.status_code() == 204)
     assert(resp.body.len() == 0)
 }
 
 test "ServerResponse.redirect(StatusCode, location): Location header set" {
-    ro resp = ServerResponse.redirect(StatusCode.found(), "/elsewhere")
+    ro resp = ServerResponse.redirect(StatusCode.FOUND, "/elsewhere")
     assert(resp.status_code() == 302)
     ro loc = resp.headers.get("Location")
     assert(match loc { Some(_) => true, None => false })
@@ -76,7 +126,7 @@ test "Json[T].into_response(): 200 application/json with the encoded body" {
 }
 
 test "ServerResponse.json[T](status, v): one-call typed JSON response at a chosen status" {
-    ro resp = ServerResponse.json(StatusCode.created(), RespWidget{ name: "widget", qty: 7 })
+    ro resp = ServerResponse.json(StatusCode.CREATED, RespWidget{ name: "widget", qty: 7 })
     assert(resp.status_code() == 201)
     ro body = unsafe { resp.body.to_str_unchecked() }
     assert(body.contains("widget"))
@@ -105,7 +155,7 @@ test "HttpError.into_response(): BodyTooLarge -> 413" {
 }
 
 test "HttpError.into_response(): Status(c) echoes the embedded status code" {
-    ro resp = HttpError.new(Status(StatusCode.forbidden())).into_response()
+    ro resp = HttpError.new(Status(StatusCode.FORBIDDEN)).into_response()
     assert(resp.status_code() == 403)
 }
 

@@ -270,7 +270,7 @@ fn hex_char_lower(d int) -> u8 {
 // more re-parse/re-validate round-trip (that only existed because `status`
 // used to be a bare `int`, plan 222.5 §4а item 3 unification). Same fallback
 // behaviour as before: an unmatched code (still possible via the deprecated
-// `ServerResponse` bare-`int` constructors' `StatusCode.from_int_unchecked`,
+// `ServerResponse` bare-`int` constructors' `unsafe { StatusCode.new_unchecked }`,
 // which does NOT validate) falls back to the generic "Status" reason.
 fn reason_of(status StatusCode) -> str {
     ro r = status.reason()

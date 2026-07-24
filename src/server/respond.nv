@@ -55,8 +55,9 @@ export type IntoResponse protocol {
 // `.as_u16() as int` delegation cast-bridge into a separate bare-`int` form
 // (`[M-statuscode-u16-cast-bounce]`, CLOSED here). The bare-`int` overloads
 // stay in server.nv too, now DEPRECATED (source-compat bridge over
-// `StatusCode.from_int_unchecked`, ~90 existing call-sites across the package
-// left untouched — soft migration, not a mass site-rewrite this wave).
+// `unsafe { StatusCode.new_unchecked }`, ~90 existing call-sites across the
+// package left untouched — soft migration, not a mass site-rewrite this
+// wave).
 
 // ── Json[T] — response body wrapper (double duty, Axum-parity: the SAME type
 // also gets a `#impl(FromRequest)` in extract.nv, Plan 222.3, for the request
@@ -135,7 +136,7 @@ export fn ServerResponse.json[T Serialize](status StatusCode, v T) -> ServerResp
 }
 
 fn server_json_encode_error(e SerError) -> ServerResponse =>
-    ServerResponse.text(StatusCode.internal_error(), "500 internal server error: ${e.to_str()}")
+    ServerResponse.text(StatusCode.INTERNAL_SERVER_ERROR, "500 internal server error: ${e.to_str()}")
 
 // ── IntoResponse impls (the bulk of this plan's value — blanket Result[R,E]
 // gives `?`-ergonomics in handlers for free) ───────────────────────────────
@@ -146,7 +147,7 @@ export fn ServerResponse consume @into_response() -> ServerResponse => @
 
 /// A bare `str` becomes a `200 OK` `text/plain` response.
 #impl(IntoResponse)
-export fn str consume @into_response() -> ServerResponse => ServerResponse.text(StatusCode.ok(), @)
+export fn str consume @into_response() -> ServerResponse => ServerResponse.text(StatusCode.OK, @)
 
 /// A bare `StatusCode` becomes a bodyless response at that status.
 #impl(IntoResponse)
@@ -155,7 +156,7 @@ export fn StatusCode consume @into_response() -> ServerResponse => ServerRespons
 /// `Json[T Serialize]` becomes a `200 OK` `application/json` response.
 #impl(IntoResponse)
 export fn Json[T Serialize] consume @into_response() -> ServerResponse =>
-    ServerResponse.json(StatusCode.ok(), @data())
+    ServerResponse.json(StatusCode.OK, @data())
 
 /// Structured error body — `{"error": "<kind>", "message": "<detail>"}`, status
 /// from `http_error_status` below (§5.2 resolution, this file's banner).
@@ -183,20 +184,20 @@ fn http_error_kind_name(kind ErrorKind) -> str {
 
 fn http_error_status(kind ErrorKind) -> StatusCode {
     match kind {
-        Connect             => StatusCode.service_unavailable()
-        Dns                 => StatusCode.service_unavailable()
-        Tls                 => StatusCode.service_unavailable()
-        Timeout             => StatusCode.service_unavailable()
-        Protocol(_)         => StatusCode.bad_request()
-        InvalidUrl          => StatusCode.bad_request()
-        InvalidHeader       => StatusCode.bad_request()
+        Connect             => StatusCode.SERVICE_UNAVAILABLE
+        Dns                 => StatusCode.SERVICE_UNAVAILABLE
+        Tls                 => StatusCode.SERVICE_UNAVAILABLE
+        Timeout             => StatusCode.SERVICE_UNAVAILABLE
+        Protocol(_)         => StatusCode.BAD_REQUEST
+        InvalidUrl          => StatusCode.BAD_REQUEST
+        InvalidHeader       => StatusCode.BAD_REQUEST
         Status(c)           => c
-        TooManyRedirects(_) => StatusCode.internal_error()
-        BodyTooLarge        => StatusCode.new(413)!!  // 413 Content Too Large — static literal, in-range by construction
-        Closed              => StatusCode.service_unavailable()
-        Canceled            => StatusCode.service_unavailable()
-        Blocked(_)          => StatusCode.forbidden()
-        Other(_)            => StatusCode.internal_error()
+        TooManyRedirects(_) => StatusCode.INTERNAL_SERVER_ERROR
+        BodyTooLarge        => StatusCode.PAYLOAD_TOO_LARGE  // 413 Content Too Large
+        Closed              => StatusCode.SERVICE_UNAVAILABLE
+        Canceled            => StatusCode.SERVICE_UNAVAILABLE
+        Blocked(_)          => StatusCode.FORBIDDEN
+        Other(_)            => StatusCode.INTERNAL_SERVER_ERROR
     }
 }
 
@@ -239,4 +240,4 @@ export fn Result[R IntoResponse, E IntoResponse] consume @into_response() -> Ser
 /// nova repo).
 #impl(IntoResponse)
 export fn[T Serialize] T consume @into_response() -> ServerResponse =>
-    ServerResponse.json(StatusCode.ok(), @)
+    ServerResponse.json(StatusCode.OK, @)
