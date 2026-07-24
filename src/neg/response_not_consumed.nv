@@ -11,7 +11,7 @@ import http.{Http}
 test "response from send() never consumed → compile error" {
     ro m = mock_http().on("GET", "/x", MockResponse.new(200).text("y"))
     with Http = effect Http { send(host, port, secure, request) { m.reply(request) } } {
-        consume resp = HttpClient.new().get("http://h.example/x").send()!!
+        consume resp = HttpClient.new().get("http://h.example/x").into_send()!!
         // resp is NEVER discharged (no bytes()/text()/drain()) → D133-not-consumed
     }
 }

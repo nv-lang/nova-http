@@ -19,9 +19,9 @@ import std.encoding.json.{JsonValue, Json}
 test "client: GET round-trip via mock" {
     ro m = mock_http().on("GET", "/hello", MockResponse.new(200).text("world"))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
-        ro resp = HttpClient.new().get("http://api.example.com/hello").send()!!
+        ro resp = HttpClient.new().get("http://api.example.com/hello").into_send()!!
         assert(resp.status().code() == 200)
-        assert(resp.text()!! == "world")
+        assert(resp.into_text()!! == "world")
     }
 }
 
@@ -31,7 +31,7 @@ test "client: POST round-trip, 201 + Location" {
         mut resp = HttpClient.new()
             .post("http://ingest.example.com/v1/reports")
             .text("payload")
-            .send()!!
+            .into_send()!!
         assert(resp.status().code() == 201)
         assert(match resp.header("Location") { Some(l) => l == "/v1/reports/7", None => false })
         assert(match resp.drain() { Ok(_) => true, Err(_) => false })
@@ -43,8 +43,8 @@ test "client: query builder + default headers" {
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
         mut b = HttpClient.builder()
         b.default_header("Accept", "application/json")
-        ro client = b.build()!!
-        mut resp = client.get("http://x.example/search").query([("q", "a b&c")]).send()!!
+        ro client = b.into_build()!!
+        mut resp = client.get("http://x.example/search").query([("q", "a b&c")]).into_send()!!
         assert(resp.status().code() == 200)
         assert(match resp.drain() { Ok(_) => true, Err(_) => false })
     }
@@ -56,8 +56,8 @@ test "client: Transfer-Encoding chunked decodes body" {
     ro wire = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n"
     ro m = mock_http().on("GET", "/chunked", MockResponse.raw(wire))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
-        ro resp = HttpClient.new().get("http://x.example/chunked").send()!!
-        assert(resp.text()!! == "Hello World")
+        ro resp = HttpClient.new().get("http://x.example/chunked").into_send()!!
+        assert(resp.into_text()!! == "Hello World")
     }
 }
 
@@ -68,9 +68,9 @@ test "client: follows 301 redirect (same origin)" {
         .on("GET", "/a", MockResponse.new(301).header("Location", "/b"))
         .on("GET", "/b", MockResponse.new(200).text("final"))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
-        ro resp = HttpClient.new().get("http://x.example/a").send()!!
+        ro resp = HttpClient.new().get("http://x.example/a").into_send()!!
         assert(resp.status().code() == 200)
-        assert(resp.text()!! == "final")
+        assert(resp.into_text()!! == "final")
     }
 }
 
@@ -79,8 +79,8 @@ test "client: redirect loop → TooManyRedirects" {
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
         mut b = HttpClient.builder()
         b.redirect(Limited(2))
-        ro client = b.build()!!
-        match client.get("http://x.example/loop").send() {
+        ro client = b.into_build()!!
+        match client.get("http://x.example/loop").into_send() {
             Ok(r)  => { assert(match r.drain() { Ok(_) => true, Err(_) => false }); assert(false) }
             Err(e) => assert(match e.kind { TooManyRedirects(_) => true, _ => false })
         }
@@ -97,9 +97,9 @@ test "client: Authorization stripped on cross-origin redirect" {
         ro resp = HttpClient.new()
             .get("http://a.example/start")
             .bearer_auth("secret")
-            .send()!!
+            .into_send()!!
         // echo body = what the SECOND (cross-origin) request carried → must be empty
-        assert(resp.text()!! == "")
+        assert(resp.into_text()!! == "")
     }
 }
 
@@ -111,8 +111,8 @@ test "client: Authorization preserved on same-origin redirect" {
         ro resp = HttpClient.new()
             .get("http://a.example/start2")
             .bearer_auth("secret")
-            .send()!!
-        assert(resp.text()!! == "Bearer secret")
+            .into_send()!!
+        assert(resp.into_text()!! == "Bearer secret")
     }
 }
 
@@ -121,7 +121,7 @@ test "client: Authorization preserved on same-origin redirect" {
 test "client: 404 is a valid Response (not an error)" {
     ro m = mock_http().on("GET", "/missing", MockResponse.new(404).text("nope"))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
-        mut resp = HttpClient.new().get("http://x.example/missing").send()!!
+        mut resp = HttpClient.new().get("http://x.example/missing").into_send()!!
         assert(resp.status().code() == 404)
         assert(resp.status().is_client_error())
         assert(match resp.drain() { Ok(_) => true, Err(_) => false })
@@ -131,7 +131,7 @@ test "client: 404 is a valid Response (not an error)" {
 test "client: error_for_status converts non-2xx to Err(Status)" {
     ro m = mock_http().on("GET", "/boom", MockResponse.new(500).text("kaboom"))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
-        match HttpClient.new().get("http://x.example/boom").send()!!.error_for_status() {
+        match HttpClient.new().get("http://x.example/boom").into_send()!!.error_for_status() {
             Ok(r)  => { assert(match r.drain() { Ok(_) => true, Err(_) => false }); assert(false) }
             Err(e) => assert(match e.kind { Status(_) => true, _ => false })
         }
@@ -141,8 +141,8 @@ test "client: error_for_status converts non-2xx to Err(Status)" {
 test "client: error_for_status passes 2xx through" {
     ro m = mock_http().on("GET", "/ok", MockResponse.new(200).text("good"))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
-        ro resp = HttpClient.new().get("http://x.example/ok").send()!!.error_for_status()!!
-        assert(resp.text()!! == "good")
+        ro resp = HttpClient.new().get("http://x.example/ok").into_send()!!.error_for_status()!!
+        assert(resp.into_text()!! == "good")
     }
 }
 
@@ -151,7 +151,7 @@ test "client: error_for_status passes 2xx through" {
 test "client: malformed response → Protocol Err" {
     ro m = mock_http().on("GET", "/bad", MockResponse.raw("garbage not http\r\n\r\n"))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
-        match HttpClient.new().get("http://x.example/bad").send() {
+        match HttpClient.new().get("http://x.example/bad").into_send() {
             Ok(r)  => { assert(match r.drain() { Ok(_) => true, Err(_) => false }); assert(false) }
             Err(e) => assert(match e.kind { Protocol(_) => true, _ => false })
         }
@@ -163,8 +163,8 @@ test "client: malformed response → Protocol Err" {
 test "client: body bytes() discharges must-consume" {
     ro m = mock_http().on("GET", "/b", MockResponse.new(200).body("raw".bytes()))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
-        ro resp = HttpClient.new().get("http://x.example/b").send()!!
-        ro bytes = resp.bytes()!!
+        ro resp = HttpClient.new().get("http://x.example/b").into_send()!!
+        ro bytes = resp.into_bytes()!!
         assert(bytes.len() == 3)
     }
 }
@@ -177,8 +177,8 @@ test "client: dynamic json body + json() response parse" {
         .text("{\"ok\":true,\"n\":7}"))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
         ro payload = Json.parse("{\"q\":42}")!!
-        ro resp = HttpClient.new().post("http://x.example/api").json(payload).send()!!
-        ro v = resp.json()!!
+        ro resp = HttpClient.new().post("http://x.example/api").json(payload).into_send()!!
+        ro v = resp.into_json()!!
         assert(v == Json.parse("{\"ok\":true,\"n\":7}")!!)
     }
 }

@@ -44,7 +44,7 @@ import http.{Http, HttpError, ErrorKind}
 /// ```nova
 /// with Net = real_net() {
 ///     with Http = real_http() {
-///         ro resp = HttpClient.new().get("http://example.com/").send()!!
+///         ro resp = HttpClient.new().get("http://example.com/").into_send()!!
 ///         resp.drain()!!
 ///     }
 /// }

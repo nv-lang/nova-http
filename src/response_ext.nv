@@ -39,7 +39,7 @@ export fn Response @cookies() -> []SetCookie {
     mut out = []SetCookie.new()
     for hv in @headers.get_all("set-cookie") {
         match hv.to_str() {
-            Ok(s) => match SetCookie.parse(s) {
+            Ok(s) => match s.to_setcookie() {
                 Ok(sc) => { out.push(sc); () }
                 Err(_) => () // [M-lint-findings-result-discarded-lenient-parse]
             }
@@ -61,7 +61,7 @@ export fn Response consume @error_for_status() -> Result[Response, HttpError] {
     ro st  = @status
     ro hdrs = @headers
     ro ok = st.is_success() || st.is_redirect()
-    ro body = @bytes()?
+    ro body = @into_bytes()?
     if ok {
         Ok(Response.new(ver, st, hdrs, body))
     } else {

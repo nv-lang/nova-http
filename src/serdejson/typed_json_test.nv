@@ -26,8 +26,8 @@ test "typed json: record DTO decodes from response body" {
         .header("Content-Type", "application/json")
         .text(wire_body))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
-        ro resp = HttpClient.new().get("http://x.example/w").send()!!
-        ro w = json_decode_body[Widget](resp.bytes()!!)!!
+        ro resp = HttpClient.new().get("http://x.example/w").into_send()!!
+        ro w = json_decode_body[Widget](resp.into_bytes()!!)!!
         assert(w.id == 7)
         assert(w.name == "gizmo")
         assert(w.tags.len() == 2)
@@ -43,8 +43,8 @@ test "typed json: optional field null decodes to None" {
     ro wire_body = "{\"id\":1,\"name\":\"x\",\"tags\":[],\"ratio\":0.0,\"note\":null}"
     ro m = mock_http().on("GET", "/w2", MockResponse.new(200).text(wire_body))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
-        ro resp = HttpClient.new().get("http://x.example/w2").send()!!
-        ro w = json_decode_body[Widget](resp.bytes()!!)!!
+        ro resp = HttpClient.new().get("http://x.example/w2").into_send()!!
+        ro w = json_decode_body[Widget](resp.into_bytes()!!)!!
         assert(w.note == None)
         assert(w.tags.len() == 0)
     }
@@ -55,8 +55,8 @@ test "typed json: optional field null decodes to None" {
 test "typed json: malformed body → Err(Protocol)" {
     ro m = mock_http().on("GET", "/bad", MockResponse.new(200).text("{not json"))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
-        ro resp = HttpClient.new().get("http://x.example/bad").send()!!
-        match json_decode_body[Widget](resp.bytes()!!) {
+        ro resp = HttpClient.new().get("http://x.example/bad").into_send()!!
+        match json_decode_body[Widget](resp.into_bytes()!!) {
             Ok(_)  => assert(false)
             Err(e) => assert(match e.kind { Protocol(_) => true, _ => false })
         }
@@ -69,26 +69,26 @@ test "typed json: missing required field → Err(Protocol)" {
     ro m = mock_http().on("GET", "/miss", MockResponse.new(200)
         .text("{\"id\":3,\"tags\":[],\"ratio\":2.0}"))     // no "name"
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
-        ro resp = HttpClient.new().get("http://x.example/miss").send()!!
-        match json_decode_body[Widget](resp.bytes()!!) {
+        ro resp = HttpClient.new().get("http://x.example/miss").into_send()!!
+        match json_decode_body[Widget](resp.into_bytes()!!) {
             Ok(_)  => assert(false)
             Err(e) => assert(match e.kind { Protocol(_) => true, _ => false })
         }
     }
 }
 
-// ── method form: `resp.json_as[T]()` (turbofish in return position) ───────────
+// ── method form: `resp.into_json_as[T]()` (turbofish in return position) ───────────
 // [M-codegen-method-return-turbofish] — the generic-method form now monomorphizes
 // correctly (T appears only in the return type; the method-call turbofish carries it).
 
-test "typed json: method form resp.json_as[T]() decodes the body" {
+test "typed json: method form resp.into_json_as[T]() decodes the body" {
     ro wire_body = "{\"id\":9,\"name\":\"widget\",\"tags\":[\"x\",\"y\",\"z\"],\"ratio\":2.5,\"note\":\"hey\"}"
     ro m = mock_http().on("GET", "/wm", MockResponse.new(200)
         .header("Content-Type", "application/json")
         .text(wire_body))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
-        ro resp = HttpClient.new().get("http://x.example/wm").send()!!
-        ro w = resp.json_as[Widget]()!!
+        ro resp = HttpClient.new().get("http://x.example/wm").into_send()!!
+        ro w = resp.into_json_as[Widget]()!!
         assert(w.id == 9)
         assert(w.name == "widget")
         assert(w.tags.len() == 3)
@@ -101,8 +101,8 @@ test "typed json: method form resp.json_as[T]() decodes the body" {
 test "typed json: method form malformed body → Err(Protocol)" {
     ro m = mock_http().on("GET", "/badm", MockResponse.new(200).text("{oops"))
     with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
-        ro resp = HttpClient.new().get("http://x.example/badm").send()!!
-        match resp.json_as[Widget]() {
+        ro resp = HttpClient.new().get("http://x.example/badm").into_send()!!
+        match resp.into_json_as[Widget]() {
             Ok(_)  => assert(false)
             Err(e) => assert(match e.kind { Protocol(_) => true, _ => false })
         }

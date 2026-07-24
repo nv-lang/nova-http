@@ -199,7 +199,7 @@ test "CookieJar: no Cookie header -> empty jar (not an error)" {
 test "set_cookie: Set-Cookie header serialized onto the response wire" {
     mut r = Router.new()
     r.get("/set", fn(req ServerRequest) -> ServerResponse {
-        ro c = SetCookie.parse("sid=xyz; Path=/; Max-Age=60; Secure; HttpOnly; SameSite=Lax")!!
+        ro c = "sid=xyz; Path=/; Max-Age=60; Secure; HttpOnly; SameSite=Lax".to_setcookie()!!
         mut resp = ServerResponse.text(200, "ok")
         resp.set_cookie(c)
         resp
