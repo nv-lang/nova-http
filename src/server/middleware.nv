@@ -108,6 +108,56 @@ export fn Middleware.new(f fn(Handler) -> Handler) -> Middleware => { f }
 /// (`copy_n_nonoverlapping` T-inference — `[M-vec-of-fn-newtype-codegen]`,
 /// probed 2026-07-23), so the flat form is a constructor, exactly the plan's
 /// §4а shape.
+///
+/// RE-AUDITED 2026-07-24 (p-mw-bare-newtype worktree, after №47
+/// [M-vec-of-fn-newtype-codegen] closed in nova main `4dd20ce72`): migration
+/// to a BARE newtype (`export type Middleware fn(Handler) -> Handler`,
+/// mirroring `Handler`) was attempted and reverted — №47's fix does NOT make
+/// the bare shape usable for `Middleware`'s actual composition. Found (fresh
+/// nova.exe built from `4dd20ce72`, isolated in standalone repro fixtures,
+/// NOT re-diagnosed further — main-repo compiler internals are out of scope
+/// for this worktree):
+/// - `Middleware.new(f) -> Middleware => f` (identity return of a `ro`-bound
+///   param under a mut-default return type) hits `[E_READONLY_COERCE]`
+///   (D246 Ф.1б, [M-ro-launder-via-mut-binding]) — worked around with
+///   `-> ro Middleware`, itself legal and clean.
+/// - With the bare newtype, `nova test src` on the REAL package
+///   deterministically SEGFAULTS (`exit=-1073741819`, before even the first
+///   of 134 tests prints) — reproduced in isolation down to: a value of a
+///   NESTED newtype-over-fn (`type Middleware fn(Handler) -> Handler` where
+///   `Handler` is ITSELF `type Handler fn(...) -> ...`) bound to a `ro`
+///   local (via a free-function return, a method return, OR captured into a
+///   nested closure) and then called/composed further breaks codegen —
+///   variants seen: the C declaration's initializer is silently dropped
+///   (`void* x = NULL;`), a subsequent call miscompiles into a bogus direct
+///   call to a nonexistent top-level function named after the local
+///   (`nova_fn_<localname>` — same SYMPTOM as the already-documented [M-16]
+///   below, but triggered WITHOUT any nested-closure capture, by a plain
+///   `ro`/let-binding of a nested-fn-newtype call result), or a linker
+///   failure (`undefined symbol: nova_fn_o`). Single-level fn-newtypes
+///   (`fn(int) -> str` directly, matching the already-closed №53 N53
+///   fixtures) do NOT show this — confirmed differentiator is the NESTING
+///   (a newtype-over-fn whose OWN signature mentions another
+///   newtype-over-fn), not record-vs-scalar payload types. Vec-INDEX
+///   bindings (`ro mw = layers[i]`) of the SAME nested type are unaffected
+///   (matches `vec_of_fn_newtype.nv`'s own note that indexed-element
+///   let-binding has its OWN registration path) — only direct
+///   call-result/method-result let-bindings and closure-captures of the
+///   nested type are broken. `Middleware`'s own `@then` composition
+///   (closure captures two Middleware values, calls them) and `wrap_handler`
+///   (binds+calls per-layer) both exercise exactly this pattern and cannot
+///   avoid it — no in-language workaround found (tried: dropping `@apply` in
+///   favor of direct call-through `mw(h)`, `then` as a free function instead
+///   of a method — both still break at the composition/closure-capture
+///   step). Candidate marker for a future compiler ticket:
+///   `[M-nested-fn-newtype-bind-then-call-broken]` (name not yet claimed in
+///   nova main — pick during triage). The RECORD-wrapper shape below
+///   sidesteps this incidentally: `@f` is a plain field-deref-then-call
+///   (`(@f)(next)`), never a "bind a nested-newtype call/method result to a
+///   local" — so it isn't just historically tied to №47, it also currently
+///   shields against this separate, still-open defect. Do not re-attempt the
+///   bare-newtype migration until that defect has its own fix confirmed by a
+///   standalone repro (available on request from this worktree's history).
 #stable(since = "0.1")
 export fn middleware(f fn(ServerRequest, Handler) -> ServerResponse) -> Middleware {
     ro g = f
