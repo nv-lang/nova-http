@@ -7,21 +7,21 @@
 module http
 
 test "method: parse round-trip + safety/idempotency" {
-    ro g = Method.parse("GET")!!
+    ro g = "GET".to_method()!!
     assert(g.str() == "GET")
     assert(g.is_safe())
     assert(g.is_idempotent())
-    ro pf = Method.parse("PROPFIND")!!
+    ro pf = "PROPFIND".to_method()!!
     assert(match pf { Other(s) => s == "PROPFIND", _ => false })
-    ro post = Method.parse("POST")!!
+    ro post = "POST".to_method()!!
     assert(!post.is_safe())
     assert(!post.is_idempotent())
     assert(post.allows_body())
 }
 
 test "method neg: non-token rejected" {
-    assert(match Method.parse("GE T") { Ok(_) => false, Err(_) => true })
-    assert(match Method.parse("") { Ok(_) => false, Err(_) => true })
+    assert(match "GE T".to_method() { Ok(_) => false, Err(_) => true })
+    assert(match "".to_method() { Ok(_) => false, Err(_) => true })
 }
 
 test "status: class + reason + range guard" {
@@ -96,20 +96,20 @@ test "headermap: Content-Length + Transfer-Encoding conflict → Err (smuggling)
 }
 
 test "mime + content-type parse" {
-    ro m = Mime.parse("Application/JSON")!!
+    ro m = "Application/JSON".to_mime()!!
     assert(m.essence() == "application/json")
     assert(m.mtype() == "application")
     assert(m.subtype() == "json")
-    ro ct = ContentType.parse("text/html; charset=utf-8")!!
+    ro ct = "text/html; charset=utf-8".to_content_type()!!
     assert(ct.mime.essence() == "text/html")
     assert(match ct.charset() { Some(c) => c == "utf-8", None => false })
-    assert(match Mime.parse("nogielsh") { Ok(_) => false, Err(_) => true })
+    assert(match "nogielsh".to_mime() { Ok(_) => false, Err(_) => true })
 }
 
 test "cookie: request header parse + SetCookie send-invariants" {
     ro cs = Cookie.parse_header("a=1; b=2")!!
     assert(cs.len() == 2)
-    ro sc = SetCookie.parse("__Secure-sid=x; Secure; SameSite=Lax; Max-Age=60")!!
+    ro sc = "__Secure-sid=x; Secure; SameSite=Lax; Max-Age=60".to_setcookie()!!
     assert(sc.secure)
     assert(sc.is_persistent())
     assert(!sc.is_sendable(false))
@@ -117,7 +117,7 @@ test "cookie: request header parse + SetCookie send-invariants" {
 }
 
 test "cookie neg: SameSite=None without Secure, __Host- misuse → Err" {
-    assert(match SetCookie.parse("a=b; SameSite=None") { Ok(_) => false, Err(_) => true })
-    assert(match SetCookie.parse("__Host-x=1; Secure; Domain=e.com; Path=/") { Ok(_) => false, Err(_) => true })
-    assert(match SetCookie.parse("__Secure-x=1; SameSite=Lax") { Ok(_) => false, Err(_) => true })
+    assert(match "a=b; SameSite=None".to_setcookie() { Ok(_) => false, Err(_) => true })
+    assert(match "__Host-x=1; Secure; Domain=e.com; Path=/".to_setcookie() { Ok(_) => false, Err(_) => true })
+    assert(match "__Secure-x=1; SameSite=Lax".to_setcookie() { Ok(_) => false, Err(_) => true })
 }

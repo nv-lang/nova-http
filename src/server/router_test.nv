@@ -63,6 +63,37 @@ test "router: MethodRouter composes multiple methods on one path" {
     assert(resp_contains(wp, "posted"))
 }
 
+// ── registration Ok-payload = Router (owner decision №84): both chain forms ────
+// `@route`/`@get`/`@post`/`@put`/`@delete`/`@patch`/`@nest` return
+// `Result[Router, HttpError]` (`Ok(@)`, NOT `Ok(())`) — enables `?`-chaining
+// inside a `Result`-returning fn AND fluent `!!`-chaining directly on an
+// rvalue (mut-receiver-on-rvalue works, verified below), on top of the plain
+// statement forms (`r.get(..)!!`) used throughout this file already.
+
+fn chained_router_via_question_mark() -> Result[Router, HttpError] {
+    mut r = Router.new()
+    r.get("/chain-a", fn(req ServerRequest) -> ServerResponse => ServerResponse.text(200, "chain-a"))?
+     .post("/chain-b", fn(req ServerRequest) -> ServerResponse => ServerResponse.text(200, "chain-b"))
+}
+
+test "router: registration `?`-chains in a Result-returning fn (Ok-payload = Router)" {
+    ro r = chained_router_via_question_mark()!!
+    ro wa = serve_once(r, get_req("/chain-a"))
+    ro wb = serve_once(r, post_req("/chain-b"))
+    assert(resp_contains(wa, "chain-a"))
+    assert(resp_contains(wb, "chain-b"))
+}
+
+test "router: fluent `!!`-chain on an rvalue — Router.new().get(..)!!.post(..)!!" {
+    ro r = Router.new()
+        .get("/fluent-a", fn(req ServerRequest) -> ServerResponse => ServerResponse.text(200, "fluent-a"))!!
+        .post("/fluent-b", fn(req ServerRequest) -> ServerResponse => ServerResponse.text(200, "fluent-b"))!!
+    ro wa = serve_once(r, get_req("/fluent-a"))
+    ro wb = serve_once(r, post_req("/fluent-b"))
+    assert(resp_contains(wa, "fluent-a"))
+    assert(resp_contains(wb, "fluent-b"))
+}
+
 // ── nest: sub-router merged under a prefix ──────────────────────────────────────
 
 test "router: nest merges a sub-router's routes under a prefix" {

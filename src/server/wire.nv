@@ -74,7 +74,8 @@ fn parse_request_line(line []u8) -> Result[(Method, str, str, str, Version), Htt
     // facade-imported method (`to_str_unchecked`) chained directly on a
     // fn-call result loses the concrete element type (backlog-followups.md).
     ro method_bytes []u8 = line[0..sp1]
-    ro method = Method.parse(unsafe { method_bytes.to_str_unchecked() })?
+    ro method_str = unsafe { method_bytes.to_str_unchecked() }
+    ro method = method_str.to_method()?
     ro sp2 = match index_of(line, 0x20, sp1 + 1) {
         Some(x) => x
         None    => return Err(HttpError.protocol_error("request line: no space after target"))

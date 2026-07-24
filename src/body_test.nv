@@ -11,31 +11,31 @@
 module http
 
 test "body: from_bytes/from_str discharge via bytes/text" {
-    consume b1 = Body.from("hello".bytes())
-    assert(b1.bytes()!!.len() == 5)
-    consume b2 = Body.from("héllo")
-    assert(b2.text()!! == "héllo")
+    consume b1 = "hello".bytes().to_body()
+    assert(b1.into_bytes()!!.len() == 5)
+    consume b2 = "héllo".to_body_utf8()
+    assert(b2.into_text()!! == "héllo")
 }
 
 test "body: stream reader drains in order" {
     mut chunks = Vec[[]u8].new()
     chunks.push("ab".bytes())
     chunks.push("cd".bytes())
-    consume b = Body.from(BodyReader.from(chunks))
-    assert(b.bytes()!!.len() == 4)
+    consume b = chunks.to_body_reader().into_body()
+    assert(b.into_bytes()!!.len() == 4)
 }
 
 test "body: with_limit → BodyTooLarge" {
-    consume b = Body.from("0123456789".bytes()).with_limit(4)
-    assert(match b.bytes() { Ok(_) => false, Err(e) => match e.kind { BodyTooLarge => true, _ => false } })
+    consume b = "0123456789".bytes().to_body().with_limit(4)
+    assert(match b.into_bytes() { Ok(_) => false, Err(e) => match e.kind { BodyTooLarge => true, _ => false } })
 }
 
 test "body: text rejects invalid UTF-8" {
     mut bad = Vec[u8].new()
     bad.push(0xFF as u8)
     bad.push(0xFE as u8)
-    consume b = Body.from(bad)
-    assert(match b.text() { Ok(_) => false, Err(_) => true })
+    consume b = bad.to_body()
+    assert(match b.into_text() { Ok(_) => false, Err(_) => true })
 }
 
 test "response: delegating discharge (must-consume body)" {
@@ -43,7 +43,7 @@ test "response: delegating discharge (must-consume body)" {
     consume resp = Response.new(StatusCode.OK, h, "hi".bytes())
     assert(resp.is_success())
     assert(resp.status().code() == 200)
-    assert(resp.text()!! == "hi")
+    assert(resp.into_text()!! == "hi")
 }
 
 test "request: build + drain" {
@@ -51,7 +51,7 @@ test "request: build + drain" {
     ro h = HeaderMap.new()
     consume req = Request.new(Method.Post, u, h, "payload".bytes())
     assert(match req.method() { Post => true, _ => false })
-    assert(req.body_bytes()!!.len() == 7)
+    assert(req.into_body_bytes()!!.len() == 7)
 }
 
 test "httperror: kind + source-chain + to_str" {

@@ -41,6 +41,6 @@ test "decompress: brotli (br) body is transparently decoded" {
         ro resp = HttpClient.new().get("http://x.example/b").send()!!
         // Content-Encoding stripped; body is the decoded plaintext.
         assert(match resp.header("content-encoding") { Some(_) => false, None => true })
-        assert(resp.text()!! == "XXXXXXXXXXYYYYYYYYYY")
+        assert(resp.into_text()!! == "XXXXXXXXXXYYYYYYYYYY")
     }
 }

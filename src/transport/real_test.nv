@@ -20,7 +20,7 @@ import std.net.{mock_net}
 test "real_http: https делает реальное TLS-рукопожатие; non-TLS peer → Err(Tls)" {
     with Net = mock_net() {
         with Http = real_http() {
-            match HttpClient.new().get("https://secure.example/x").send() {
+            match HttpClient.new().get("https://secure.example/x").into_send() {
                 Ok(r)  => { assert(match r.drain() { Ok(_) => true, Err(_) => false }); assert(false) }
                 Err(e) => assert(match e.kind { Tls => true, _ => false })
             }

@@ -10,7 +10,7 @@
 // Landed (CORE, plaintext HTTP/1.1):
 //   · HttpClient + HttpClientBuilder (default headers, redirect policy, UA).
 //   · RequestBuilder: get/post/put/delete/patch/head + request; header/append_header,
-//     query, body/text/json(dynamic)/form, bearer_auth/basic_auth; send/build.
+//     query, body/text/json(dynamic)/form, bearer_auth/basic_auth; send/into_client.
 //   · Redirect following (limit + TooManyRedirects; 303/301/302→GET-ify;
 //     307/308 preserve; cross-origin Authorization+Cookie strip).
 //   · Content-Length (identity) + Transfer-Encoding: chunked (wire.nv).
@@ -147,7 +147,7 @@ export fn HttpClientBuilder mut @max_decompressed(max_bytes int) -> @ {
 /// Finalize the client. Fallible for parity with the full builder (tls/proxy);
 /// CORE construction never fails.
 #stable(since = "0.1")
-export fn HttpClientBuilder consume @build() -> Result[HttpClient, HttpError] =>
+export fn HttpClientBuilder consume @into_client() -> Result[HttpClient, HttpError] =>
     Ok({ @default_headers, @follow_redirects, @max_redirects, @user_agent, @auto_decompress, @max_decompressed })
 
 // ── verb shortcuts ───────────────────────────────────────────────────────────
@@ -287,6 +287,10 @@ export fn RequestBuilder @build() -> Result[Request, HttpError] {
 /// Send the request (round-trip through the `Http` seam), following redirects.
 /// Returns a must-consume `Response` (4xx/5xx included — use `error_for_status`).
 #stable(since = "0.1")
+// send = ЭФФЕКТНОЕ ДЕЙСТВИЕ (Http round-trip), не конверсия владения: ось §1а
+// into_* покрывает конверсии, не сетевые действия (приёмка волны №79;
+// кандидат — эффект-исключение в сам линт W_CONSUME_NAKED_NAME).
+// nova:allow W_CONSUME_NAKED_NAME -- effectful action, not a conversion
 export fn RequestBuilder consume @send() Http -> Result[Response, HttpError] {
     // `mut` (not `ro`): `apply_query` takes `u` as a `mut` in-out param
     // (D246 canon (a)) — used exactly once, right below.
@@ -641,10 +645,10 @@ fn form_encode(fields [](str, str)) -> str {
 // ── dynamic JSON body (Response extension; keeps the json dep out of core) ────
 
 /// Consume the response body and parse it as dynamic JSON (`JsonValue`). For a
-/// typed record `T`, use `http.serdejson.json_decode_body[T](resp.bytes()!!)`.
+/// typed record `T`, use `http.serdejson.json_decode_body[T](resp.into_bytes()!!)`.
 #stable(since = "0.1")
-export fn Response consume @json() -> Result[JsonValue, HttpError] {
-    ro text = @text()?
+export fn Response consume @into_json() -> Result[JsonValue, HttpError] {
+    ro text = @into_text()?
     match Json.parse(text) {
         Ok(v)  => Ok(v)
         Err(_) => Err(HttpError.protocol_error("response body is not valid JSON"))

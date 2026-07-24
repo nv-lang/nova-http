@@ -296,7 +296,7 @@ fn strip_ws(b []u8) -> []u8 {
 
 // `form-data; name="foo"; filename="bar.txt"` → (Some("foo"), Some("bar.txt")).
 // The leading "form-data" segment has no "=" — `split_once` returns `None`
-// for it, silently skipped (matches `ContentType.parse`'s own param-loop
+// for it, silently skipped (matches `str @to_content_type`'s own param-loop
 // shape, mime.nv, module `http` — not reused directly since that module's
 // helpers are private to ITS module, not this one).
 fn parse_content_disposition(s str) -> (Option[str], Option[str]) {
