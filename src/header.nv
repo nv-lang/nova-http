@@ -6,7 +6,7 @@
 // Имя = ASCII tchar, нормализовано lowercase; значение = байты (visible ASCII +
 // obs-text), `str`-API — latin1 fast-path, `@to_str()` fallible на non-ASCII (Q18).
 //
-// БЕЗОПАСНОСТЬ (differentiator): `insert`/`append`/`HeaderValue.from_*` ОТВЕРГАЮТ
+// БЕЗОПАСНОСТЬ (differentiator): `insert`/`append`/`@to_header_value` ОТВЕРГАЮТ
 // CR/LF/NUL в значениях и не-tchar/non-ASCII в именах → request/response-splitting
 // невозможен by construction (Q14). `@content_length` ловит конфликт
 // `Transfer-Encoding` + `Content-Length` (request-smuggling, RFC 7230 §3.3.3).
@@ -20,16 +20,16 @@ export type HeaderName value { priv lower str }
 
 /// Разобрать имя. Пустое / не-tchar / non-ASCII → `InvalidHeader`.
 #stable(since = "0.1")
-export fn HeaderName.parse(s str) -> Result[HeaderName, HttpError] { // [M-lint-findings-static-conversion]
-    if s.byte_len() == 0 {
+export fn str @to_header_name() -> Result[HeaderName, HttpError] {
+    if @byte_len() == 0 {
         return Err(HttpError.invalid_header("empty header name"))
     }
-    for c in s.chars() {
+    for c in @chars() {
         if !is_tchar(c) {
             return Err(HttpError.invalid_header("non-tchar in header name"))
         }
     }
-    Ok({ lower: s.to_ascii_lower() })
+    Ok({ lower: @to_ascii_lower() })
 }
 
 /// Канон. lowercase-имя.
@@ -41,23 +41,37 @@ export fn HeaderName @str() -> str => @lower
 export type HeaderValue value { priv bytes []u8 }
 
 /// Из сырых байт. CR/LF/NUL → `InvalidHeader` (anti-injection).
+///
+/// Имя `to_header_value_bytes`, НЕ `to_header_value` — одноимённые расширения
+/// на РАЗНЫХ конкретных ресиверах (`[]u8`/`str`) компилятор не codegen'ит
+/// корректно: `method_receivers` single-key last-wins резолвит ЛЮБОЙ вызов
+/// `.to_header_value()` в ПОСЛЕДНЮЮ объявленную перегрузку
+/// (`[E_RECV_METHOD_MISMATCH]`, изолированный repro подтвердил на минимальном
+/// файле вне этого пакета — известное семейство багов,
+/// docs/plans/wip/196.5-facet-c-map.md и родня). `str @to_header_value()`
+/// ниже — первичное/чаще используемое имя (2 внутренних call-site vs 1 у
+/// байтовой формы); `[]u8`-форма несёт различимое имя.
+/// `[M-samename-extension-method-recv-type-collision]`
 #stable(since = "0.1")
-export fn HeaderValue.from(b []u8) -> Result[HeaderValue, HttpError] { // [M-lint-findings-static-conversion]
-    for byte in b {
+export fn []u8 @to_header_value_bytes() -> Result[HeaderValue, HttpError] {
+    for byte in @ {
         if is_forbidden_octet(byte) {
             return Err(HttpError.invalid_header("CR/LF/NUL in header value"))
         }
     }
-    Ok({ bytes: b })
+    Ok({ bytes: @ })
 }
 
 /// Из строки (latin1 fast-path: codepoint 0..255 → один байт). CR/LF/NUL или
 /// codepoint > 0xFF → `InvalidHeader`.
+///
+/// Имя `to_header_value` — первичная форма, см. маркер
+/// `[M-samename-extension-method-recv-type-collision]` на `[]u8 @to_header_value_bytes()` выше.
 #stable(since = "0.1")
-export fn HeaderValue.from(s str) -> Result[HeaderValue, HttpError] { // [M-lint-findings-static-conversion]
+export fn str @to_header_value() -> Result[HeaderValue, HttpError] {
     mut buf = WriteBuffer.new()
-    buf.cap(s.byte_len())
-    for c in s.chars() {
+    buf.cap(@byte_len())
+    for c in @chars() {
         ro cp = c as int
         if cp > 0xFF {
             return Err(HttpError.invalid_header("non-latin1 character in header value"))
@@ -132,8 +146,8 @@ export fn HeaderMap @contains(name str) -> bool {
 /// ЗАМЕНИТЬ все прежние значения имени одним новым (set-семантика, D358 §13.1).
 #stable(since = "0.1")
 export fn HeaderMap mut @insert(name str, value str) -> Result[(), HttpError] {
-    ro hn = HeaderName.parse(name)?
-    ro hv = HeaderValue.from(value)?
+    ro hn = name.to_header_name()?
+    ro hv = value.to_header_value()?
     @entries = without_name(@entries, hn.str())
     @entries.push(HeaderEntry { name: hn, value: hv })
     Ok(())
@@ -142,8 +156,8 @@ export fn HeaderMap mut @insert(name str, value str) -> Result[(), HttpError] {
 /// ДОБАВИТЬ ещё одно значение (multi-value append, D358 §13.1).
 #stable(since = "0.1")
 export fn HeaderMap mut @append(name str, value str) -> Result[(), HttpError] {
-    ro hn = HeaderName.parse(name)?
-    ro hv = HeaderValue.from(value)?
+    ro hn = name.to_header_name()?
+    ro hv = value.to_header_value()?
     @entries.push(HeaderEntry { name: hn, value: hv })
     Ok(())
 }
@@ -152,8 +166,8 @@ export fn HeaderMap mut @append(name str, value str) -> Result[(), HttpError] {
 /// obs-text/latin1 при разборе ответа — Ф.2). CR/LF/NUL / не-tchar → reject.
 #stable(since = "0.1")
 export fn HeaderMap mut @append_bytes(name str, value []u8) -> Result[(), HttpError] {
-    ro hn = HeaderName.parse(name)?
-    ro hv = HeaderValue.from(value)?
+    ro hn = name.to_header_name()?
+    ro hv = value.to_header_value_bytes()?
     @entries.push(HeaderEntry { name: hn, value: hv })
     Ok(())
 }
@@ -251,7 +265,7 @@ export fn HeaderMap @content_length() -> Result[Option[int], HttpError] {
 export fn HeaderMap @content_type() -> Option[ContentType] {
     match @get("content-type") {
         Some(hv) => match hv.to_str() {
-            Ok(s)  => match ContentType.parse(s) { Ok(ct) => Some(ct), Err(_) => None }
+            Ok(s)  => match s.to_content_type() { Ok(ct) => Some(ct), Err(_) => None }
             Err(_) => None
         }
         None => None

@@ -12,8 +12,8 @@ export type Mime value { priv mtype str, priv msub str }
 
 /// Разобрать `type/subtype`. Отсутствие `/` / пустые части → `Protocol`.
 #stable(since = "0.1")
-export fn Mime.parse(s str) -> Result[Mime, HttpError] { // [M-lint-findings-static-conversion]
-    match s.split_once("/") {
+export fn str @to_mime() -> Result[Mime, HttpError] {
+    match @split_once("/") {
         Some((t, sub)) => {
             ro tt = t.trim_ascii()
             ro ss = sub.trim_ascii()
@@ -65,12 +65,12 @@ export type ContentType value { ro mime Mime, priv params []Param }
 
 /// Разобрать `type/subtype; k=v; k2=v2`.
 #stable(since = "0.1")
-export fn ContentType.parse(s str) -> Result[ContentType, HttpError] { // [M-lint-findings-static-conversion]
-    ro parts = s.split(";").collect()
+export fn str @to_content_type() -> Result[ContentType, HttpError] {
+    ro parts = @split(";").collect()
     if parts.len() == 0 {
         return Err(HttpError.protocol_error("empty Content-Type"))
     }
-    ro mime = Mime.parse(mime_head(parts))?
+    ro mime = mime_head(parts).to_mime()?
     mut params = []Param.new()
     mut i = 1
     while i < parts.len() {

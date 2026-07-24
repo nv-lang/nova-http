@@ -328,7 +328,7 @@ export fn QueryDeserializer mut @enter_key(key str) -> Result[QueryDeserializer,
 /// param from ONE generic fn straight into ANOTHER generic fn with the same
 /// bound is a known checker limitation ([M-176-io-forward-bounded-generic],
 /// already documented + worked around the SAME way by
-/// `http.serdejson.Response consume @json_as[T]()`). Uses `JsonValue.try_from`
+/// `http.serdejson.Response consume @into_json_as[T]()`). Uses `JsonValue.try_from`
 /// (not the namespace-static `Json.parse`) to avoid a name CLASH with this
 /// module's own `Json[T]` extractor/response type sharing the bare name `Json`.
 #impl(FromRequest)

@@ -10,7 +10,7 @@
 // Landed (CORE, plaintext HTTP/1.1):
 //   · HttpClient + HttpClientBuilder (default headers, redirect policy, UA).
 //   · RequestBuilder: get/post/put/delete/patch/head + request; header/append_header,
-//     query, body/text/json(dynamic)/form, bearer_auth/basic_auth; send/build.
+//     query, body/text/json(dynamic)/form, bearer_auth/basic_auth; into_send/into_build.
 //   · Redirect following (limit + TooManyRedirects; 303/301/302→GET-ify;
 //     307/308 preserve; cross-origin Authorization+Cookie strip).
 //   · Content-Length (identity) + Transfer-Encoding: chunked (wire.nv).
@@ -147,7 +147,7 @@ export fn HttpClientBuilder mut @max_decompressed(max_bytes int) -> @ {
 /// Finalize the client. Fallible for parity with the full builder (tls/proxy);
 /// CORE construction never fails.
 #stable(since = "0.1")
-export fn HttpClientBuilder consume @build() -> Result[HttpClient, HttpError] =>
+export fn HttpClientBuilder consume @into_build() -> Result[HttpClient, HttpError] =>
     Ok({ @default_headers, @follow_redirects, @max_redirects, @user_agent, @auto_decompress, @max_decompressed })
 
 // ── verb shortcuts ───────────────────────────────────────────────────────────
@@ -204,7 +204,7 @@ export type RequestBuilder value {
 // RequestBuilder → мутирующие свойства (D117 AMEND-2, `mut @x(v) -> @`, auto
 // self-return D409). Копирующая форма shallow-copy'ила heap-backed
 // `header_ops`/`query`/`body_bytes`. Беглые цепочки
-// (`client.get(u).header(..).send()`) корректны после 184 Ф.2.
+// (`client.get(u).header(..).into_send()`) корректны после 184 Ф.2.
 
 /// Set a header (replace all prior values of this name).
 #stable(since = "0.1")
@@ -287,7 +287,7 @@ export fn RequestBuilder @build() -> Result[Request, HttpError] {
 /// Send the request (round-trip through the `Http` seam), following redirects.
 /// Returns a must-consume `Response` (4xx/5xx included — use `error_for_status`).
 #stable(since = "0.1")
-export fn RequestBuilder consume @send() Http -> Result[Response, HttpError] {
+export fn RequestBuilder consume @into_send() Http -> Result[Response, HttpError] {
     // `mut` (not `ro`): `apply_query` takes `u` as a `mut` in-out param
     // (D246 canon (a)) — used exactly once, right below.
     mut url0 = @url_input.to_url()?
@@ -309,22 +309,22 @@ export fn RequestBuilder consume @send() Http -> Result[Response, HttpError] {
 
 /// One-shot GET (script convenience).
 #stable(since = "0.1")
-export fn get(url str) Http -> Result[Response, HttpError] => HttpClient.new().get(url).send()
+export fn get(url str) Http -> Result[Response, HttpError] => HttpClient.new().get(url).into_send()
 /// One-shot HEAD.
 #stable(since = "0.1")
-export fn head(url str) Http -> Result[Response, HttpError] => HttpClient.new().head(url).send()
+export fn head(url str) Http -> Result[Response, HttpError] => HttpClient.new().head(url).into_send()
 /// One-shot DELETE.
 #stable(since = "0.1")
-export fn delete(url str) Http -> Result[Response, HttpError] => HttpClient.new().delete(url).send()
+export fn delete(url str) Http -> Result[Response, HttpError] => HttpClient.new().delete(url).into_send()
 /// One-shot POST with a byte body.
 #stable(since = "0.1")
-export fn post(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().post(url).body(body).send()
+export fn post(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().post(url).body(body).into_send()
 /// One-shot PUT with a byte body.
 #stable(since = "0.1")
-export fn put(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().put(url).body(body).send()
+export fn put(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().put(url).body(body).into_send()
 /// One-shot PATCH with a byte body.
 #stable(since = "0.1")
-export fn patch(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().patch(url).body(body).send()
+export fn patch(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().patch(url).body(body).into_send()
 
 // ── request execution + redirect loop ───────────────────────────────────────
 
@@ -641,10 +641,10 @@ fn form_encode(fields [](str, str)) -> str {
 // ── dynamic JSON body (Response extension; keeps the json dep out of core) ────
 
 /// Consume the response body and parse it as dynamic JSON (`JsonValue`). For a
-/// typed record `T`, use `http.serdejson.json_decode_body[T](resp.bytes()!!)`.
+/// typed record `T`, use `http.serdejson.json_decode_body[T](resp.into_bytes()!!)`.
 #stable(since = "0.1")
-export fn Response consume @json() -> Result[JsonValue, HttpError] {
-    ro text = @text()?
+export fn Response consume @into_json() -> Result[JsonValue, HttpError] {
+    ro text = @into_text()?
     match Json.parse(text) {
         Ok(v)  => Ok(v)
         Err(_) => Err(HttpError.protocol_error("response body is not valid JSON"))

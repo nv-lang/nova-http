@@ -23,20 +23,20 @@ export type Method enum
 ///
 /// # Examples
 /// ```nova
-/// assert(Method.parse("GET")!! == Method.Get)
-/// assert(Method.parse("PROPFIND")!! == Method.Other("PROPFIND"))
+/// assert("GET".to_method()!! == Method.Get)
+/// assert("PROPFIND".to_method()!! == Method.Other("PROPFIND"))
 /// ```
 #stable(since = "0.1")
-export fn Method.parse(s str) -> Result[Method, HttpError] { // [M-lint-findings-static-conversion]
-    if s.byte_len() == 0 {
+export fn str @to_method() -> Result[Method, HttpError] {
+    if @byte_len() == 0 {
         return Err(HttpError.protocol_error("empty method token"))
     }
-    for c in s.chars() {
+    for c in @chars() {
         if !is_tchar(c) {
             return Err(HttpError.protocol_error("invalid method token"))
         }
     }
-    Ok(match s {
+    Ok(match @ {
         "GET"     => Get
         "HEAD"    => Head
         "POST"    => Post
@@ -46,7 +46,7 @@ export fn Method.parse(s str) -> Result[Method, HttpError] { // [M-lint-findings
         "OPTIONS" => Options
         "TRACE"   => Trace
         "PATCH"   => Patch
-        _         => Other(s)
+        _         => Other(@)
     })
 }
 

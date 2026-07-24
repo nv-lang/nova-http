@@ -50,23 +50,42 @@ export type BodyReader value { priv chunks [][]u8, priv pos int }
 export fn Body.empty() -> Body => { repr: InMemory([]u8.new()), limit: -1 }
 
 /// Тело из байт (InMemory; replayable).
+///
+/// `[]u8 @to_body()` (не `str @to_body()` — оба одноимённых расширения на РАЗНЫХ
+/// конкретных ресиверах компилятор не codegen'ит корректно: `method_receivers`
+/// single-key last-wins резолвит ЛЮБОЙ вызов `.to_body()` в ПОСЛЕДНЮЮ
+/// объявленную перегрузку (`[E_RECV_METHOD_MISMATCH]`, изолированный repro
+/// подтвердил на минимальном файле — не специфично этому пакету, известное
+/// семейство багов, docs/plans/wip/196.5-facet-c-map.md и родня). Здесь
+/// `[]u8` — первичное/чаще используемое имя (`to_body`, D174.1-стиль); `str`
+/// несёт различимое имя `to_body_utf8` ниже, а не тот же `to_body`.
+/// `[M-samename-extension-method-recv-type-collision]`
 #stable(since = "0.1")
-export fn Body.from(b []u8) -> Body => { repr: InMemory(b), limit: -1 } // [M-lint-findings-static-conversion]
+export fn []u8 @to_body() -> Body => { repr: InMemory(@), limit: -1 }
 
-/// Тело из строки (UTF-8-байты).
+/// Тело из строки (UTF-8-байты). Имя `to_body_utf8`, НЕ `to_body` — см. маркер
+/// `[M-samename-extension-method-recv-type-collision]` на `[]u8 @to_body()` выше.
 #stable(since = "0.1")
-export fn Body.from(s str) -> Body => // [M-lint-findings-static-conversion]
+export fn str @to_body_utf8() -> Body =>
     // `repr: InMemory([]u8)` needs an OWNED buffer; `.clone()` materialises the
     // owned copy (D410: view+.clone() ≡ retired `to_bytes()` twin).
-    { repr: InMemory(s.bytes().clone()), limit: -1 }
+    { repr: InMemory(@bytes().clone()), limit: -1 }
 
 /// Тело из потокового ридера (Ф.1: in-memory; Ф.2 reader станет `consume`).
 #stable(since = "0.1")
-export fn Body.from(r BodyReader) -> Body => { repr: Stream(r), limit: -1 } // [M-lint-findings-static-conversion]
+export fn BodyReader consume @into_body() -> Body => { repr: Stream(@), limit: -1 }
 
 /// In-memory ридер над списком чанков (для тестов/прокси; pure Nova).
-#stable(since = "0.1")
-export fn BodyReader.from(chunks [][]u8) -> BodyReader => { chunks, pos: 0 } // [M-lint-findings-static-conversion]
+///
+/// Receiver написан generic-формой `Vec[T] @to_body_reader()` (T НЕ used иначе),
+/// НЕ конкретной `[][]u8`/`Vec[[]u8] @to_body_reader()` — обе конкретные формы
+/// компилятор не резолвит на call-site (`[E7320] no field or method
+/// to_body_reader on type Vec`, изолированный repro подтвердил: single-level
+/// `[]u8 @m()` резолвится, двойной `[][]u8 @m()`/`Vec[[]u8] @m()` — нет).
+/// `T` привязывается к `[]u8` через return-type-констрейнт поля `chunks`
+/// (`{ chunks: @, .. }` требует `Vec[T] == [][]u8`) — та же call-site
+/// безопасность, что и у конкретной формы. `[M-nested-vec-concrete-extension-unresolved]`
+export fn Vec[T] @to_body_reader() -> BodyReader => { chunks: @, pos: 0 }
 
 // ── Max-size guard (DoS/OOM-защита) ──────────────────────────────────────────
 
@@ -78,7 +97,7 @@ export fn Body consume @with_limit(max_bytes int) -> Body => { @repr, limit: max
 
 /// Дочитать всё → `[]u8` (с max-guard). Разряжает тело.
 #stable(since = "0.1")
-export fn Body consume @bytes() -> Result[[]u8, HttpError] {
+export fn Body consume @into_bytes() -> Result[[]u8, HttpError] {
     ro lim = @limit
     match @repr {
         InMemory(b) => guard_limit(b, lim)
@@ -89,8 +108,8 @@ export fn Body consume @bytes() -> Result[[]u8, HttpError] {
 /// Дочитать всё + декодировать как **UTF-8** (строго; charset-aware latin1-fallback
 /// = Ф.2 Response-контекст, `[M-178-body-text-charset]`). Невалидный UTF-8 → `Protocol`.
 #stable(since = "0.1")
-export fn Body consume @text() -> Result[str, HttpError] {
-    ro bytes = @bytes()?
+export fn Body consume @into_text() -> Result[str, HttpError] {
+    ro bytes = @into_bytes()?
     match utf8_to_str(bytes) {
         Ok(s)  => Ok(s)
         Err(_) => Err(HttpError.protocol_error("body is not valid UTF-8; use bytes()"))
@@ -113,7 +132,7 @@ export fn Body consume @drain() -> Result[(), HttpError] {
 #stable(since = "0.1")
 export fn Body consume @into_reader() -> BodyReader {
     match @repr {
-        InMemory(b) => BodyReader.from(single_chunk(b))
+        InMemory(b) => single_chunk(b).to_body_reader()
         Stream(r)   => r
     }
 }
