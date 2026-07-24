@@ -199,8 +199,4 @@ fn guard_limit(b []u8, lim int) -> Result[[]u8, HttpError] {
     Ok(b)
 }
 
-fn single_chunk(b []u8) -> [][]u8 {
-    mut v [][]u8 = []
-    v.push(b)
-    v
-}
+fn single_chunk(b []u8) -> [][]u8 => [b]
