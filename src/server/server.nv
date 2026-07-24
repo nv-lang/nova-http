@@ -247,8 +247,10 @@ export type ServerResponse value {
 // implementation now). The `int` overloads are NOT removed: ~90 existing
 // call-sites across the package (`server_router.nv`, `static.nv`,
 // `servernet/policy.nv`, middleware, tests, …) pass bare literals and stay
-// unmigrated this wave — `StatusCode.from_int_unchecked` preserves their
-// exact prior behaviour (no validation, same as before this unification). ──
+// unmigrated this wave — `unsafe { StatusCode.new_unchecked(status) }`
+// preserves their exact prior behaviour (no validation, same as before this
+// unification; plan 222.5 §4б-финал renamed `from_int_unchecked` to
+// `new_unchecked` + made it `unsafe`). ──
 
 /// Response with a status code and empty body/headers.
 #stable(since = "0.1")
@@ -258,7 +260,7 @@ export fn ServerResponse.new(status StatusCode) -> ServerResponse =>
 /// `ServerResponse.new` — DEPRECATED bare-`int` form, see the section banner above.
 #stable(since = "0.1")
 export fn ServerResponse.new(status int) -> ServerResponse =>
-    ServerResponse.new(StatusCode.from_int_unchecked(status))
+    ServerResponse.new(unsafe { StatusCode.new_unchecked(status) })
 
 /// `text/plain; charset=utf-8` response.
 #stable(since = "0.1")
@@ -271,7 +273,7 @@ export fn ServerResponse.text(status StatusCode, s str) -> ServerResponse {
 /// `ServerResponse.text` — DEPRECATED bare-`int` form, see the section banner above.
 #stable(since = "0.1")
 export fn ServerResponse.text(status int, s str) -> ServerResponse =>
-    ServerResponse.text(StatusCode.from_int_unchecked(status), s)
+    ServerResponse.text(unsafe { StatusCode.new_unchecked(status) }, s)
 
 /// `text/html; charset=utf-8` response.
 #stable(since = "0.1")
@@ -284,7 +286,7 @@ export fn ServerResponse.html(status StatusCode, s str) -> ServerResponse {
 /// `ServerResponse.html` — DEPRECATED bare-`int` form, see the section banner above.
 #stable(since = "0.1")
 export fn ServerResponse.html(status int, s str) -> ServerResponse =>
-    ServerResponse.html(StatusCode.from_int_unchecked(status), s)
+    ServerResponse.html(unsafe { StatusCode.new_unchecked(status) }, s)
 
 /// Raw-bytes response with an explicit Content-Type.
 #stable(since = "0.1")
@@ -297,7 +299,7 @@ export fn ServerResponse.bytes(status StatusCode, content_type str, data []u8) -
 /// `ServerResponse.bytes` — DEPRECATED bare-`int` form, see the section banner above.
 #stable(since = "0.1")
 export fn ServerResponse.bytes(status int, content_type str, data []u8) -> ServerResponse =>
-    ServerResponse.bytes(StatusCode.from_int_unchecked(status), content_type, data)
+    ServerResponse.bytes(unsafe { StatusCode.new_unchecked(status) }, content_type, data)
 
 /// Bodyless response (204/304/…).
 #stable(since = "0.1")
@@ -307,7 +309,7 @@ export fn ServerResponse.empty(status StatusCode) -> ServerResponse =>
 /// `ServerResponse.empty` — DEPRECATED bare-`int` form, see the section banner above.
 #stable(since = "0.1")
 export fn ServerResponse.empty(status int) -> ServerResponse =>
-    ServerResponse.empty(StatusCode.from_int_unchecked(status))
+    ServerResponse.empty(unsafe { StatusCode.new_unchecked(status) })
 
 /// Redirect response (`Location: location`).
 #stable(since = "0.1")
@@ -320,7 +322,7 @@ export fn ServerResponse.redirect(status StatusCode, location str) -> ServerResp
 /// `ServerResponse.redirect` — DEPRECATED bare-`int` form, see the section banner above.
 #stable(since = "0.1")
 export fn ServerResponse.redirect(status int, location str) -> ServerResponse =>
-    ServerResponse.redirect(StatusCode.from_int_unchecked(status), location)
+    ServerResponse.redirect(unsafe { StatusCode.new_unchecked(status) }, location)
 
 // ── Streamed response body ([M-178-server-streaming]) ─────────────────────────
 //
@@ -375,7 +377,7 @@ export fn ServerResponse.stream(status StatusCode, headers HeaderMap, producer S
 /// `ServerResponse.stream` — DEPRECATED bare-`int` form (see `.text`'s section banner above).
 #stable(since = "0.1")
 export fn ServerResponse.stream(status int, headers HeaderMap, producer StreamBody) -> ServerResponse =>
-    ServerResponse.stream(StatusCode.from_int_unchecked(status), headers, producer)
+    ServerResponse.stream(unsafe { StatusCode.new_unchecked(status) }, headers, producer)
 
 /// `text/event-stream` (SSE) response — sets the standard no-cache headers and
 /// streams `producer`'s chunks as the raw SSE wire bytes (format each chunk
@@ -386,7 +388,7 @@ export fn ServerResponse.sse(producer StreamBody) -> ServerResponse {
     ro _ = h.insert("Content-Type", "text/event-stream; charset=utf-8") // статическое имя — не может отказать
     ro _ = h.insert("Cache-Control", "no-cache")
     ro _ = h.insert("X-Accel-Buffering", "no")
-    { status: StatusCode.ok(), headers: h, body: []u8.new(), stream: Some(producer), background: None, upgrade: None }
+    { status: StatusCode.OK, headers: h, body: []u8.new(), stream: Some(producer), background: None, upgrade: None }
 }
 
 /// Whether this response streams its body via a chunk producer (vs. a fixed

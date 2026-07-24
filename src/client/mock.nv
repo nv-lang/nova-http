@@ -81,7 +81,7 @@ fn MockResponse @to_wire() -> str {
         None    => {
             ro sc = match StatusCode.new(@status) {
                 Ok(c)  => c
-                Err(_) => StatusCode.ok()
+                Err(_) => StatusCode.OK
             }
             serialize_response(sc, @headers, @body)
         }
@@ -143,14 +143,14 @@ fn mock_dispatch(routes []MockRoute, request str) -> Result[str, HttpError] {
                         Some(v) => v
                         None    => ""
                     }
-                    return Ok(serialize_response(StatusCode.ok(), HeaderMap.new(), val.bytes()))
+                    return Ok(serialize_response(StatusCode.OK, HeaderMap.new(), val.bytes()))
                 }
                 None => return Ok(r.resp.to_wire())
             }
         }
     }
     // Unmatched → synthetic 404 (still a valid Response for the client).
-    Ok(serialize_response(StatusCode.not_found(), HeaderMap.new(), []u8.new()))
+    Ok(serialize_response(StatusCode.NOT_FOUND, HeaderMap.new(), []u8.new()))
 }
 
 fn route_matches(r MockRoute, method str, path str) -> bool {

@@ -19,21 +19,52 @@ module http
 /// (nv-coding-style same-name-by-arity convention), not an `as_*`-prefixed
 /// narrowing method — `u16` only ever appears at the true wire boundary
 /// (ASCII-digit parsing), never as internal storage or a public return type.
-// TODO `[M-assoc-const-out-of-body-syntax]`: named constants land here once
-// the parser accepts the out-of-body assoc-const form (D200, spec/decisions/
-// 02-types.md:8056 — "one door", in-body is NOT the canon; a prior draft of
-// this wave added in-body constants + retracted the factories below in the
-// SAME breath — reverted 2026-07-24, owner catch: out-of-body syntax isn't
-// parseable yet, so there is nothing to migrate factory call-sites TO). When
-// the parser lands: add `const StatusCode.OK StatusCode = { code: 200 }` (+
-// CREATED/NO_CONTENT/MOVED_PERMANENTLY/FOUND/NOT_MODIFIED/BAD_REQUEST/
-// UNAUTHORIZED/FORBIDDEN/NOT_FOUND/METHOD_NOT_ALLOWED/REQUEST_TIMEOUT/
-// PAYLOAD_TOO_LARGE/UPGRADE_REQUIRED/TOO_MANY_REQUESTS/
-// INTERNAL_SERVER_ERROR/BAD_GATEWAY/SERVICE_UNAVAILABLE), delete the named
-// factories below, migrate every call-site in the package to the constants
-// (D9 — one door, no const+wrapper-fn duplication).
 #stable(since = "0.1")
 export type StatusCode value { priv code int }
+
+/// Named associated constants (plan 222.5 §4а-РЕШЕНИЕ, out-of-body form,
+/// D200 amendment / window №66): the one door for frequent literal
+/// StatusCode values. Full names per the `http::StatusCode` convention
+/// (Rust `http` crate), UPPER_SNAKE (cf. `Duration.SECOND`). Named factory
+/// functions are RETRACTED (D9 — a const and a zero-arg wrapper fn over the
+/// same value would be two doors) — see call-site migration across the
+/// package.
+#stable(since = "0.1")
+const StatusCode.OK StatusCode = { code: 200 }
+#stable(since = "0.1")
+const StatusCode.CREATED StatusCode = { code: 201 }
+#stable(since = "0.1")
+const StatusCode.NO_CONTENT StatusCode = { code: 204 }
+#stable(since = "0.1")
+const StatusCode.MOVED_PERMANENTLY StatusCode = { code: 301 }
+#stable(since = "0.1")
+const StatusCode.FOUND StatusCode = { code: 302 }
+#stable(since = "0.1")
+const StatusCode.NOT_MODIFIED StatusCode = { code: 304 }
+#stable(since = "0.1")
+const StatusCode.BAD_REQUEST StatusCode = { code: 400 }
+#stable(since = "0.1")
+const StatusCode.UNAUTHORIZED StatusCode = { code: 401 }
+#stable(since = "0.1")
+const StatusCode.FORBIDDEN StatusCode = { code: 403 }
+#stable(since = "0.1")
+const StatusCode.NOT_FOUND StatusCode = { code: 404 }
+#stable(since = "0.1")
+const StatusCode.METHOD_NOT_ALLOWED StatusCode = { code: 405 }
+#stable(since = "0.1")
+const StatusCode.REQUEST_TIMEOUT StatusCode = { code: 408 }
+#stable(since = "0.1")
+const StatusCode.PAYLOAD_TOO_LARGE StatusCode = { code: 413 }
+#stable(since = "0.1")
+const StatusCode.UPGRADE_REQUIRED StatusCode = { code: 426 }
+#stable(since = "0.1")
+const StatusCode.TOO_MANY_REQUESTS StatusCode = { code: 429 }
+#stable(since = "0.1")
+const StatusCode.INTERNAL_SERVER_ERROR StatusCode = { code: 500 }
+#stable(since = "0.1")
+const StatusCode.BAD_GATEWAY StatusCode = { code: 502 }
+#stable(since = "0.1")
+const StatusCode.SERVICE_UNAVAILABLE StatusCode = { code: 503 }
 
 /// Класс статуса (первая цифра).
 #stable(since = "0.1")
@@ -50,16 +81,19 @@ export fn StatusCode.new(code int) -> Result[StatusCode, HttpError] {
     Ok({ code })
 }
 
-/// Unchecked construction from a raw `int` — NO 100..599 validation. Internal
-/// bridge for the DEPRECATED bare-`int` `ServerResponse` constructors
-/// (`server.nv`, soft migration — plan 222.5 §4а item 3): those overloads
-/// never validated their status before this unification either, so this
-/// preserves that exact (permissive) legacy behaviour instead of introducing
-/// a new panic/error path for the ~90 existing bare-int call-sites across the
-/// package. Prefer `StatusCode.new`/the named factories below for validated
-/// construction — this is NOT part of the normal public surface.
+/// Unchecked construction from a raw `int` — NO 100..599 validation
+/// (plan 222.5 §4б-финал: `unsafe`, escape-hatch, std-precedent
+/// `to_str`/`to_str_unchecked`; skipping the check can mint an invalid
+/// StatusCode that breaks the `@class()` invariant — the invariant is on the
+/// caller). Internal bridge for the DEPRECATED bare-`int` `ServerResponse`
+/// constructors (`server.nv`, soft migration — plan 222.5 §4а item 3): those
+/// overloads never validated their status before this unification either, so
+/// this preserves that exact (permissive) legacy behaviour instead of
+/// introducing a new panic/error path for the existing bare-int call-sites
+/// across the package. Prefer `StatusCode.new`/the named constants for
+/// validated construction — this is NOT part of the normal public surface.
 #stable(since = "0.1")
-export fn StatusCode.from_int_unchecked(code int) -> StatusCode => { code }
+export unsafe fn StatusCode.new_unchecked(code int) -> StatusCode => { code }
 
 /// Числовое значение (property accessor over `priv code` — nv-coding-style
 /// same-name-by-arity convention, mirrors `Json[T] @data()`/`Response
@@ -168,81 +202,3 @@ export fn StatusCode @reason() -> str {
     }
 }
 
-// ── Именованные zero-arg фабрики (читаемость; НЕ top-level let — Q17) ─────────
-// Значения в 100..599 by-construction → конструируем напрямую.
-//
-// TEMPORARY (owner 2026-07-24): these STAY for now — deleting them requires
-// the assoc-const replacement first (`[M-assoc-const-out-of-body-syntax]`,
-// see the type's own TODO above), which the parser doesn't support yet. Once
-// it does: replace every literal body here with the matching
-// `StatusCode.CONST_NAME`, then delete these factories entirely and migrate
-// call-sites to the constants directly (D9 — one door; a const + a
-// zero-arg wrapper fn over the SAME value would be two).
-
-/// 200 OK.
-#stable(since = "0.1")
-export fn StatusCode.ok() -> StatusCode => { code: 200 }
-
-/// 201 Created.
-#stable(since = "0.1")
-export fn StatusCode.created() -> StatusCode => { code: 201 }
-
-/// 204 No Content.
-#stable(since = "0.1")
-export fn StatusCode.no_content() -> StatusCode => { code: 204 }
-
-/// 301 Moved Permanently.
-#stable(since = "0.1")
-export fn StatusCode.moved_permanently() -> StatusCode => { code: 301 }
-
-/// 302 Found.
-#stable(since = "0.1")
-export fn StatusCode.found() -> StatusCode => { code: 302 }
-
-/// 304 Not Modified.
-#stable(since = "0.1")
-export fn StatusCode.not_modified() -> StatusCode => { code: 304 }
-
-/// 307 Temporary Redirect.
-#stable(since = "0.1")
-export fn StatusCode.temporary_redirect() -> StatusCode => { code: 307 }
-
-/// 308 Permanent Redirect.
-#stable(since = "0.1")
-export fn StatusCode.permanent_redirect() -> StatusCode => { code: 308 }
-
-/// 400 Bad Request.
-#stable(since = "0.1")
-export fn StatusCode.bad_request() -> StatusCode => { code: 400 }
-
-/// 401 Unauthorized.
-#stable(since = "0.1")
-export fn StatusCode.unauthorized() -> StatusCode => { code: 401 }
-
-/// 403 Forbidden.
-#stable(since = "0.1")
-export fn StatusCode.forbidden() -> StatusCode => { code: 403 }
-
-/// 404 Not Found.
-#stable(since = "0.1")
-export fn StatusCode.not_found() -> StatusCode => { code: 404 }
-
-/// 405 Method Not Allowed.
-#stable(since = "0.1")
-export fn StatusCode.method_not_allowed() -> StatusCode => { code: 405 }
-
-/// 429 Too Many Requests.
-#stable(since = "0.1")
-export fn StatusCode.too_many_requests() -> StatusCode => { code: 429 }
-
-/// 500 Internal Server Error.
-#stable(since = "0.1")
-export fn StatusCode.internal_error() -> StatusCode => { code: 500 }
-
-/// 502 Bad Gateway.
-#stable(since = "0.1")
-export fn StatusCode.bad_gateway() -> StatusCode => { code: 502 }
-
-/// 503 Service Unavailable.
-#stable(since = "0.1")
-export fn StatusCode.service_unavailable() -> StatusCode => { code: 503 }

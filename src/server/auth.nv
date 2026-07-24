@@ -71,7 +71,7 @@ import std.time.duration.{Timestamp}
 
 // ── shared 401 helpers ─────────────────────────────────────────────────────
 
-fn err_401() -> HttpError => HttpError.new(Status(StatusCode.unauthorized()))
+fn err_401() -> HttpError => HttpError.new(Status(StatusCode.UNAUTHORIZED))
 
 /// A full `401 Unauthorized` response carrying `WWW-Authenticate: Bearer`
 /// (RFC 6750 §3 — the challenge an extractor-level `HttpError` cannot carry;
