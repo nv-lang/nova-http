@@ -261,8 +261,9 @@ type CollectedRoute value { ro segs []str, ro methods MethodRouter }
 /// per-route method dispatch (405 + `Allow` when the path matches but the
 /// method doesn't); `@nest` for prefix-grouped sub-routers; `@fallback` for the
 /// global 404. Route registration (`@route`/`@get`/…/`@nest`) is fallible
-/// (`Result[(), HttpError]`) — a duplicate/conflicting route is a typed error,
-/// not a panic.
+/// (`Result[Router, HttpError]`, `Ok(@)` — owner decision №84, chains
+/// `r.get(..)?.post(..)?`/`Router.new().get(..)!!.post(..)!!`) — a
+/// duplicate/conflicting route is a typed error, not a panic.
 #stable(since = "0.1")
 export type Router value {
     mut nodes    []RouteNode
@@ -297,9 +298,14 @@ export fn Router @fallback() -> Option[Handler] => @fallback
 /// (exact-duplicate path, or a `{name}` clashing with a DIFFERENT existing
 /// param name at the same trie slot, or two `{*...}` at the same slot) are a
 /// typed `Err(HttpError)`, not a panic.
+///
+/// Ok-нагрузка = `Router` (`Ok(@)`), НЕ `Ok(())` — включает fluent-цепочки
+/// (`r.route(..)?.route(..)?` в `Result`-fn, `Router.new().get(..)!!.post(..)!!`
+/// как rvalue-цепочка) поверх обычных statement-форм (владелец-решение, №84).
 #stable(since = "0.1")
-export fn Router mut @route(path str, mr MethodRouter) -> Result[(), HttpError] {
-    @insert_segs(split_segments(path), path, mr)
+export fn Router mut @route(path str, mr MethodRouter) -> Result[Router, HttpError] {
+    @insert_segs(split_segments(path), path, mr)?
+    Ok(@)
 }
 
 fn Router mut @insert_segs(segs []str, path str, mr MethodRouter) -> Result[(), HttpError] {
@@ -388,32 +394,34 @@ fn Router mut @insert_segs(segs []str, path str, mr MethodRouter) -> Result[(), 
 // import `http.client` are unaffected.
 
 /// Register a single `GET` handler at `path` (sugar over `@route(path, get(h))`).
+/// Ok-нагрузка = `Router` (`@route` уже возвращает `Ok(@)`) — см. `@route`'s
+/// own banner, owner decision №84.
 #stable(since = "0.1")
-export fn Router mut @get(path str, h Handler) -> Result[(), HttpError] {
+export fn Router mut @get(path str, h Handler) -> Result[Router, HttpError] {
     mut mr = MethodRouter.new(); mr.get(h); @route(path, mr)
 }
 
 /// Register a single `POST` handler at `path`.
 #stable(since = "0.1")
-export fn Router mut @post(path str, h Handler) -> Result[(), HttpError] {
+export fn Router mut @post(path str, h Handler) -> Result[Router, HttpError] {
     mut mr = MethodRouter.new(); mr.post(h); @route(path, mr)
 }
 
 /// Register a single `PUT` handler at `path`.
 #stable(since = "0.1")
-export fn Router mut @put(path str, h Handler) -> Result[(), HttpError] {
+export fn Router mut @put(path str, h Handler) -> Result[Router, HttpError] {
     mut mr = MethodRouter.new(); mr.put(h); @route(path, mr)
 }
 
 /// Register a single `DELETE` handler at `path`.
 #stable(since = "0.1")
-export fn Router mut @delete(path str, h Handler) -> Result[(), HttpError] {
+export fn Router mut @delete(path str, h Handler) -> Result[Router, HttpError] {
     mut mr = MethodRouter.new(); mr.delete(h); @route(path, mr)
 }
 
 /// Register a single `PATCH` handler at `path`.
 #stable(since = "0.1")
-export fn Router mut @patch(path str, h Handler) -> Result[(), HttpError] {
+export fn Router mut @patch(path str, h Handler) -> Result[Router, HttpError] {
     mut mr = MethodRouter.new(); mr.patch(h); @route(path, mr)
 }
 
@@ -424,7 +432,7 @@ export fn Router mut @patch(path str, h Handler) -> Result[(), HttpError] {
 /// still a typed `Err`, not a panic. `sub.@fallback` is NOT threaded through
 /// (documented simplification, see file banner).
 #stable(since = "0.1")
-export fn Router mut @nest(prefix str, sub Router) -> Result[(), HttpError] {
+export fn Router mut @nest(prefix str, sub Router) -> Result[Router, HttpError] {
     ro prefix_segs = split_segments(prefix)
     ro collected = sub.collect_from(0, []str.new())
     mut i = 0
@@ -440,7 +448,7 @@ export fn Router mut @nest(prefix str, sub Router) -> Result[(), HttpError] {
         }
         i += 1
     }
-    Ok(())
+    Ok(@)
 }
 
 // DFS over the trie, reconstructing each registered route's segment list
