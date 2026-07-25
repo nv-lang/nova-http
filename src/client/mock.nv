@@ -19,6 +19,7 @@
 // (a value builder cannot itself be an `Effect[Http]`). [M-178-mock-build-terminal]
 
 module http.client
+
 import http.{HeaderMap, StatusCode, HttpError, Http}
 
 /// A programmed mock HTTP response. Build with `.new(status)` + `.header/.body`,

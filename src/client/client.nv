@@ -31,6 +31,7 @@
 //     policy surface deferred beyond CORE. [M-178-client-policy-surface]
 
 module http.client
+
 import http.{Method, Url, HeaderMap, Response, Request, Http, HttpError, ErrorKind, Version, StatusCode}
 
 import std.encoding.base64.{Base64}
@@ -93,10 +94,15 @@ export fn HttpClient.new() -> HttpClient =>
 // Internal self-accessors (field privacy is enforced at the call-site module,
 // so cross-type reads of these `priv` fields go through owner methods, D281).
 fn HttpClient @cfg_follow() -> bool => @follow_redirects
+
 fn HttpClient @cfg_max() -> int => @max_redirects
+
 fn HttpClient @cfg_ua() -> str => @user_agent
+
 fn HttpClient @cfg_defaults() -> []HeaderKV => @default_headers
+
 fn HttpClient @cfg_auto_decompress() -> bool => @auto_decompress
+
 fn HttpClient @cfg_max_decompressed() -> int => @max_decompressed
 
 /// Add a default header sent on every request (append). Mutating fleeting
@@ -155,21 +161,27 @@ export fn HttpClientBuilder consume @into_client() -> Result[HttpClient, HttpErr
 /// GET request builder.
 #stable(since = "0.1")
 export fn HttpClient @get(url str) -> RequestBuilder => new_rb(@, Get, url)
+
 /// POST request builder.
 #stable(since = "0.1")
 export fn HttpClient @post(url str) -> RequestBuilder => new_rb(@, Post, url)
+
 /// PUT request builder.
 #stable(since = "0.1")
 export fn HttpClient @put(url str) -> RequestBuilder => new_rb(@, Put, url)
+
 /// DELETE request builder.
 #stable(since = "0.1")
 export fn HttpClient @delete(url str) -> RequestBuilder => new_rb(@, Delete, url)
+
 /// PATCH request builder.
 #stable(since = "0.1")
 export fn HttpClient @patch(url str) -> RequestBuilder => new_rb(@, Patch, url)
+
 /// HEAD request builder.
 #stable(since = "0.1")
 export fn HttpClient @head(url str) -> RequestBuilder => new_rb(@, Head, url)
+
 /// Arbitrary-method request builder (extension methods).
 #stable(since = "0.1")
 export fn HttpClient @request(method Method, url str) -> RequestBuilder => new_rb(@, method, url)
@@ -314,18 +326,23 @@ export fn RequestBuilder consume @send() Http -> Result[Response, HttpError] {
 /// One-shot GET (script convenience).
 #stable(since = "0.1")
 export fn get(url str) Http -> Result[Response, HttpError] => HttpClient.new().get(url).send()
+
 /// One-shot HEAD.
 #stable(since = "0.1")
 export fn head(url str) Http -> Result[Response, HttpError] => HttpClient.new().head(url).send()
+
 /// One-shot DELETE.
 #stable(since = "0.1")
 export fn delete(url str) Http -> Result[Response, HttpError] => HttpClient.new().delete(url).send()
+
 /// One-shot POST with a byte body.
 #stable(since = "0.1")
 export fn post(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().post(url).body(body).send()
+
 /// One-shot PUT with a byte body.
 #stable(since = "0.1")
 export fn put(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().put(url).body(body).send()
+
 /// One-shot PATCH with a byte body.
 #stable(since = "0.1")
 export fn patch(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().patch(url).body(body).send()

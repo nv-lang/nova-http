@@ -48,12 +48,15 @@ export fn Request.streaming(method Method, url Url, headers HeaderMap, reader Bo
 /// Метод (borrow).
 #stable(since = "0.1")
 export fn Request @method() -> Method => @method
+
 /// URL (borrow).
 #stable(since = "0.1")
 export fn Request @url() -> Url => @url
+
 /// Версия (borrow).
 #stable(since = "0.1")
 export fn Request @version() -> Version => @version
+
 /// Заголовки (borrow).
 #stable(since = "0.1")
 export fn Request @headers() -> HeaderMap => @headers
@@ -102,12 +105,15 @@ export fn Response.streaming(status StatusCode, headers HeaderMap, reader BodyRe
 /// Статус (borrow).
 #stable(since = "0.1")
 export fn Response @status() -> StatusCode => @status
+
 /// Версия (borrow).
 #stable(since = "0.1")
 export fn Response @version() -> Version => @version
+
 /// Заголовки (borrow).
 #stable(since = "0.1")
 export fn Response @headers() -> HeaderMap => @headers
+
 /// 2xx? (borrow).
 #stable(since = "0.1")
 export fn Response @is_success() -> bool => @status.is_success()

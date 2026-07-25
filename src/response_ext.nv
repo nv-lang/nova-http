@@ -13,7 +13,6 @@
 
 module http
 
-
 /// First value of `name` as a string (case-insensitive), or `None`.
 #stable(since = "0.1")
 export fn Response @header(name str) -> Option[str] {

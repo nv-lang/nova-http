@@ -29,9 +29,11 @@ export fn str @to_mime() -> Result[Mime, HttpError] {
 /// Полная essence-строка `type/subtype`.
 #stable(since = "0.1")
 export fn Mime @essence() -> str => "${@mtype}/${@msub}"
+
 /// Тип-часть (`text`).
 #stable(since = "0.1")
 export fn Mime @mtype() -> str => @mtype
+
 /// Subtype-часть (`html`).
 #stable(since = "0.1")
 export fn Mime @subtype() -> str => @msub
@@ -112,6 +114,7 @@ fn unquote(s str) -> str {
 /// `charset`-параметр (для decode тела).
 #stable(since = "0.1")
 export fn ContentType @charset() -> Option[str] => @param("charset")
+
 /// `boundary`-параметр (для multipart).
 #stable(since = "0.1")
 export fn ContentType @boundary() -> Option[str] => @param("boundary")

@@ -119,15 +119,19 @@ export fn StatusCode @class() -> StatusClass {
 /// 1xx.
 #stable(since = "0.1")
 export fn StatusCode @is_informational() -> bool => @code >= 100 && @code < 200
+
 /// 2xx.
 #stable(since = "0.1")
 export fn StatusCode @is_success() -> bool => @code >= 200 && @code < 300
+
 /// 3xx.
 #stable(since = "0.1")
 export fn StatusCode @is_redirect() -> bool => @code >= 300 && @code < 400
+
 /// 4xx.
 #stable(since = "0.1")
 export fn StatusCode @is_client_error() -> bool => @code >= 400 && @code < 500
+
 /// 5xx.
 #stable(since = "0.1")
 export fn StatusCode @is_server_error() -> bool => @code >= 500 && @code < 600

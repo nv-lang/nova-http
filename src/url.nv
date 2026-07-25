@@ -70,7 +70,6 @@ export fn ParseUrlError @to_str() -> str {
     }
 }
 
-
 // ──────────────────────────────────────────────────────────────────────────
 // Парсинг → Result[Url, HttpError]
 // ──────────────────────────────────────────────────────────────────────────
@@ -235,7 +234,6 @@ fn parse_path(s str) -> (str, str) {
     }
 }
 
-
 // ──────────────────────────────────────────────────────────────────────────
 // Строгий host/SSRF-валидатор
 // ──────────────────────────────────────────────────────────────────────────
@@ -365,7 +363,6 @@ fn is_dotted_quad(s str) -> bool {
     true
 }
 
-
 // ──────────────────────────────────────────────────────────────────────────
 // Accessors
 // ──────────────────────────────────────────────────────────────────────────
@@ -436,7 +433,6 @@ fn is_private_ipv6(h str) -> bool {
     false
 }
 
-
 // ──────────────────────────────────────────────────────────────────────────
 // Сериализация
 // ──────────────────────────────────────────────────────────────────────────
@@ -492,7 +488,6 @@ export fn Url @to_str() -> str {
     }
     buf.into_str()
 }
-
 
 // ──────────────────────────────────────────────────────────────────────────
 // Percent-encoding (RFC 3986 §2.1) — query values
@@ -570,8 +565,6 @@ fn decode_query_inner(s str) -> Result[str, ParseUrlError] {
     }
 }
 
-
-
 fn hex_byte_val(b u8, pos int) -> Result[u8, ParseUrlError] {
     ro n = b as int
     if n >= 48 && n <= 57 { Ok((n - 48) as u8) }
@@ -579,7 +572,6 @@ fn hex_byte_val(b u8, pos int) -> Result[u8, ParseUrlError] {
     else if n >= 65 && n <= 70 { Ok((n - 65 + 10) as u8) }
     else { Err(InvalidPercentEncoding(pos)) }
 }
-
 
 // ──────────────────────────────────────────────────────────────────────────
 // Байтовые/char хелперы
@@ -607,6 +599,7 @@ fn find_first_of(s str, chars str) -> Option[int] {
 // Типизированные `None`-хелперы: bare `None` в кортеже codegen'ит как
 // `Option[int]` (inference default) — эти обёртки форсируют элемент-тип.
 fn none_str() -> Option[str] => None
+
 fn none_int() -> Option[int] => None
 
 fn is_alpha(c char) -> bool {

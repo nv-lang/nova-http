@@ -179,4 +179,5 @@ export fn SetCookie @serialize() -> str {
 export fn SetCookie @to_cookie() -> Cookie => { @name, @value }
 
 fn none_cookie_str() -> Option[str] => None
+
 fn none_cookie_int() -> Option[int] => None
