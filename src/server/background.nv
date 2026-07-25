@@ -157,7 +157,7 @@ export fn BackgroundTasks mut @drain() {
         with Supervisor = effect Supervisor {
             on_child_fail(idx, err) -> Decision {
                 failed = true
-                if let Some(s) = err.try_as[str]() {
+                if Some(s) = err.try_as[str]() {
                     reason = s
                 } else {
                     reason = "non-string task error"

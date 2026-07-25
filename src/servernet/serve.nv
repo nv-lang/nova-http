@@ -143,7 +143,7 @@ fn run_request(s mut TcpStream, handler fn([]u8) -> ServerResponse, raw []u8, po
     with Supervisor = effect Supervisor {
         on_child_fail(idx, err) -> Decision {
             failed = true
-            if let Some(msg) = err.try_as[str]() {
+            if Some(msg) = err.try_as[str]() {
                 reason = msg
             } else {
                 reason = "non-string handler error"
