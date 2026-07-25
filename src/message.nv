@@ -32,8 +32,8 @@ export type Request consume {
 
 /// Построить запрос с in-memory телом (HTTP/1.1). `body_bytes` — сырьё тела.
 #stable(since = "0.1")
-export fn Request.new(method Method, url Url, headers HeaderMap, body_bytes []u8) -> Request =>
-    { method, url, version: Version.Http11, headers, body: body_bytes.to_body() }
+export fn Request.new(method Method, url Url, headers HeaderMap, consume body_bytes []u8) -> Request =>
+    { method, url, version: Version.Http11, headers, body: body_bytes.into_body() }
 
 /// Построить запрос без тела (GET/HEAD).
 #stable(since = "0.1")
@@ -81,13 +81,13 @@ export type Response consume {
 
 /// Построить ответ с in-memory телом (HTTP/1.1). `body_bytes` — сырьё тела.
 #stable(since = "0.1")
-export fn Response.new(status StatusCode, headers HeaderMap, body_bytes []u8) -> Response =>
-    { version: Version.Http11, status, headers, body: body_bytes.to_body() }
+export fn Response.new(status StatusCode, headers HeaderMap, consume body_bytes []u8) -> Response =>
+    { version: Version.Http11, status, headers, body: body_bytes.into_body() }
 
 /// Построить ответ с явной версией + in-memory телом (Ф.2 client parse-result).
 #stable(since = "0.1")
-export fn Response.new(version Version, status StatusCode, headers HeaderMap, body_bytes []u8) -> Response =>
-    { version, status, headers, body: body_bytes.to_body() }
+export fn Response.new(version Version, status StatusCode, headers HeaderMap, consume body_bytes []u8) -> Response =>
+    { version, status, headers, body: body_bytes.into_body() }
 
 /// Построить ответ без тела (204/304).
 #stable(since = "0.1")

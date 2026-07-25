@@ -51,28 +51,17 @@ export fn Body.empty() -> Body => { repr: InMemory([]u8.new()), limit: -1 }
 
 /// Тело из байт (InMemory; replayable).
 ///
-/// `[]u8 @to_body()` (не `str @to_body()` — оба одноимённых расширения на РАЗНЫХ
-/// конкретных ресиверах компилятор не codegen'ит корректно: `method_receivers`
-/// single-key last-wins резолвит ЛЮБОЙ вызов `.to_body()` в ПОСЛЕДНЮЮ
-/// объявленную перегрузку (`[E_RECV_METHOD_MISMATCH]`, изолированный repro
-/// подтвердил на минимальном файле — не специфично этому пакету, известное
-/// семейство багов, docs/plans/wip/196.5-facet-c-map.md и родня). Здесь
-/// `[]u8` — первичное/чаще используемое имя (`to_body`, D174.1-стиль); `str`
-/// несёт различимое имя `to_body_utf8` ниже, а не тот же `to_body`.
-/// `[M-samename-extension-method-recv-type-collision]`
-#stable(since = "0.1")
-// ИНТЕРИМ (аудит владельца 2026-07-25): канон — `consume @into_body()` (перенос
-// владения, zero-copy), но имя-близнец с `BodyReader consume @into_body` бьёт
-// [M-samename-extension-method-recv-type-collision] (№92, ПОДТВЕРЖДЕНО пробой:
-// E_RECV_METHOD_MISMATCH single-key last-wins). До фикса №92 — честный `to_*`
-// с явной копией (§1а: to_ отдаёт НЕЗАВИСИМОЕ значение; прежний alias `InMemory(@)`
-// был нарушением — расшаривал буфер под именем копии). После №92: -> consume @into_body.
-export fn []u8 @to_body() -> Body => { repr: InMemory(@clone()), limit: -1 }
+/// Тело из готовых байтов — перенос владения (ось §1а into_). str-дверь —
+/// `str @to_body()` ниже (копия, честный to_). Диспатч одноимённостей по типу
+/// ресивера — №92 (resolved_callees, channel-first).
+// КАНОН (владелец 2026-07-25, разблокировано №92 channel-first): перенос
+// владения буфера, zero-copy — одноимённость с `BodyReader consume @into_body`
+// теперь диспатчится по типу ресивера через resolved_callees.
+export fn []u8 consume @into_body() -> Body => { repr: InMemory(@), limit: -1 }
 
-/// Тело из строки (UTF-8-байты). Имя `to_body_utf8`, НЕ `to_body` — см. маркер
-/// `[M-samename-extension-method-recv-type-collision]` на `[]u8 @to_body()` выше.
+/// Тело из строки (UTF-8-байты; копия — честный to_, str immutable).
 #stable(since = "0.1")
-export fn str @to_body_utf8() -> Body =>
+export fn str @to_body() -> Body =>
     // `repr: InMemory([]u8)` needs an OWNED buffer; `.clone()` materialises the
     // owned copy (D410: view+.clone() ≡ retired `to_bytes()` twin).
     { repr: InMemory(@bytes().clone()), limit: -1 }

@@ -11,9 +11,9 @@
 module http
 
 test "body: from_bytes/from_str discharge via bytes/text" {
-    consume b1 = "hello".bytes().to_body()
+    consume b1 = "hello".to_body()
     assert(b1.into_bytes()!!.len() == 5)
-    consume b2 = "héllo".to_body_utf8()
+    consume b2 = "héllo".to_body()
     assert(b2.into_text()!! == "héllo")
 }
 
@@ -26,7 +26,7 @@ test "body: stream reader drains in order" {
 }
 
 test "body: limit → BodyTooLarge" {
-    consume b = "0123456789".bytes().to_body().limit(4)
+    consume b = "0123456789".to_body().limit(4)
     assert(match b.into_bytes() { Ok(_) => false, Err(e) => match e.kind { BodyTooLarge => true, _ => false } })
 }
 
@@ -34,7 +34,7 @@ test "body: text rejects invalid UTF-8" {
     mut bad = Vec[u8].new()
     bad.push(0xFF as u8)
     bad.push(0xFE as u8)
-    consume b = bad.to_body()
+    consume b = bad.into_body()
     assert(match b.into_text() { Ok(_) => false, Err(_) => true })
 }
 
