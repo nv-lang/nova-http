@@ -58,7 +58,7 @@ export fn MockResponse.echo_request_header(name str) -> MockResponse =>
 /// Add a response header (replace).
 #stable(since = "0.1")
 export fn MockResponse mut @header(name str, value str) -> @ {
-    if Err(_) = @headers.insert(name, value) { panic("mock header: invariant — test-authored name/value must be valid") }
+    @headers.insert(name, value) ?? panic("mock header: invariant — test-authored name/value must be valid")
 }
 
 /// Set the response body (bytes).
