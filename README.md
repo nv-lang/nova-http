@@ -97,14 +97,14 @@ unchanged) — migrated out of `std` 2026-07-13 (Plan 203).
 
 Requires the Nova toolchain (`nova` CLI + clang). `[dependencies]` declares
 the release form (`tls = { git = "https://github.com/nv-lang/nova-tls",
-version = "0.1" }`, same for `compress`) — `nova.lock` pins the resolved
+version = "0.1" }`, same for `compress`) — `nova.lock.toml` pins the resolved
 tag+commit, fetched into the shared `~/.nova/git` cache on first build
 (network required once).
 
 For local development against a sibling checkout of
 [`nova-tls`](https://github.com/nv-lang/nova-tls) and/or
 [`nova-compress`](https://github.com/nv-lang/nova-compress) instead, create
-a `nova.local.toml` (NOT committed — see `.gitignore`) next to this file:
+a `nova.override.toml` (NOT committed — see `.gitignore`) next to this file:
 
 ```toml
 [replace]
