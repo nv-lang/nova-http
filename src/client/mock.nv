@@ -105,7 +105,9 @@ export fn mock_http() -> MockHttp => { routes: []MockRoute.new() }
 /// stripped).
 #stable(since = "0.1")
 export fn MockHttp @on(method str, path str, resp MockResponse) -> MockHttp {
-    mut rs = @routes
+    // Honest builder copy: clone the table so the NEW value owns its routes —
+    // the old `mut rs = @routes` alias silently mutated the receiver too.
+    mut rs = @routes.clone()
     rs.push(MockRoute { method, path, resp })
     { routes: rs }
 }
