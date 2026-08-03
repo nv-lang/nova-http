@@ -192,8 +192,9 @@ your option — same terms as the Nova compiler and standard library.
 
 ## Roadmap
 
-- **`serve_static(mux, fs ReadFs)` + mime-по-расширению** (owner-go 2026-07-16): статик-хендлер поверх
-  read-only VFS-протокола `ReadFs` (nova std/fs, Plan 210 Ф.6б) — «dev = с диска (`DirFs`), prod = из
-  бинаря (`EmbeddedDir`/`embed_dir`)» одной строкой; Go `http.FileServer`-паритет. Mime-таблица по
-  расширению (минимальный набор: html/css/js/json/svg/png/jpg/woff2/wasm + `application/octet-stream`
-  fallback). Витрина — флагман-агрегатор (nova Plan 187): `embed_dir("frontend")` + `serve_static`.
+- **`serve_static(mux, fs ReadFs)` + extension-based mime** (owner-go 2026-07-16): a static handler on
+  top of the read-only VFS protocol `ReadFs` (nova std/fs, Plan 210 Ф.6б) — "dev = from disk (`DirFs`),
+  prod = from the binary (`EmbeddedDir`/`embed_dir`)" in one line; parity with Go's `http.FileServer`.
+  Extension-based mime table (minimal set: html/css/js/json/svg/png/jpg/woff2/wasm +
+  `application/octet-stream` fallback). Showcase — the flagship aggregator (nova Plan 187):
+  `embed_dir("frontend")` + `serve_static`.
