@@ -2,12 +2,14 @@
 
 # nova-http
 
-HTTP/1.1 client + server for [Nova](https://nv-lang.org) — request/response
-model (`Method`, `StatusCode`, `Version`, `HeaderMap`, `Body`), URL parsing
-with a strict host/SSRF validator, cookies (RFC 6265bis), an `HttpClient`
-(reqwest-style builder: redirects, gzip/deflate/brotli decompression, typed
-JSON bodies), and an `HTTP/1.1` server (`ServeMux`, streaming/SSE, live
-accept loop over `std.net`). HTTPS goes through [`tls`](../nova-tls).
+HTTP/1.1 client + protocol core for [Nova](https://nv-lang.org) —
+request/response model (`Method`, `StatusCode`, `Version`, `HeaderMap`,
+`Body`), URL parsing with a strict host/SSRF validator, cookies (RFC
+6265bis), and an `HttpClient` (reqwest-style builder: redirects,
+gzip/deflate/brotli decompression, typed JSON bodies). HTTPS goes through
+[`tls`](../nova-tls). **There is no HTTP server in this package** — the
+`Router`, handlers, middleware, auth and WebSocket layer live in
+[`nova-polaris`](https://github.com/nv-lang/nova-polaris).
 
 Pure Nova — no native C shim of its own; external dependencies are `tls`
 (for the `secure = true` transport path) and `compress` (for transparent
@@ -21,27 +23,34 @@ standalone repository per
 `nova-tls`'s own extraction ([Plan 193](https://github.com/nv-lang/nova/blob/main/docs/plans/193-nova-tls-repo.md)):
 Rust and Swift both keep `http`+`tls` outside their standard library: this
 package follows that school, continuing the direction set by nova-tls.
-Public API is unchanged from `std.http` — only the module path moved
-(`std.http.*` -> `http.*`; see "Module path" note below).
+Public API for the surface that remains (protocol types + `HttpClient`) is
+unchanged from `std.http` — only the module path moved (`std.http.*` ->
+`http.*`; see "Module path" note below).
+
+A later split ([Plan 222](https://github.com/nv-lang/nova/blob/main/docs/plans/222-http-framework.md),
+owner decision 2026-07-24, commit `d580e78`) moved the server, `Router`,
+middleware, auth and WebSocket layer OUT of this package entirely into
+[`nova-polaris`](https://github.com/nv-lang/nova-polaris), under the
+`polaris.*` module path (not `http.server.*`) — a different package, not
+just a different module. This package kept only what's below: the protocol
+core (types) and the client.
 
 ## Usage
 
 ```nova
 import http.{Http}
 import http.client.{HttpClient}
-import http.server.{Router, ServerRequest, ServerResponse, serve_once}
+import http.transport.{real_http}
+import std.net.{real_net}
 
-fn make_client() Http -> HttpClient {
-    HttpClient.new()
-}
-
-fn make_router() -> Router {
-    mut r = Router.new()
-    // A bare closure auto-lifts into `Handler` (newtype over
-    // `fn(ServerRequest) -> ServerResponse`, D52/D55) — no wrapper call.
-    r.get("/", fn(req ServerRequest) -> ServerResponse =>
-        ServerResponse.text(200, "hello from nova-http"))!!
-    r
+fn main() {
+    with Net = real_net() {
+        with Http = real_http() {
+            ro resp = HttpClient.new().get("http://example.com/").send()!!
+            println("status: ${resp.status().code()}")
+            resp.drain()!!
+        }
+    }
 }
 ```
 
@@ -66,8 +75,6 @@ nova-http/
     ├── *_test.nv           root-peer tests (same-module, positive)
     ├── neg/                EXPECT_COMPILE_ERROR fixtures (standalone CUs)
     ├── client/             HttpClient + reqwest-style builder, wire codec, mock transport (D357/D360)
-    ├── server/             HTTP/1.1 server CORE + wire codec (D361)
-    ├── servernet/          live accept loop over std.net (D361) + rt/ smoke tests
     ├── serdejson/          typed JSON body decode (D360)
     └── transport/          real_http() over `Net`/`tls` (D357)
 ```
@@ -81,11 +88,11 @@ single-segment `module <package_name>` form — a peer group analogous to
 Cargo's `lib.rs`. This package's root-level surface (`body`, `cookie`,
 `effect`, `error`, `header`, `message`, `method`, `mime`, `response_ext`,
 `status`, `url`, `version`, all declaring `module http`) uses that form;
-domain subfolders (`client/`, `server/`, `servernet/`, `serdejson/`,
-`transport/`) are ordinary folder-module peers declaring `module
-http.client`, `module http.server`, etc. — unchanged in shape from inside
-the monorepo (`std/src/http/**`), only the enclosing `http/` directory
-itself disappeared (it IS this package's source root now). Import as
+domain subfolders (`client/`, `serdejson/`, `transport/`) are ordinary
+folder-module peers declaring `module http.client`, `module
+http.serdejson`, etc. — unchanged in shape from inside the monorepo
+(`std/src/http/**`), only the enclosing `http/` directory itself
+disappeared (it IS this package's source root now). Import as
 `import http.{Http, ...}` / `import http.client.{HttpClient}` / etc., both
 from another package's `[dependencies]` consumer and from an independent
 same-package file (e.g. `src/neg/*.nv` uses `import http.{Body}` to reach
@@ -140,9 +147,6 @@ export NOVA_RT_DIR=/path/to/nova/compiler-codegen/nova_rt
 nova test src
 ```
 
-Some tests (`servernet/rt/*`, live socket smoke tests) bind real ports and
-may need a longer timeout (`--timeout 300`) than the default under load.
-
 ## Gate
 
 The package gate (Plan 222 §9, owner decision 2026-07-23) is
@@ -166,24 +170,33 @@ Two mandatory steps, in order:
    4019173).
 2. **`nova test src`** — the full test suite over the C-codegen pipeline.
 
-## Testing handlers without sockets
+## Testing the client without sockets
 
-A handler is just a function — no socket required. Nova's architecture lets
-you test `Handler` behavior directly by invoking `dispatch` in a test, passing
-a synthetic request. Unlike frameworks that require mock transports or
-heavyweight `TestClient` stubs (FastAPI, for example, markets its `TestClient`
-as an optional external tool), this pattern is built in: request dispatch is
-a pure function call. To test a route's behavior without binding ports, call
-`serve_once()` with a router and raw HTTP bytes — you get back the full wire
-response, parse it inline.
+`Http` is a thin, mockable effect seam (`effect.nv`) between the pure-Nova
+client logic (redirects, auth-strip, `error_for_status`, ...) and the byte
+transport. Production code installs `real_http()` (`transport/real.nv`,
+over `Net`); tests install `mock_http()` (`client/mock.nv`) instead — an
+in-memory `Http` handler that routes a serialized request to a programmed
+`MockResponse` by `(method, path)`, with no socket involved. It runs the
+response through the SAME wire codec `real_http()` uses, so chunked-decode
+and malformed-response fixtures exercise the identical parser.
 
 ```nova
-mut r = Router.new()
-r.get("/hello", fn(req ServerRequest) -> ServerResponse => 
-    ServerResponse.text(200, "hello"))!!
-ro wire = serve_once(r, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n".bytes())
-assert(status_line(wire) == "HTTP/1.1 200 OK")
+test "client: GET round-trip via mock" {
+    ro m = mock_http().on("GET", "/hello", MockResponse.new(200).text("world"))
+    with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
+        ro resp = HttpClient.new().get("http://api.example.com/hello").send()!!
+        assert(resp.status().code() == 200)
+        assert(resp.into_text()!! == "world")
+    }
+}
 ```
+
+The inline `effect Http { send(..) { m.reply(request) } }` handler captures
+`m` by-frame — needed for the conservative GC to keep the mock's routes
+reachable (`mock_http().on(..).build()` also works but copies the routes
+into an unrooted heap closure — see `[M-178-mock-handler-gc-trace]` in
+`client/mock.nv`).
 
 ## License
 

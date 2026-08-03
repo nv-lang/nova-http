@@ -2,12 +2,14 @@
 
 # nova-http
 
-HTTP/1.1-клиент и сервер для [Nova](https://nv-lang.org) — модель
-запрос/ответ (`Method`, `StatusCode`, `Version`, `HeaderMap`, `Body`), разбор
-URL со строгим валидатором host/SSRF, куки (RFC 6265bis), `HttpClient`
-(билдер в стиле reqwest: редиректы, распаковка gzip/deflate/brotli,
-типизированные JSON-тела) и сервер `HTTP/1.1` (`ServeMux`, streaming/SSE,
-живой accept-цикл поверх `std.net`). HTTPS идёт через [`tls`](../nova-tls).
+HTTP/1.1-клиент и протокольное ядро для [Nova](https://nv-lang.org) —
+модель запрос/ответ (`Method`, `StatusCode`, `Version`, `HeaderMap`,
+`Body`), разбор URL со строгим валидатором host/SSRF, куки (RFC 6265bis) и
+`HttpClient` (билдер в стиле reqwest: редиректы, распаковка
+gzip/deflate/brotli, типизированные JSON-тела). HTTPS идёт через
+[`tls`](../nova-tls). **В этом пакете НЕТ HTTP-сервера** — маршрутизатор
+`Router`, обработчики, middleware, авторизация и WebSocket-слой живут в
+[`nova-polaris`](https://github.com/nv-lang/nova-polaris).
 
 Чистый Nova — без своей нативной C-прослойки; внешние зависимости — `tls`
 (для транспортного пути `secure = true`) и `compress` (для прозрачной
@@ -21,27 +23,34 @@ URL со строгим валидатором host/SSRF, куки (RFC 6265bis)
 собственное извлечение `nova-tls` ([план 193](https://github.com/nv-lang/nova/blob/main/docs/plans/193-nova-tls-repo.md)):
 и Rust, и Swift держат `http`+`tls` вне своей стандартной библиотеки — этот
 пакет следует той же школе, продолжая направление, заданное nova-tls.
-Публичный API не изменился по сравнению с `std.http` — сдвинулся только путь
-модуля (`std.http.*` -> `http.*`; см. заметку «Путь модуля» ниже).
+Публичный API для оставшейся поверхности (протокольные типы + `HttpClient`)
+не изменился по сравнению с `std.http` — сдвинулся только путь модуля
+(`std.http.*` -> `http.*`; см. заметку «Путь модуля» ниже).
+
+Позднее разбиение ([план 222](https://github.com/nv-lang/nova/blob/main/docs/plans/222-http-framework.md),
+решение владельца 2026-07-24, коммит `d580e78`) вынесло сервер, `Router`,
+middleware, авторизацию и WebSocket-слой из этого пакета ЦЕЛИКОМ в
+[`nova-polaris`](https://github.com/nv-lang/nova-polaris), под путь модуля
+`polaris.*` (не `http.server.*`) — это другой пакет, а не просто другой
+путь модуля. В этом пакете осталось только то, что описано ниже:
+протокольное ядро (типы) и клиент.
 
 ## Использование
 
 ```nova
 import http.{Http}
 import http.client.{HttpClient}
-import http.server.{Router, ServerRequest, ServerResponse, serve_once}
+import http.transport.{real_http}
+import std.net.{real_net}
 
-fn make_client() Http -> HttpClient {
-    HttpClient.new()
-}
-
-fn make_router() -> Router {
-    mut r = Router.new()
-    // A bare closure auto-lifts into `Handler` (newtype over
-    // `fn(ServerRequest) -> ServerResponse`, D52/D55) — no wrapper call.
-    r.get("/", fn(req ServerRequest) -> ServerResponse =>
-        ServerResponse.text(200, "hello from nova-http"))!!
-    r
+fn main() {
+    with Net = real_net() {
+        with Http = real_http() {
+            ro resp = HttpClient.new().get("http://example.com/").send()!!
+            println("status: ${resp.status().code()}")
+            resp.drain()!!
+        }
+    }
 }
 ```
 
@@ -66,8 +75,6 @@ nova-http/
     ├── *_test.nv           root-peer tests (same-module, positive)
     ├── neg/                EXPECT_COMPILE_ERROR fixtures (standalone CUs)
     ├── client/             HttpClient + reqwest-style builder, wire codec, mock transport (D357/D360)
-    ├── server/             HTTP/1.1 server CORE + wire codec (D361)
-    ├── servernet/          live accept loop over std.net (D361) + rt/ smoke tests
     ├── serdejson/          typed JSON body decode (D360)
     └── transport/          real_http() over `Net`/`tls` (D357)
 ```
@@ -81,9 +88,9 @@ D78 rev-4 (root peers, `spec/decisions/07-modules.md` «Root peers —
 `lib.rs` в Cargo. Поверхность корневого уровня этого пакета (`body`,
 `cookie`, `effect`, `error`, `header`, `message`, `method`, `mime`,
 `response_ext`, `status`, `url`, `version`, все объявляют `module http`)
-использует эту форму; доменные подпапки (`client/`, `server/`, `servernet/`,
-`serdejson/`, `transport/`) — обычные пиры-папки-модули, объявляющие `module
-http.client`, `module http.server` и т. д. — по форме не отличаются от
+использует эту форму; доменные подпапки (`client/`, `serdejson/`,
+`transport/`) — обычные пиры-папки-модули, объявляющие `module
+http.client`, `module http.serdejson` и т. д. — по форме не отличаются от
 монорепозитория (`std/src/http/**`), исчезла только сама объемлющая папка
 `http/` (теперь ею является исходный корень этого пакета). Импортировать как
 `import http.{Http, ...}` / `import http.client.{HttpClient}` / и т. д., как
@@ -141,10 +148,6 @@ export NOVA_RT_DIR=/path/to/nova/compiler-codegen/nova_rt
 nova test src
 ```
 
-Некоторым тестам (`servernet/rt/*`, живые тесты сокетов) нужны реальные
-порты, и им может понадобиться более длинный таймаут (`--timeout 300`), чем
-дефолтный, при нагрузке.
-
 ## Гейт
 
 Гейт пакета (план 222 §9, решение владельца 2026-07-23) — это
@@ -168,25 +171,34 @@ powershell -File scripts/gate.ps1            # optionally: -TestTimeout 300
    лога, найденный флагманской сборкой, коммит 4019173).
 2. **`nova test src`** — полный набор тестов через пайплайн C-codegen.
 
-## Тестирование обработчиков без сокетов
+## Тестирование клиента без сокетов
 
-Обработчик — это просто функция, сокет не нужен. Архитектура Nova позволяет
-тестировать поведение `Handler` напрямую, вызывая `dispatch` в тесте и
-передавая синтетический запрос. В отличие от фреймворков, которым нужны
-мок-транспорты или тяжеловесные заглушки `TestClient` (например, FastAPI
-позиционирует свой `TestClient` как опциональный внешний инструмент), этот
-паттерн встроен: диспетчеризация запроса — это чистый вызов функции. Чтобы
-протестировать поведение маршрута без привязки портов, вызовите
-`serve_once()` с маршрутизатором и сырыми байтами HTTP — в ответ вы получите
-полный проводной ответ и разбираете его прямо на месте.
+`Http` — это тонкий, подменяемый эффект-шов (`effect.nv`) между чистой
+Nova-логикой клиента (редиректы, срез авторизации, `error_for_status`, ...)
+и байтовым транспортом. Прод-код устанавливает `real_http()`
+(`transport/real.nv`, поверх `Net`); тесты вместо этого устанавливают
+`mock_http()` (`client/mock.nv`) — обработчик `Http` в памяти, который
+маршрутизирует сериализованный запрос к запрограммированному
+`MockResponse` по паре `(method, path)`, без единого сокета. Ответ проходит
+через ТОТ ЖЕ проводной кодек, что использует `real_http()`, так что
+фикстуры на chunked-декод и на битый ответ проверяют тот же самый парсер.
 
 ```nova
-mut r = Router.new()
-r.get("/hello", fn(req ServerRequest) -> ServerResponse => 
-    ServerResponse.text(200, "hello"))!!
-ro wire = serve_once(r, "GET /hello HTTP/1.1\r\nHost: x\r\n\r\n".bytes())
-assert(status_line(wire) == "HTTP/1.1 200 OK")
+test "client: GET round-trip via mock" {
+    ro m = mock_http().on("GET", "/hello", MockResponse.new(200).text("world"))
+    with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
+        ro resp = HttpClient.new().get("http://api.example.com/hello").send()!!
+        assert(resp.status().code() == 200)
+        assert(resp.into_text()!! == "world")
+    }
+}
 ```
+
+Встроенный обработчик `effect Http { send(..) { m.reply(request) } }`
+захватывает `m` по кадру — это нужно, чтобы консервативный сборщик мусора
+видел маршруты мока достижимыми (`mock_http().on(..).build()` тоже
+работает, но копирует маршруты в незакорнённое хип-замыкание — см.
+`[M-178-mock-handler-gc-trace]` в `client/mock.nv`).
 
 ## Лицензия
 
