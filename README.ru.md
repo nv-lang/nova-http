@@ -44,12 +44,10 @@ import http.transport.{real_http}
 import std.net.{real_net}
 
 fn main() {
-    with Net = real_net() {
-        with Http = real_http() {
-            ro resp = HttpClient.new().get("http://example.com/").send()!!
-            println("status: ${resp.status().code()}")
-            resp.drain()!!
-        }
+    with Net = real_net(), Http = real_http() {
+        ro resp = HttpClient.new().get("http://example.com/").send()!!
+        println("status: ${resp.status().code()}")
+        resp.drain()!!
     }
 }
 ```
