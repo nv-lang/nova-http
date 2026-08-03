@@ -1,3 +1,5 @@
+**English** | [Русский](README.ru.md)
+
 # nova-http
 
 HTTP/1.1 client + server for [Nova](https://nv-lang.org) — request/response
