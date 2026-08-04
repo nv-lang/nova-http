@@ -1,5 +1,15 @@
 # Effect Dependency Injection for Handlers
 
+> **Note:** this pattern is illustrated with `Router`/`ServerRequest`/
+> `ServerResponse` — those types do NOT live in this package (`nova-http`).
+> The server/router/handler layer was split out into
+> [`nova-polaris`](https://github.com/nv-lang/nova-polaris) (Plan 222,
+> owner decision 2026-07-24); `nova-http` now carries only the protocol core
+> and the client (see the [top-level README](../../README.md)). The
+> effect-widening technique below is a general Nova pattern, not specific to
+> either package — it applies wherever you have a fixed handler-like
+> signature and want per-handler effect rows to widen into it.
+
 ## Problem: Factory ceremonies
 
 Typically, handlers require external services — database pools, loggers,
@@ -63,9 +73,14 @@ fn health(req ServerRequest) -> ServerResponse => ServerResponse.text(200, "ok")
 ```
 
 At dispatch time, wrap a **single** `with` pair around the entire router,
-not per-route:
+not per-route. `Router`/`ServerRequest`/`ServerResponse` here are
+`nova-polaris` types (`import polaris.{Router, ServerRequest,
+ServerResponse}`) — `Router.@dispatch` is a real method
+(`src/server_router.nv`):
 
 ```nova
+import polaris.{Router, ServerRequest, ServerResponse}
+
 fn serve_app(r Router, req ServerRequest) -> ServerResponse {
     with Db = effect Db {
         find(id int) -> Option[str] { /* real pool query */ }
@@ -99,5 +114,9 @@ fn serve_app(r Router, req ServerRequest) -> ServerResponse {
 ## Verification
 
 Build with `nova check --strict-effects` to catch undeclared transitive
-effects at compile time (see [Gate](../../README.md#gate) section,
-scripts/gate.ps1).
+effects at compile time — in whichever package hosts your handlers. This
+package's own gate (`Router`-free) is [Gate](../../README.md#gate); for
+`nova-polaris`, where `Router`/`ServerRequest`/`ServerResponse` above
+actually live, every documented code sample (including this pattern, once
+ported there) is checked via `nova test src/doc_samples_test.nv` — see its
+[README](https://github.com/nv-lang/nova-polaris#documentation).
