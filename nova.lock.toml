@@ -1,4 +1,4 @@
-# nova.lock — сгенерирован автоматически (Plan 03.1 / D78).
+# nova.lock.toml — сгенерирован автоматически (Plan 03.1 / D78).
 # Фиксирует точные версии зависимостей для воспроизводимых
 # сборок. Не редактируйте вручную; коммитьте в репозиторий.
 
@@ -9,13 +9,13 @@ name = "compress"
 source = "git"
 git = "https://github.com/nv-lang/nova-compress"
 pin = "version:>=0.1.0, <0.2.0"
-version = "0.1.0"
-commit = "47b0a642460ee247d18c398148b1fae7acaacfc6"
+version = "0.1.1"
+commit = "75919d9c89a0d52767d2d20ff342e69f50b6ad53"
 
 [[package]]
 name = "tls"
 source = "git"
 git = "https://github.com/nv-lang/nova-tls"
 pin = "version:>=0.1.0, <0.2.0"
-version = "0.1.0"
-commit = "510acc25335bb0cce0eb79f195dac1dd7a40f2dc"
+version = "0.1.5"
+commit = "3003b64fe48ee4cbad0d5683f14c536b25d9b8e5"
