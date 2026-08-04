@@ -79,8 +79,7 @@ nova-http/
 
 ## Module path
 
-D78 rev-4 (root peers, `spec/decisions/07-modules.md` "Root peers —
-`.nv`-файлы прямо в source root") lets `.nv` files that sit directly in the
+D78 rev-4 (root peers, see `spec/decisions/07-modules.md`, section "Root peers") lets `.nv` files that sit directly in the
 package's source root (`src/`, per `[lib] src` above) declare the
 single-segment `module <package_name>` form — a peer group analogous to
 Cargo's `lib.rs`. This package's root-level surface (`body`, `cookie`,
@@ -119,7 +118,7 @@ tls = { path = "../nova-tls" }
 compress = { path = "../nova-compress" }
 ```
 
-(Plan 204 дофикс №2 / D420: a committed `[replace]` would break a clean
+(Plan 204 follow-up fix #2 / D420: a committed `[replace]` would break a clean
 clone whose override path only exists on the author's machine — `nova
 build` hard-errors on that, `E_REPLACE_IN_MANIFEST`.)
 
