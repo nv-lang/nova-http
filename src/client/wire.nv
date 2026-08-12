@@ -273,7 +273,7 @@ fn parse_version(tok str) -> Result[Version, HttpError] {
     }
 }
 
-fn parse_header_line(hm mut HeaderMap, line []u8) -> Result[(), HttpError] {
+fn parse_header_line(mut hm HeaderMap, line []u8) -> Result[(), HttpError] {
     ro colon = match index_of(line, 0x3A, 0) {       // ':'
         Some(x) => x
         None    => return Err(HttpError.protocol_error("header line: no colon"))
