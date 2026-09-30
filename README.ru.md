@@ -104,7 +104,7 @@ std.http` (корневые файлы) / `module http.client` и т. д. (по�
 
 Нужен тулчейн Nova (CLI `nova` + clang). `[dependencies]` объявляет
 релизную форму (`tls = { git = "https://github.com/nv-lang/nova-tls",
-version = "0.1" }`, аналогично для `compress`) — `nova.lock.toml` фиксирует
+version = "0.2" }`, а `compress` — на `"0.1"`) — `nova.lock.toml` фиксирует
 разрешённые тег+коммит, которые подтягиваются в общий кэш `~/.nova/git` при
 первой сборке (один раз нужна сеть).
 

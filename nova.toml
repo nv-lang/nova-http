@@ -17,7 +17,7 @@
 
 [package]
 name = "http"
-version = "0.1.3"
+version = "0.2.0"
 description = "HTTP/1.1 client + protocol core (headers, cookies, URL, JSON bodies) for Nova — extracted from Nova's std/http (Plan 203); server/routing live in nova-polaris"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nv-lang/nova-http"
@@ -45,5 +45,5 @@ src = "src"
 # pulls in the `compress` package (extracted from std/encoding/compress, same
 # extraction shape as `tls` above) — client/client.nv and error.nv import it.
 [dependencies]
-tls = { git = "https://github.com/nv-lang/nova-tls", version = "0.1" }
+tls = { git = "https://github.com/nv-lang/nova-tls", version = "0.2" }
 compress = { git = "https://github.com/nv-lang/nova-compress", version = "0.1" }

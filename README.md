@@ -103,7 +103,7 @@ unchanged) — migrated out of `std` 2026-07-13 (Plan 203).
 
 Requires the Nova toolchain (`nova` CLI + clang). `[dependencies]` declares
 the release form (`tls = { git = "https://github.com/nv-lang/nova-tls",
-version = "0.1" }`, same for `compress`) — `nova.lock.toml` pins the resolved
+version = "0.2" }`, and `compress` at `"0.1"`) — `nova.lock.toml` pins the resolved
 tag+commit, fetched into the shared `~/.nova/git` cache on first build
 (network required once).
 
