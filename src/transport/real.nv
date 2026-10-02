@@ -64,7 +64,7 @@ export fn real_http() -> Effect[Http] => effect Http {
 // SystemRoots) → write → read-to-EOF over the encrypted stream → close.
 // Закрывает [M-178-https-needs-116] (Plan 116 Ф.5.3).
 fn https_send_over_net(host str, port int, request str) Net -> Result[str, HttpError] {
-    ro addrs = match resolve(host, port as u16) {
+    ro addrs = match resolve(host, port) {
         Ok(a)  => a
         Err(e) => return Err(HttpError.from_net(ErrorKind.Dns, e))
     }
@@ -136,7 +136,7 @@ fn https_send_over_net(host str, port int, request str) Net -> Result[str, HttpE
 
 // One plaintext HTTP/1.1 round-trip over Net: resolve → connect → write → read.
 fn http_send_over_net(host str, port int, request str) Net -> Result[str, HttpError] {
-    ro addrs = match resolve(host, port as u16) {
+    ro addrs = match resolve(host, port) {
         Ok(a)  => a
         Err(e) => return Err(HttpError.from_net(ErrorKind.Dns, e))
     }
