@@ -40,7 +40,7 @@ test "decompress: gzip body is transparently decoded" {
     ro payload = "hello, gzip world — transparently decompressed!"
     ro m = mock_http().on("GET", "/g",
         MockResponse.new(200).header("Content-Encoding", "gzip").body(gz(payload)))
-    with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
+    with Http = effect Http { send(host, port, secure, request, config) -> Result[[]u8, HttpError] { m.reply(request) } } {
         ro resp = HttpClient.new().get("http://x.example/g").send()!!
         assert(resp.into_text()!! == payload)
     }
@@ -52,7 +52,7 @@ test "decompress: deflate (zlib) body decoded, Content-Encoding dropped" {
     ro payload = "deflate/zlib payload body"
     ro m = mock_http().on("GET", "/d",
         MockResponse.new(200).header("Content-Encoding", "deflate").body(zl(payload)))
-    with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
+    with Http = effect Http { send(host, port, secure, request, config) -> Result[[]u8, HttpError] { m.reply(request) } } {
         ro resp = HttpClient.new().get("http://x.example/d").send()!!
         // Header now describes the DECODED body (Content-Encoding stripped).
         assert(match resp.header("content-encoding") { Some(_) => false, None => true })
@@ -67,7 +67,7 @@ test "decompress: disabled → body stays gzip-compressed" {
     ro compressed = gz(payload)
     ro m = mock_http().on("GET", "/r",
         MockResponse.new(200).header("Content-Encoding", "gzip").body(compressed))
-    with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
+    with Http = effect Http { send(host, port, secure, request, config) -> Result[[]u8, HttpError] { m.reply(request) } } {
         mut b = HttpClient.builder()
         b.no_decompress()
         ro client = b.into_client()!!
@@ -89,7 +89,7 @@ test "decompress: gzip bomb past max_decompressed → Err(BodyTooLarge)" {
     ro payload = big.into_str()
     ro m = mock_http().on("GET", "/bomb",
         MockResponse.new(200).header("Content-Encoding", "gzip").body(gz(payload)))
-    with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
+    with Http = effect Http { send(host, port, secure, request, config) -> Result[[]u8, HttpError] { m.reply(request) } } {
         mut b = HttpClient.builder()
         b.max_decompressed(256)
         ro client = b.into_client()!!

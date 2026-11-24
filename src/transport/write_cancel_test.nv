@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+module http.transport
+
+import std.net.{TcpListener, SocketAddr, real_net}
+import std.time.duration
+import http.{HttpConfig, HttpError}
+import http.client.{HttpClient}
+
+fn stalled_write(cancel bool) Net Io Time -> bool {
+    transport_trace("write start cancel=${cancel}")
+    consume listener = TcpListener.bind(SocketAddr.loopback(0))!!
+    ro port = listener.local_port()
+    ro (done_tx, done_rx) = Channel[int].new(1)
+    ro tok = CancelToken.new()
+    // Far larger than the socket send window; peer NEVER reads any bytes.
+    mut body []u8 = []u8.new()
+    body.resize(16777216, 65 as u8)
+    mut failed = false
+    ro start = Timestamp.now().unix_millis()
+    supervised(timeout: 5.to_seconds()) {
+        spawn consume listener {
+            transport_trace("write server accepting")
+            consume peer = listener.accept()!!
+            transport_trace("write server accepted; stalled-write wire ready")
+            if cancel { 100.to_millis().sleep(); transport_trace("write token cancel"); tok.cancel() }
+            assert(done_rx.recv() == Some(1))
+            transport_trace("write server completion received")
+            peer.close()
+            listener.close()
+            transport_trace("write peer and listener closed")
+        }
+        mut config = HttpConfig.new()
+        config.cancel = tok
+        config.total_timeout = if cancel { 4.to_seconds() } else { 200.to_millis() }
+        with Http = real_http() {
+            mut builder = HttpClient.builder()
+            builder.config(config)
+            ro client = builder.into_client()!!
+            match client.post("http://127.0.0.1:${port}/").body(body).send() {
+                Ok(consume r) => { r.drain()!!; failed = false }
+                Err(e) => {
+                    println("write interrupt cancel=${cancel}: ${e.to_str()}")
+                    failed = if cancel { match e.kind { Canceled => true, _ => false } } else { match e.kind { Timeout => true, _ => false } }
+                }
+            }
+        }
+        transport_trace("write client returned failed=${failed}")
+        assert(done_tx.try_send(1))
+    }
+    transport_trace("write resources joined")
+    ro elapsed = Timestamp.now().unix_millis() - start
+    println("write elapsed=${elapsed} failed=${failed}")
+    failed && elapsed < 2000
+}
+
+test "native: deadline interrupts stalled write" {
+    with Net = real_net() { assert(stalled_write(false)) }
+}
+
+test "native: cancellation interrupts stalled write" {
+    with Net = real_net() { assert(stalled_write(true)) }
+}

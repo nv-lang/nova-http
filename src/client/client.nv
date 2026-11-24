@@ -17,14 +17,13 @@
 //   · 4xx/5xx = valid Response; opt-in error_for_status (response_ext.nv).
 //
 // Honest gates (markers, not silent simplifications):
-//   · timeout/deadline-by-default — substrate present but no effect-poly deadline
-//     combinator / supervised(deadline:) in main. [M-178-timeout-needs-173] (refined)
+//   · Native timeout/cancellation and HTTP/HTTPS byte framing are implemented.
 //   · auto-decompress gzip/deflate — decode exists (Plan 179) but wiring compress
 //     into this CU collides http/compress `ErrorKind` C-mangling (codegen).
 //     [M-178-autodecompress-needs-179] → [M-codegen-nominal-type-name-collision]
 //   · typed JSON bodies — LANDED as `json_decode_body[T]` in http.serdejson
 //     (free-fn, isolated CU). [M-178-typed-json-needs-180] closed.
-//   · https/h2 ← Plan 116 (real_http returns Err(Tls) for https). [M-178-https-needs-116]
+//   · HTTP/2 remains deferred; native HTTPS explicitly negotiates HTTP/1.1.
 //   · live keep-alive/pool reuse — decision logic + config here; live socket reuse
 //     deferred (real.nv). [M-178-client-live-pool]
 //   · Proxy/CONNECT-tunnel, SSRF-guard, cookie-jar, idempotent-retry — client
@@ -32,11 +31,12 @@
 
 module http.client
 
-import http.{Method, Url, HeaderMap, Response, Request, Http, HttpError, ErrorKind, Version, StatusCode}
+import http.{Method, Url, HeaderMap, Response, Request, Http, HttpError, ErrorKind, Version, StatusCode, HttpConfig}
 
 import std.encoding.base64.{Base64}
 import std.encoding.json.{JsonValue, Json}
 import compress.{gzip_decode, zlib_decode, inflate, brotli_decode, CompressError}
+import tls.{ClientConfig}
 
 // ── RedirectPolicy ───────────────────────────────────────────────────────────
 
@@ -62,9 +62,11 @@ export type HttpClient value {
     priv default_headers []HeaderKV
     priv follow_redirects bool
     priv max_redirects    int
+    priv allowed_origins  []str
     priv user_agent       str
     priv auto_decompress  bool
     priv max_decompressed int
+    priv config HttpConfig
 }
 
 /// Fluent client builder.
@@ -73,9 +75,11 @@ export type HttpClientBuilder value {
     priv default_headers []HeaderKV
     priv follow_redirects bool
     priv max_redirects    int
+    priv allowed_origins  []str
     priv user_agent       str
     priv auto_decompress  bool
     priv max_decompressed int
+    priv config HttpConfig
 }
 
 /// Start a client builder with production defaults (10 redirects, UA set,
@@ -83,19 +87,23 @@ export type HttpClientBuilder value {
 #stable(since = "0.1")
 export fn HttpClient.builder() -> HttpClientBuilder =>
     { default_headers: []HeaderKV.new(), follow_redirects: true, max_redirects: 10,
-      user_agent: "nova-http/0.1", auto_decompress: true, max_decompressed: DEFAULT_MAX_DECOMPRESSED }
+      allowed_origins: []str.new(),
+      user_agent: "nova-http/0.1", auto_decompress: true, max_decompressed: DEFAULT_MAX_DECOMPRESSED, config: HttpConfig.new() }
 
 /// Client with production defaults.
 #stable(since = "0.1")
 export fn HttpClient.new() -> HttpClient =>
     { default_headers: []HeaderKV.new(), follow_redirects: true, max_redirects: 10,
-      user_agent: "nova-http/0.1", auto_decompress: true, max_decompressed: DEFAULT_MAX_DECOMPRESSED }
+      allowed_origins: []str.new(),
+      user_agent: "nova-http/0.1", auto_decompress: true, max_decompressed: DEFAULT_MAX_DECOMPRESSED, config: HttpConfig.new() }
 
 // Internal self-accessors (field privacy is enforced at the call-site module,
 // so cross-type reads of these `priv` fields go through owner methods, D281).
 fn HttpClient @cfg_follow() -> bool => @follow_redirects
 
 fn HttpClient @cfg_max() -> int => @max_redirects
+
+fn HttpClient @cfg_allowed() -> []str => @allowed_origins
 
 fn HttpClient @cfg_ua() -> str => @user_agent
 
@@ -104,6 +112,14 @@ fn HttpClient @cfg_defaults() -> []HeaderKV => @default_headers
 fn HttpClient @cfg_auto_decompress() -> bool => @auto_decompress
 
 fn HttpClient @cfg_max_decompressed() -> int => @max_decompressed
+
+fn HttpClient @cfg_transport() -> HttpConfig => @config
+
+/// Configure byte budgets, native TLS, cancellation and request deadlines.
+export fn HttpClientBuilder mut @config(config HttpConfig) -> @ {
+    @config = config
+    @max_decompressed = config.decoded_body_bytes
+}
 
 /// Add a default header sent on every request (append). Mutating fleeting
 /// property (D117 AMEND-2): a copying builder would shallow-copy the
@@ -129,6 +145,18 @@ export fn HttpClientBuilder mut @redirect(policy RedirectPolicy) -> @ {
     }
 }
 
+/// Restrict request targets to these origins — the INITIAL request URL and
+/// every redirect hop are both checked BEFORE any I/O. Each entry is an
+/// absolute URL ("scheme://host[:port]"); it is canonicalized ONCE here into
+/// the origin triple key (lowercase scheme, lowercase host, effective port).
+/// An EMPTY list allows every origin (default). With `NoFollow`/`Limited(0)`
+/// the chain never follows a hop at all, so the origin surface stays empty by
+/// contract (production-rework п.4).
+#stable(since = "0.1")
+export fn HttpClientBuilder mut @allowed_origins(origins []str) -> @ {
+    @allowed_origins = origins
+}
+
 /// Override the User-Agent.
 #stable(since = "0.1")
 export fn HttpClientBuilder mut @user_agent(ua str) -> @ {
@@ -148,13 +176,32 @@ export fn HttpClientBuilder mut @no_decompress() -> @ {
 #stable(since = "0.1")
 export fn HttpClientBuilder mut @max_decompressed(max_bytes int) -> @ {
     @max_decompressed = max_bytes
+    @config.decoded_body_bytes = max_bytes
 }
 
 /// Finalize the client. Fallible for parity with the full builder (tls/proxy);
 /// CORE construction never fails.
 #stable(since = "0.1")
-export fn HttpClientBuilder consume @into_client() -> Result[HttpClient, HttpError] =>
-    Ok({ @default_headers, @follow_redirects, @max_redirects, @user_agent, @auto_decompress, @max_decompressed })
+export fn HttpClientBuilder consume @into_client() -> Result[HttpClient, HttpError] {
+    if @config.header_bytes < 0 || @config.encoded_body_bytes < 0 || @config.decoded_body_bytes < 0 || @max_redirects < 0 {
+        return Err(HttpError.protocol_error("negative HTTP limit"))
+    }
+    // production-rework п.2: 1..2147483647 ms, явный отказ вне диапазона.
+    @config.check_timeouts()?
+    // production-rework п.4: max_hops 0..20; 20+ — явный отказ, не «как повезёт».
+    if @max_redirects > 20 {
+        return Err(HttpError.protocol_error("redirect max_hops out of range 0..20"))
+    }
+    // Canonicalize the allow-list ONCE at build time; a bad entry is a build
+    // error, not a mid-redirect surprise.
+    mut keys []str = []str.new()
+    for o in @allowed_origins {
+        ro u = o.to_url()?
+        ro (s, h, p) = u.origin()
+        keys.push(origin_key(s, h, p))
+    }
+    Ok({ @default_headers, @follow_redirects, @max_redirects, allowed_origins: keys, @user_agent, @auto_decompress, @max_decompressed, @config })
+}
 
 // ── verb shortcuts ───────────────────────────────────────────────────────────
 
@@ -293,6 +340,7 @@ export fn RequestBuilder @build() -> Result[Request, HttpError] {
     mut url0 = @url_input.to_url()?
     ro url1 = apply_query(url0, @query)
     ro headers = build_headers(@client, @header_ops, @content_type)?
+    validate_request_framing(headers, @body_bytes)?
     Ok(Request.new(@method, url1, headers, @body_bytes))
 }
 
@@ -303,7 +351,7 @@ export fn RequestBuilder @build() -> Result[Request, HttpError] {
 // into_* покрывает конверсии, не сетевые действия (приёмка волны №79;
 // кандидат — эффект-исключение в сам линт W_CONSUME_NAKED_NAME).
 // nova:allow W_CONSUME_NAKED_NAME -- effectful action, not a conversion
-export fn RequestBuilder consume @send() Http -> Result[Response, HttpError] {
+export fn RequestBuilder consume @send() Http Time -> Result[Response, HttpError] {
     // `mut` (not `ro`): `apply_query` takes `u` as a `mut` in-out param
     // (D246 canon (a)) — used exactly once, right below.
     mut url0 = @url_input.to_url()?
@@ -316,8 +364,8 @@ export fn RequestBuilder consume @send() Http -> Result[Response, HttpError] {
         return Err(HttpError.new(InvalidUrl).with_url(url1))
     }
     mut headers = build_headers(@client, @header_ops, @content_type)?
-    run_request(@method, url1, headers, @body_bytes, @client.cfg_follow(), @client.cfg_max(),
-                @client.cfg_auto_decompress(), @client.cfg_max_decompressed())
+    run_request(@method, url1, headers, @body_bytes, @client.cfg_follow(), @client.cfg_max(), @client.cfg_allowed(),
+                @client.cfg_auto_decompress(), @client.cfg_max_decompressed(), @client.cfg_transport())
 }
 
 // ── convenience (script / one-shot) — uses a fresh default client ────────────
@@ -325,35 +373,35 @@ export fn RequestBuilder consume @send() Http -> Result[Response, HttpError] {
 
 /// One-shot GET (script convenience).
 #stable(since = "0.1")
-export fn get(url str) Http -> Result[Response, HttpError] => HttpClient.new().get(url).send()
+export fn get(url str) Http Time -> Result[Response, HttpError] => HttpClient.new().get(url).send()
 
 /// One-shot HEAD.
 #stable(since = "0.1")
-export fn head(url str) Http -> Result[Response, HttpError] => HttpClient.new().head(url).send()
+export fn head(url str) Http Time -> Result[Response, HttpError] => HttpClient.new().head(url).send()
 
 /// One-shot DELETE.
 #stable(since = "0.1")
-export fn delete(url str) Http -> Result[Response, HttpError] => HttpClient.new().delete(url).send()
+export fn delete(url str) Http Time -> Result[Response, HttpError] => HttpClient.new().delete(url).send()
 
 /// One-shot POST with a byte body.
 #stable(since = "0.1")
-export fn post(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().post(url).body(body).send()
+export fn post(url str, body []u8) Http Time -> Result[Response, HttpError] => HttpClient.new().post(url).body(body).send()
 
 /// One-shot PUT with a byte body.
 #stable(since = "0.1")
-export fn put(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().put(url).body(body).send()
+export fn put(url str, body []u8) Http Time -> Result[Response, HttpError] => HttpClient.new().put(url).body(body).send()
 
 /// One-shot PATCH with a byte body.
 #stable(since = "0.1")
-export fn patch(url str, body []u8) Http -> Result[Response, HttpError] => HttpClient.new().patch(url).body(body).send()
+export fn patch(url str, body []u8) Http Time -> Result[Response, HttpError] => HttpClient.new().patch(url).body(body).send()
 
 // ── request execution + redirect loop ───────────────────────────────────────
 
 // Thin wrapper over the `Http.send` seam op — gives codegen a concrete
 // monomorphized `Result[str, HttpError]` (mirrors how net wraps its effect ops in
 // TcpStream methods; calling the raw op inline mis-typed the Err payload).
-fn http_seam_send(host str, port int, secure bool, request str) Http -> Result[str, HttpError] {
-    Http.send(host, port, secure, request)
+fn http_seam_send(host str, port int, secure bool, request []u8, config HttpConfig) Http Time -> Result[[]u8, HttpError] {
+    Http.send(host, port, secure, request, config)
 }
 
 // `method`/`url`/`headers`/`body` are all `mut` params (D246 canon (a)):
@@ -362,18 +410,35 @@ fn http_seam_send(host str, port int, secure bool, request str) Http -> Result[s
 // `url = next`) as it walks the chain, not an independent-copy case. The one
 // call site (`@send` below) never reuses its own `url1`/`headers` bindings
 // after this call.
-fn run_request(mut method Method, mut url Url, mut headers HeaderMap, mut body []u8, follow bool, max int, auto_decompress bool, max_decompressed int) Http -> Result[Response, HttpError] {
+fn run_request(mut method Method, mut url Url, mut headers HeaderMap, mut body []u8, follow bool, max int, allowed []str, auto_decompress bool, max_decompressed int, config HttpConfig) Http Time -> Result[Response, HttpError] {
+    // One absolute budget for ALL hops, never renewed by redirects.
+    ro end = Monotonic.now() + config.total_timeout
+    ro deadline = match config.deadline { Some(d) => if d.compare(end) < 0 { d } else { end }, None => end }
+    mut hop_config = HttpConfig {
+        header_bytes: config.header_bytes, encoded_body_bytes: config.encoded_body_bytes,
+        decoded_body_bytes: config.decoded_body_bytes, connect_timeout: config.connect_timeout,
+        total_timeout: config.total_timeout, deadline: Some(deadline), cancel: config.cancel, tls: config.tls
+    }
     mut remaining = max
     mut i = 0
+    // The allow-list governs the INITIAL request target too, not only redirect
+    // hops: an outbound request to a non-listed origin never reaches the
+    // network (production-rework п.4, приёмка замечание 3).
+    if allowed.len() > 0 {
+        ro (s0, h0, p0) = url.origin()
+        if !contains_str(allowed, origin_key(s0, h0, p0)) {
+            return Err(HttpError.transport(Blocked("request origin not allowed"), "${s0}://${h0}:${p0}").with_url(url))
+        }
+    }
     while i <= max {
         i += 1
         ro (scheme, host, port) = url.origin()
         ro secure = scheme == "https"
         ro target = request_target(url)
         ro host_header = host_header_of(url)
-        ro req = serialize_request(method.str(), target, host_header, headers, body)
-        ro raw = http_seam_send(host, port, secure, req)?
-        mut parsed = parse_response(raw)?
+        ro req = serialize_request(method.str(), target, host_header, headers, body)?
+        ro raw = http_seam_send(host, port, secure, req, hop_config)?
+        mut parsed = parse_response(raw, method.str() == "HEAD", config.header_bytes, config.encoded_body_bytes, config.decoded_body_bytes)?
         ro st = parsed.status
         ro code = st.code()
         if follow && st.is_redirect() && code != 304 {
@@ -382,9 +447,17 @@ fn run_request(mut method Method, mut url Url, mut headers HeaderMap, mut body [
                     if remaining <= 0 {
                         return Err(HttpError.new(TooManyRedirects(max)).with_url(url))
                     }
-                    ro next = resolve_url(url, loc)
+                    ro next = resolve_url(url, loc)?
                     ro (ns, nh, np) = next.origin()
-                    ro cross = ns != scheme || nh != host || np != port
+                    if ns != "http" && ns != "https" || (secure && ns != "https") {
+                        return Err(HttpError.transport(Blocked("unsafe redirect scheme"), "HTTPS downgrade prohibited"))
+                    }
+                    // Authority/origin allow-list: enforced BEFORE any I/O on the
+                    // new hop (production-rework п.4).
+                    if allowed.len() > 0 && !contains_str(allowed, origin_key(ns, nh, np)) {
+                        return Err(HttpError.transport(Blocked("redirect origin not allowed"), "${ns}://${nh}:${np}").with_url(next))
+                    }
+                    ro cross = ns != scheme || nh.to_ascii_lower() != host.to_ascii_lower() || np != port
                     if code == 303 || ((code == 301 || code == 302) && !method_is_get_head(method)) {
                         method = Get
                         body = []u8.new()
@@ -392,16 +465,24 @@ fn run_request(mut method Method, mut url Url, mut headers HeaderMap, mut body [
                     }
                     if cross {
                         headers = strip_sensitive(headers)
+                        // Client certificates are credentials too: never reuse on another origin.
+                        hop_config.tls = match hop_config.tls {
+                            Some(c) => Some(ClientConfig {
+                                server_name: nh, alpn_protocols: ["http/1.1"], verification: c.verification,
+                                client_cert_pem: []u8.new(), client_key_pem: []u8.new()
+                            })
+                            None => None
+                        }
                     }
                     url = next
                     remaining -= 1
                 }
                 None => {
-                    return finalize_response(parsed.version, st, parsed.headers, parsed.body, auto_decompress, max_decompressed)
+                    return finalize_deadlined(parsed.version, st, parsed.headers, parsed.body, auto_decompress && method.str() != "HEAD" && code != 204 && code != 304, max_decompressed, deadline, config.cancel)
                 }
             }
         } else {
-            return finalize_response(parsed.version, st, parsed.headers, parsed.body, auto_decompress, max_decompressed)
+            return finalize_deadlined(parsed.version, st, parsed.headers, parsed.body, auto_decompress && method.str() != "HEAD" && code != 204 && code != 304, max_decompressed, deadline, config.cancel)
         }
     }
     Err(HttpError.new(TooManyRedirects(max)).with_url(url))
@@ -419,11 +500,37 @@ fn run_request(mut method Method, mut url Url, mut headers HeaderMap, mut body [
 // headers`'s own `mut` param on the decode branches below; both callers
 // (`run_request` above) pass `parsed.headers` (a field access, not a bound
 // identifier), so this doesn't constrain them.
+// These are boundary checks, NOT active interruption of synchronous decode.
+// compress 0.1.3 has no public Brotli incremental decoder/cancellation hook;
+// its DEFLATE finish() may also pump unbounded work. A total decode deadline
+// requires a package-supported input/output/work-bounded step API for every
+// codec, including bounded EOF/checksum validation and explicit cleanup.
+fn finalize_deadlined(ver Version, st StatusCode, mut headers HeaderMap, body []u8, auto_decompress bool, max_decompressed int, deadline Monotonic, cancel CancelToken) Time -> Result[Response, HttpError] {
+    if cancel.is_cancelled() { return Err(HttpError.new(Canceled)) }
+    if Monotonic.now().compare(deadline) >= 0 { return Err(HttpError.new(Timeout)) }
+    match finalize_response(ver, st, headers, body, auto_decompress, max_decompressed) {
+        Err(e) => Err(e)
+        Ok(consume response) => {
+            if cancel.is_cancelled() {
+                response.drain()?
+                return Err(HttpError.new(Canceled))
+            }
+            if Monotonic.now().compare(deadline) >= 0 {
+                response.drain()?
+                return Err(HttpError.new(Timeout))
+            }
+            Ok(response)
+        }
+    }
+}
+
 fn finalize_response(ver Version, st StatusCode, mut headers HeaderMap, body []u8, auto_decompress bool, max_decompressed int) -> Result[Response, HttpError] {
-    if !auto_decompress {
+    ro enc = content_encoding_lower(headers)
+    if !auto_decompress || enc.byte_len() == 0 || enc == "identity" ||
+       (enc != "gzip" && enc != "x-gzip" && enc != "deflate" && enc != "br") {
+        if max_decompressed >= 0 && body.len() > max_decompressed { return Err(HttpError.body_too_large()) }
         return Ok(Response.new(ver, st, headers, body))
     }
-    ro enc = content_encoding_lower(headers)
     if enc.byte_len() == 0 {
         return Ok(Response.new(ver, st, headers, body))
     }
@@ -485,9 +592,21 @@ fn rewrite_encoding_headers(mut h HeaderMap, decoded_len int) -> HeaderMap {
     h
 }
 
+// Framing/routing headers are TRANSPORT-OWNED (production-rework п.3): the wire
+// layer derives Host from the URL and Content-Length/Transfer-Encoding from the
+// body — a manual override is a smuggling vector and is rejected BEFORE any
+// socket is opened.
+fn is_transport_owned_header(name str) -> bool {
+    ro key = name.to_ascii_lower()
+    key == "host" || key == "content-length" || key == "transfer-encoding"
+}
+
 fn build_headers(client HttpClient, ops []HeaderOp, content_type Option[str]) -> Result[HeaderMap, HttpError] {
     mut hm = HeaderMap.new()
     for kv in client.cfg_defaults() {
+        if is_transport_owned_header(kv.name) {
+            return Err(HttpError.protocol_error("manual ${kv.name} override is forbidden (transport-owned header)"))
+        }
         hm.insert(kv.name, kv.value)?
     }
     ro ua = client.cfg_ua()
@@ -505,6 +624,9 @@ fn build_headers(client HttpClient, ops []HeaderOp, content_type Option[str]) ->
         None     => ()
     }
     for op in ops {
+        if is_transport_owned_header(op.name) {
+            return Err(HttpError.protocol_error("manual ${op.name} override is forbidden (transport-owned header)"))
+        }
         ro r = if op.replace { hm.insert(op.name, op.value) } else { hm.append(op.name, op.value) }
         r?
     }
@@ -579,6 +701,8 @@ fn method_is_get_head(m Method) -> bool {
 fn strip_sensitive(mut h HeaderMap) -> HeaderMap {
     ro _ = h.remove("authorization")
     ro _ = h.remove("cookie")
+    ro _ = h.remove("proxy-authorization")
+    ro _ = h.remove("host")
     h
 }
 
@@ -592,12 +716,13 @@ fn drop_body_headers(mut h HeaderMap) -> HeaderMap {
 }
 
 // Resolve a Location value against the current URL (absolute / absolute-path /
-// relative). Unparseable → falls back to the base URL (redirect stops there).
-fn resolve_url(base Url, loc str) -> Url {
+// relative). Unparseable Location is a DEFINITE protocol error, never a silent
+// re-request of the base URL (production-rework AC: точная причина).
+fn resolve_url(base Url, loc str) -> Result[Url, HttpError] {
     if loc.starts_with("http://") || loc.starts_with("https://") {
-        match loc.to_url() { Ok(u) => u, Err(_) => base }
+        match loc.to_url() { Ok(u) => Ok(u), Err(_) => Err(HttpError.transport(Protocol("invalid redirect Location"), loc)) }
     } else if loc.starts_with("//") {
-        match "${base.scheme}:${loc}".to_url() { Ok(u) => u, Err(_) => base }
+        match "${base.scheme}:${loc}".to_url() { Ok(u) => Ok(u), Err(_) => Err(HttpError.transport(Protocol("invalid redirect Location"), loc)) }
     } else if loc.starts_with("/") {
         url_with_target(base, loc)
     } else {
@@ -605,7 +730,11 @@ fn resolve_url(base Url, loc str) -> Url {
     }
 }
 
-fn url_with_target(base Url, target str) -> Url {
+/// Canonical origin key for the redirect allow-list: "scheme|host|port" with
+/// all components already canonical (see `Url.origin()`).
+fn origin_key(scheme str, host str, port int) -> str => "${scheme}|${host}|${port}"
+
+fn url_with_target(base Url, target str) -> Result[Url, HttpError] {
     consume sb = StringBuilder.new()
     sb.cap(64)
     sb.append(base.scheme)
@@ -622,7 +751,7 @@ fn url_with_target(base Url, target str) -> Url {
     }
     if !target.starts_with("/") { sb.append("/") }
     sb.append(target)
-    match sb.into_str().to_url() { Ok(u) => u, Err(_) => base }
+    match sb.into_str().to_url() { Ok(u) => Ok(u), Err(_) => Err(HttpError.transport(Protocol("invalid redirect Location"), target)) }
 }
 
 fn merge_rel_path(base_path str, rel str) -> str {

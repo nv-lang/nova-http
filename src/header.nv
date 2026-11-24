@@ -233,7 +233,7 @@ export fn HeaderMap @transfer_encoding() -> []str {
 #stable(since = "0.1")
 export fn HeaderMap @content_length() -> Result[Option[int], HttpError] {
     ro cls = @get_all("content-length")
-    if @transfer_encoding().len() > 0 && cls.len() > 0 {
+    if @contains("transfer-encoding") && cls.len() > 0 {
         return Err(HttpError.protocol_error("both Transfer-Encoding and Content-Length present"))
     }
     if cls.len() == 0 { return Ok(None) }
@@ -243,18 +243,18 @@ export fn HeaderMap @content_length() -> Result[Option[int], HttpError] {
             Ok(t)  => t
             Err(_) => return Err(HttpError.protocol_error("invalid Content-Length octets"))
         }
-        for c in s.chars() {
-            if !c.is_ascii_digit() {
-                return Err(HttpError.protocol_error("non-digit in Content-Length"))
+        for part in s.split(",") {
+            ro tok = part.trim_ascii()
+            if tok.byte_len() == 0 { return Err(HttpError.protocol_error("empty Content-Length")) }
+            mut n = 0
+            for byte in tok.bytes() {
+                ro d = (byte as int) - 48
+                if d < 0 || d > 9 { return Err(HttpError.protocol_error("non-digit in Content-Length")) }
+                if n > (9223372036854775807 - d) / 10 { return Err(HttpError.protocol_error("Content-Length overflow")) }
+                n = n * 10 + d
             }
-        }
-        ro n = match s.to_int() {
-            Ok(x)  => x
-            Err(_) => return Err(HttpError.protocol_error("malformed Content-Length"))
-        }
-        if first == -1 { first = n }
-        else if first != n {
-            return Err(HttpError.protocol_error("conflicting Content-Length values"))
+            if first == -1 { first = n }
+            else if first != n { return Err(HttpError.protocol_error("conflicting Content-Length values")) }
         }
     }
     Ok(Some(first))

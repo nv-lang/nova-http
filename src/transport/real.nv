@@ -1,176 +1,187 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// nova-http: real.nv — real_http() over `Net` (D357). Extracted from
-// monorepo std/http (Plan 203 Ф.1).
-// Plan 183 Ф.3: migrated onto std.net2 (byte-surface `Net`, D407) — the old
-// std.net str-carrying effect is deprecated (see std/net/*.nv banners).
-//
-// `real_http()` is the production `Http` handler: resolve host, open a TCP
-// connection (Plan 183 zero-copy byte-surface), write the serialized request,
-// read the full response. All HTTP semantics stay in Nova (http wire/client);
-// this handler is the thin byte-transport seam.
-//
-// WHY A SEPARATE MODULE (`http.transport`): importing `std.net2` pulls
-// `NetError` into the importing module's constructor namespace, where
-// `NetError.InvalidPort` shadows `ParseUrlError.InvalidPort` (http/url.nv).
-// Isolating the std.net2 dependency here keeps http's namespace clean.
-// [M-178-transport-submodule-net-isolation]
-//
-// CORE scope (plaintext HTTP/1.1 + HTTPS): one hop per connection, `Connection:
-// close`, read-to-EOF. HARD-GATES / honest deferrals:
-//   · https (`secure = true`) — ✅ Plan 116 Ф.5.3: TLS-слой поверх TcpStream
-//     (SNI = host, SystemRoots webpki-roots, ALPN http/1.1). Закрывает
-//     [M-178-https-needs-116].
-//   · keep-alive live conn reuse / pool — decision logic + config in client.nv
-//     (pure, tested); live socket reuse deferred. [M-178-client-live-pool]
-//   · timeout/deadline-by-default — Plan 173 supervised scope, at the call site.
-//     [M-178-timeout-needs-173]
-//   · typed `ErrSource.Net(NetError)` ✅ landed (Plan 176 Ф.4, Q3): connect/
-//     write/read transport failures carry the actual `NetError` via
-//     `HttpError.from_net` (error.nv); dns resolution failure (`resolve`
-//     returns `NetError` too) is the same path. Typed `ErrSource.Tls(TlsError)`
-//     ✅ landed (Plan 116 Ф.5.3 / M-178): handshake/encrypted-write/encrypted-
-//     read failures carry the actual `TlsError` via `HttpError.from_tls`
-//     (error.nv) — closes [M-178-errsource-tls].
-
 module http.transport
 
 import std.net.{TcpStream, resolve}
 import tls.{TlsStream, ClientConfig, TlsError}
-import http.{Http, HttpError, ErrorKind}
+import http.{Http, HttpError, ErrorKind, HttpConfig}
+import http.client.{ResponseFramer}
 
-/// Production `Http` handler over the `Net` effect (TCP + DNS via libuv).
-///
-/// Install alongside `Net`:
-/// ```nova
-/// with Net = real_net() {
-///     with Http = real_http() {
-///         ro resp = HttpClient.new().get("http://example.com/").send()!!
-///         resp.drain()!!
-///     }
-/// }
-/// ```
+/// Native single-hop HTTP/HTTPS transport. The same byte framer as the client
+/// stops reads at completion (not EOF), validates framing, and bounds storage.
 #stable(since = "0.1")
 export fn real_http() -> Effect[Http] => effect Http {
-    send(host, port, secure, request) -> Result[str, HttpError] {
-        if secure {
-            https_send_over_net(host, port, request)
-        } else {
-            http_send_over_net(host, port, request)
-        }
+    send(host, port, secure, request, config) -> Result[[]u8, HttpError] {
+        send_bounded(host, port, secure, request, config)
     }
 }
 
-// One HTTPS/1.1 round-trip: resolve → TCP connect → TLS handshake (SNI=host,
-// SystemRoots) → write → read-to-EOF over the encrypted stream → close.
-// Закрывает [M-178-https-needs-116] (Plan 116 Ф.5.3).
-fn https_send_over_net(host str, port int, request str) Net -> Result[str, HttpError] {
+fn send_bounded(host str, port int, secure bool, request []u8, config HttpConfig) Net Time -> Result[[]u8, HttpError] {
+    config.check_timeouts()?
+    ro end = match config.deadline {
+        Some(d) => d
+        None => Monotonic.now() + config.total_timeout
+    }
+    mut response Result[[]u8, HttpError] = Err(HttpError.new(ErrorKind.Canceled))
+    ro status = with Fail[TimeoutError] = |_e| 0 {
+        ro result = supervised(cancel: config.cancel) {
+            supervised(deadline: end) {
+                response = send_once(host, port, secure, request, config)
+            }
+        }
+        match result { Finished(_) => 1, Aborted(_) => 2 }
+    }
+    // Direct native waits may return their typed Cancelled error instead of
+    // throwing. The absolute clock check is authoritative after the wait has
+    // actually been interrupted; preserve the original transport source.
+    if status == 0 || Monotonic.now().compare(end) >= 0 {
+        return interrupted_result(response, ErrorKind.Timeout)
+    }
+    if status == 2 { return interrupted_result(response, ErrorKind.Canceled) }
+    match response {
+        Err(e) => if transport_cancelled(e) {
+            interrupted_result(Err(e), if config.cancel.is_cancelled() { ErrorKind.Canceled } else { ErrorKind.Timeout })
+        } else { Err(e) }
+        Ok(b) => Ok(b)
+    }
+}
+
+fn transport_cancelled(e HttpError) -> bool {
+    match e.source {
+        Some(Net(ne)) => match ne { Cancelled => true, _ => false }
+        Some(Tls(te)) => match te { Net(ne) => match ne { Cancelled => true, _ => false }, _ => false }
+        _ => false
+    }
+}
+
+fn interrupted_result(response Result[[]u8, HttpError], kind ErrorKind) -> Result[[]u8, HttpError] {
+    match response {
+        Err(e) => Err(HttpError { kind, url: e.url, source: e.source })
+        Ok(_) => Err(HttpError.new(kind))
+    }
+}
+
+fn send_once(host str, port int, secure bool, request []u8, config HttpConfig) Net -> Result[[]u8, HttpError] {
+    if secure { https_send_over_net(host, port, request, config) }
+    else { http_send_over_net(host, port, request, config) }
+}
+
+fn connect_tcp(host str, port int, config HttpConfig) Net -> Result[TcpStream, HttpError] {
+    ro (tx, rx) = Channel[Result[TcpStream, HttpError]].new(1)
+    supervised(timeout: config.connect_timeout) {
+        ro sent = tx.try_send(connect_tcp_now(host, port))
+        assert(sent)
+    }
+    tx.close()
+    match rx.try_recv() {
+        Some(consume r) => r
+        None => Err(HttpError.new(ErrorKind.Canceled))
+    }
+}
+
+fn connect_tcp_now(host str, port int) Net -> Result[TcpStream, HttpError] {
     ro addrs = match resolve(host, port) {
-        Ok(a)  => a
+        Ok(a) => a
         Err(e) => return Err(HttpError.from_net(ErrorKind.Dns, e))
     }
-    ro addr = match addrs.get(0) {
-        Some(a) => a
-        None    => return Err(HttpError.transport(ErrorKind.Dns, "no addresses resolved"))
+    mut last = HttpError.transport(ErrorKind.Dns, "no addresses resolved")
+    for addr in addrs {
+        match TcpStream.connect(addr) {
+            Ok(consume s) => return Ok(s)
+            Err(e) => {
+                last = HttpError.from_net(ErrorKind.Connect, e)
+                if transport_cancelled(last) { return Err(last) }
+            }
+        }
     }
-    // SNI + hostname-verification target = host; SystemRoots + ALPN http/1.1
-    // (дефолт ClientConfig.new). TlsStream.connect потребляет tcp на ВСЕХ путях
-    // (на ошибке закрывает сам) — поэтому connect+handshake одним match'ем без
-    // промежуточного consume-биндинга tcp (D131 path-merge).
-    ro cfg = ClientConfig.new(host)
-    ro conn = match TcpStream.connect(addr) {
-        Ok(consume s)  => TlsStream.connect(s, cfg)
-        Err(e) => return Err(HttpError.from_net(ErrorKind.Connect, e))
+    Err(last)
+}
+
+fn tls_connect_now(host str, port int, cfg ClientConfig) Net -> Result[TlsStream, HttpError] {
+    match connect_tcp_now(host, port) {
+        Ok(consume s) => match TlsStream.connect(s, cfg) {
+            Ok(consume t) => Ok(t)
+            Err(e) => Err(HttpError.from_tls(ErrorKind.Tls, e))
+        }
+        Err(e) => Err(e)
     }
-    consume tls = match conn {
-        Ok(s)  => s
+}
+
+fn tls_connect_bounded(host str, port int, cfg ClientConfig, config HttpConfig) Net -> Result[TlsStream, HttpError] {
+    ro (tx, rx) = Channel[Result[TlsStream, HttpError]].new(1)
+    supervised(timeout: config.connect_timeout) {
+        ro sent = tx.try_send(tls_connect_now(host, port, cfg))
+        assert(sent)
+    }
+    tx.close()
+    match rx.try_recv() {
+        Some(consume r) => r
+        None => Err(HttpError.new(ErrorKind.Canceled))
+    }
+}
+
+fn request_is_head(request []u8) -> bool {
+    request.len() >= 5 && request[0] == 72 as u8 && request[1] == 69 as u8 &&
+    request[2] == 65 as u8 && request[3] == 68 as u8 && request[4] == 32 as u8
+}
+
+fn http_send_over_net(host str, port int, request []u8, config HttpConfig) Net -> Result[[]u8, HttpError] {
+    consume stream = match connect_tcp(host, port, config) {
+        Ok(consume s) => s
+        Err(e) => return Err(e)
+    }
+    ro result = http_exchange(stream, request, config)
+    stream.close()
+    result
+}
+
+fn http_exchange(mut stream TcpStream, request []u8, config HttpConfig) Net -> Result[[]u8, HttpError] {
+    match stream.write_all(request) {
+        Ok(_) => ()
+        // A failed WRITE is a broken/closed connection, not a connect failure —
+        // mislabeling it Connect masked the real phase in acceptance matrices.
+        Err(e) => return Err(HttpError.from_net(ErrorKind.Closed, e))
+    }
+    mut frame = ResponseFramer.new(request_is_head(request), config.header_bytes, config.encoded_body_bytes, config.decoded_body_bytes)
+    while !frame.complete() {
+        match stream.read_bytes(4096) {
+            Ok(bytes) => {
+                if bytes.len() == 0 { frame.finish_eof()? } else { frame.feed(bytes)? }
+            }
+            Err(e) => return Err(HttpError.from_net(ErrorKind.Closed, e))
+        }
+    }
+    Ok(frame.bytes())
+}
+
+fn https_send_over_net(host str, port int, request []u8, config HttpConfig) Net -> Result[[]u8, HttpError] {
+    ro base = match config.tls { Some(c) => c, None => ClientConfig.new(host) }
+    // Bind verification/SNI to the actual destination, not the previous hop.
+    ro cfg = ClientConfig {
+        server_name: host, alpn_protocols: ["http/1.1"], verification: base.verification,
+        client_cert_pem: base.client_cert_pem, client_key_pem: base.client_key_pem
+    }
+    consume stream = match tls_connect_bounded(host, port, cfg, config) {
+        Ok(consume s) => s
+        Err(e) => return Err(e)
+    }
+    ro result = https_exchange(stream, request, config)
+    stream.close()
+    result
+}
+
+fn https_exchange(mut stream TlsStream, request []u8, config HttpConfig) Net -> Result[[]u8, HttpError] {
+    match stream.write_all(request) {
+        Ok(_) => ()
         Err(e) => return Err(HttpError.from_tls(ErrorKind.Tls, e))
     }
-    // Единственный consume tls — `close` в конце на ВСЕХ путях; ошибки write/read
-    // сворачиваются в сентинел (D131: без early-return после consume).
-    mut acc = WriteBuffer.new()
-    acc.cap(4096)
-    // NB: `err_detail` stays STRING-typed (not `Option[TlsError]`) — see
-    // [M-178-write-all-ufcs-overload] below. `HttpError.from_tls` (typed
-    // `source: Tls(TlsError)`) is used at the handshake site above (a static
-    // `TlsStream.connect` call, unambiguous); this site keeps the untyped
-    // `HttpError.transport` fallback.
-    mut err_detail Option[str] = None
-    match tls.write_all(request.bytes()) {
-        Ok(_)  => {
-            mut reading = true
-            while reading {
-                match tls.read_bytes(65536) {
-                    Ok(chunk) => {
-                        if chunk.len() == 0 { reading = false } else { acc.write_bytes(chunk) }
-                    }
-                    Err(_) => { reading = false }
-                }
+    mut frame = ResponseFramer.new(request_is_head(request), config.header_bytes, config.encoded_body_bytes, config.decoded_body_bytes)
+    while !frame.complete() {
+        match stream.read_bytes(4096) {
+            Ok(bytes) => {
+                if bytes.len() == 0 { frame.finish_eof()? } else { frame.feed(bytes)? }
             }
-        }
-        // [M-178-write-all-ufcs-overload] (found while landing this wave,
-        // OUT OF SCOPE here — separate root cause from M-178's bare-variant-
-        // ctor mono-cache): `tls.write_all(...)` DISPATCHES to the generic
-        // `write_all[W: Write](w, data) -> Result[(), IoError]` (std/io/
-        // core.nv, reachable via TlsStream's structural `io.Write`
-        // conformance) instead of TlsStream's OWN native
-        // `@write_all -> Result[(), TlsError]` (std/tls/stream.nv) — the
-        // bound `e`'s emitted C representation is `NovaValue_IoError`, not
-        // `Nova_TlsError*`, even under an explicit `ro te TlsError = e`
-        // annotation (CC-FAIL "incompatible type", confirmed live in this
-        // worktree). Pre-existing: the ORIGINAL code already called
-        // `e.to_str()` on this same mis-dispatched value (silently wrong
-        // error text — `IoError.to_str()`, not `TlsError.to_str()` — masked
-        // because both return `str`). `e.to_str()` kept here UNCHANGED
-        // (byte-identical to before this wave) rather than papered over.
-        Err(e) => { err_detail = Some(e.to_str()) }
-    }
-    tls.close()
-    match err_detail {
-        Some(d) => Err(HttpError.transport(ErrorKind.Tls, d))
-        None    => {
-            ro acc_bytes []u8 = acc.into_bytes()
-            Ok(unsafe { acc_bytes.to_str_unchecked() })
+            Err(e) => return Err(HttpError.from_tls(ErrorKind.Tls, e))
         }
     }
-}
-
-// One plaintext HTTP/1.1 round-trip over Net: resolve → connect → write → read.
-fn http_send_over_net(host str, port int, request str) Net -> Result[str, HttpError] {
-    ro addrs = match resolve(host, port) {
-        Ok(a)  => a
-        Err(e) => return Err(HttpError.from_net(ErrorKind.Dns, e))
-    }
-    ro addr = match addrs.get(0) {
-        Some(a) => a
-        None    => return Err(HttpError.transport(ErrorKind.Dns, "no addresses resolved"))
-    }
-    consume stream = match TcpStream.connect(addr) {
-        Ok(consume s)  => s
-        Err(e) => return Err(HttpError.from_net(ErrorKind.Connect, e))
-    }
-    match stream.write_all(request.bytes()) {
-        Ok(_)  => ()
-        Err(e) => {
-            stream.close()
-            return Err(HttpError.from_net(ErrorKind.Connect, e))
-        }
-    }
-    // Read to EOF (Connection: close). A mid-stream error stops the read; the wire
-    // parser (client.nv) then validates framing (short body → Protocol). `Ok(0)`
-    // (clean EOF, D407 byte surface) and a hard read error both end the loop.
-    mut acc = WriteBuffer.new()
-    acc.cap(4096)
-    mut reading = true
-    while reading {
-        match stream.read_bytes(65536) {
-            Ok(chunk) => {
-                if chunk.len() == 0 { reading = false } else { acc.write_bytes(chunk) }
-            }
-            Err(_) => { reading = false }
-        }
-    }
-    stream.close()
-    // [M-174.1-vec-method-chain-elem-erasure]: explicit `[]u8` local.
-    ro acc_bytes []u8 = acc.into_bytes()
-    Ok(unsafe { acc_bytes.to_str_unchecked() })
+    Ok(frame.bytes())
 }

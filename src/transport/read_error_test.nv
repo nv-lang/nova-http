@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+module http.transport
+
+import std.net.{mock_net, TcpStream, SocketAddr, NetError}
+import http.{HttpConfig, HttpError, ErrorKind}
+
+// An injected typed failure AFTER a close-delimited partial body must never
+// become successful EOF. The old read-to-EOF loop swallowed precisely this.
+test "native exchange: read failure retained not EOF success" {
+    with Net = mock_net() {
+        consume stream = TcpStream.connect(SocketAddr.loopback(80))!!
+        mut calls = AtomicInt.new(0)
+        mut result Result[[]u8, HttpError] = Err(HttpError.new(ErrorKind.Closed))
+        with Net = effect Net {
+            write(_stream, data) -> Result[int, NetError] { Ok(data.len()) }
+            read(_stream TcpStream, mut buf []u8) -> Result[int, NetError] {
+                if calls.fetch_add(1) == 0 {
+                    ro first = "HTTP/1.1 200 OK\r\n\r\npartial".bytes()
+                    mut i = 0
+                    while i < first.len() { buf[i] = first[i]; i += 1 }
+                    Ok(first.len())
+                } else { Err(NetError.ConnectionReset) }
+            }
+        } {
+            result = http_exchange(stream, "GET / HTTP/1.1\r\n\r\n".bytes(), HttpConfig.new())
+        }
+        stream.close()
+        assert(match result {
+            Ok(_) => false
+            Err(e) => match e.source { Some(Net(ne)) => match ne { ConnectionReset => true, _ => false }, _ => false }
+        })
+    }
+}

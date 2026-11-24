@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+module http.client
+
+import http.{HeaderMap, HttpError}
+
+/// Incremental HTTP/1 response framing. Limits are checked BEFORE storing each
+/// octet. Encoded body includes chunk metadata/trailers; header budget includes
+/// all informational heads and trailers. No UTF-8 conversion of payload bytes.
+export type ResponseFramer {
+    priv raw []u8
+    priv line []u8
+    priv state int
+    priv left int
+    priv head_count int
+    priv encoded_count int
+    priv decoded_count int
+    priv header_cap int
+    priv encoded_cap int
+    priv decoded_cap int
+    priv head_request bool
+}
+
+export fn ResponseFramer.new(head_request bool, header_bytes int, encoded_body_bytes int, decoded_body_bytes int) -> ResponseFramer => {
+    raw: []u8.new(), line: []u8.new(), state: 0, left: 0,
+    head_count: 0, encoded_count: 0, decoded_count: 0,
+    header_cap: header_bytes, encoded_cap: encoded_body_bytes,
+    decoded_cap: decoded_body_bytes, head_request
+}
+
+export fn ResponseFramer @complete() -> bool => @state == 8
+
+/// Consume only through the final response boundary; later bytes belong to a
+/// different message, not this body. Caller closes the single-hop connection.
+export fn ResponseFramer mut @feed(bytes []u8) -> Result[(), HttpError] {
+    if @header_cap < 0 || @encoded_cap < 0 || @decoded_cap < 0 {
+        return Err(HttpError.protocol_error("negative response framing limit"))
+    }
+    for byte in bytes {
+        if @complete() { return Ok(()) }
+        if @state == 0 || @state == 7 {
+            if @head_count >= @header_cap { return Err(HttpError.protocol_error("response headers exceed limit")) }
+            @head_count += 1
+        }
+        if @state != 0 {
+            if @encoded_count >= @encoded_cap { return Err(HttpError.body_too_large()) }
+            @encoded_count += 1
+        }
+        if @state == 1 || @state == 2 || @state == 4 {
+            if @decoded_count >= @decoded_cap { return Err(HttpError.body_too_large()) }
+            @decoded_count += 1
+        }
+        @raw.push(byte)
+        if @state == 0 {
+            ro n = @raw.len()
+            if n >= 4 && @raw[n - 4] == 13 as u8 && @raw[n - 3] == 10 as u8 &&
+                         @raw[n - 2] == 13 as u8 && @raw[n - 1] == 10 as u8 {
+                ro (_, status, hm, _) = parse_response_head(@raw)?
+                ro len = hm.content_length()?
+                ro te = hm.transfer_encoding()
+                validate_transfer_encoding(hm)?
+                // Compressed representation is governed by encoded_cap here;
+                // decompression enforces decoded_cap incrementally in the codec.
+                ro encoding = match hm.get("content-encoding") {
+                    Some(v) => match v.to_str() { Ok(s) => s.to_ascii_lower(), Err(_) => "" }
+                    None => ""
+                }
+                ro code = status.code()
+                if code >= 200 && (encoding == "gzip" || encoding == "x-gzip" || encoding == "deflate" || encoding == "br") {
+                    @decoded_cap = @encoded_cap
+                }
+                if code == 101 { return Err(HttpError.protocol_error("HTTP upgrade unsupported")) }
+                if code < 200 {
+                    if hm.contains("transfer-encoding") || hm.contains("content-length") {
+                        return Err(HttpError.protocol_error("informational response has body framing"))
+                    }
+                    @raw = []u8.new()
+                } else if @head_request || code == 204 || code == 304 {
+                    if code == 204 && (hm.contains("transfer-encoding") || hm.contains("content-length")) {
+                        return Err(HttpError.protocol_error("204 has body framing"))
+                    }
+                    @state = 8
+                } else if te.len() > 0 {
+                    @state = 3
+                } else {
+                    match len {
+                        Some(nbytes) => {
+                            if nbytes > @encoded_cap || nbytes > @decoded_cap { return Err(HttpError.body_too_large()) }
+                            @left = nbytes
+                            @state = if nbytes == 0 { 8 } else { 1 }
+                        }
+                        None => { @state = 2 }
+                    }
+                }
+            }
+        } else if @state == 1 {
+            @left -= 1
+            if @left == 0 { @state = 8 }
+        } else if @state == 3 || @state == 7 {
+            @line.push(byte)
+            ro n = @line.len()
+            if n >= 2 && @line[n - 2] == 13 as u8 && @line[n - 1] == 10 as u8 {
+                if @state == 3 {
+                    ro size = match parse_chunk_size(@line[0..n - 2]) {
+                        Some(s) => s
+                        None => return Err(HttpError.protocol_error("chunk: invalid size"))
+                    }
+                    if size > @encoded_cap - @encoded_count || size > @decoded_cap - @decoded_count {
+                        return Err(HttpError.body_too_large())
+                    }
+                    @left = size
+                    @state = if size == 0 { 7 } else { 4 }
+                } else {
+                    if n == 2 { @state = 8 } else {
+                        validate_trailer(@line[0..n - 2])?
+                    }
+                }
+                @line = []u8.new()
+            }
+        } else if @state == 4 {
+            @left -= 1
+            if @left == 0 { @state = 5 }
+        } else if @state == 5 {
+            if byte != 13 as u8 { return Err(HttpError.protocol_error("chunk: missing data CRLF")) }
+            @state = 6
+        } else if @state == 6 {
+            if byte != 10 as u8 { return Err(HttpError.protocol_error("chunk: missing data CRLF")) }
+            @state = 3
+        }
+    }
+    Ok(())
+}
+
+export fn ResponseFramer mut @finish_eof() -> Result[(), HttpError] {
+    if @state == 2 { @state = 8 }
+    if !@complete() { return Err(HttpError.protocol_error("response: premature EOF")) }
+    Ok(())
+}
+
+export fn ResponseFramer @bytes() -> []u8 => @raw
+
+fn validate_transfer_encoding(hm HeaderMap) -> Result[(), HttpError] {
+    if hm.contains("transfer-encoding") {
+        ro values = hm.get_all("transfer-encoding")
+        if values.len() != 1 { return Err(HttpError.protocol_error("multiple Transfer-Encoding fields")) }
+        ro te = values[0].to_str()?
+        if te.trim_ascii().to_ascii_lower() != "chunked" {
+            return Err(HttpError.protocol_error("unsupported or invalid Transfer-Encoding"))
+        }
+    }
+    Ok(())
+}
+
+fn validate_trailer(line []u8) -> Result[(), HttpError] {
+    mut h = HeaderMap.new()
+    parse_header_line(h, line)?
+    if h.contains("content-length") || h.contains("transfer-encoding") || h.contains("host") ||
+       h.contains("authorization") || h.contains("cookie") || h.contains("content-encoding") ||
+       h.contains("connection") || h.contains("trailer") {
+        return Err(HttpError.protocol_error("forbidden framing/routing trailer"))
+    }
+    Ok(())
+}

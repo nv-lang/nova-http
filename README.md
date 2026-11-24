@@ -52,6 +52,38 @@ fn main() {
 }
 ```
 
+### Configuration — `HttpConfig`
+
+One policy object shared by the client codec and the native transport
+(`src/effect.nv`):
+
+- **byte limits** (enforced DURING receive/framing, per octet):
+  `header_bytes`, `encoded_body_bytes`, `decoded_body_bytes`;
+- **timeouts** (production-rework п.2): `connect_timeout` bounds
+  DNS/connect/TLS-handshake; `total_timeout` bounds the whole exchange —
+  BOTH must be `1..2147483647` ms, values outside the range are a definite
+  build error (`HttpConfig.check_timeouts`), never a silent "infinite" wait;
+- `deadline` — optional earlier absolute deadline (`Option[Monotonic]`);
+  `total_timeout` is resolved ONCE for the whole redirect chain, never
+  renewed by hops;
+- `cancel` — `CancelToken`; late callbacks never revive a cancelled
+  operation;
+- `tls` — optional `tls.ClientConfig` (custom roots, client certs).
+
+Builder surface: `HttpClientBuilder.config(HttpConfig)` installs the whole
+policy; `redirect(Limited(0..20))` caps hops (>20 is a build error);
+`allowed_origins(["scheme://host[:port]", ...])` restricts every request
+target AND every redirect hop to the listed origins (canonicalized to
+(lowercase scheme, canonical host, effective port); an unparseable entry
+fails at build time; an empty list allows all). Host, Content-Length and
+Transfer-Encoding are TRANSPORT-OWNED — a manual override is rejected
+before any socket is opened.
+
+Note: `send()` / `get()` / `head()` / `post()` / `put()` / `patch()` /
+`delete()` carry the `Time` effect (deadline bookkeeping) in addition to
+`Http` — install a `Time` handler (or run under a test/scope that
+provides one) when calling them from strict-effect-checked code.
+
 ## Layout
 
 ```
@@ -140,8 +172,9 @@ export NOVA_CG_INCLUDE=/path/to/nova/compiler-codegen
 export NOVA_RT_DIR=/path/to/nova/compiler-codegen/nova_rt
 
 # Use `nova test`, not `nova build <single-file>`, for anything beyond a
-# syntax/import smoke check — this package has no `main`.
-nova test src
+# syntax/import smoke check — this package has no `main`. `--full` also runs
+# the src/neg EXPECT_COMPILE_ERROR lane (otherwise it SKIPs).
+nova test src --full
 ```
 
 ## Gate
@@ -165,7 +198,9 @@ Two mandatory steps, in order:
    built with the flag (precedent: the background/log default-sink
    `E_UNDECLARED_TRANSITIVE_EFFECT` found by the flagship build, commit
    4019173).
-2. **`nova test src`** — the full test suite over the C-codegen pipeline.
+2. **`nova test src --full`** — the full test suite over the C-codegen
+   pipeline, including the `src/neg/*` EXPECT_COMPILE_ERROR lane (`--full`
+   is required — without it the neg lane SKIPs and only dirty CUs rerun).
 
 ## Testing the client without sockets
 
@@ -181,7 +216,7 @@ and malformed-response fixtures exercise the identical parser.
 ```nova
 test "client: GET round-trip via mock" {
     ro m = mock_http().on("GET", "/hello", MockResponse.new(200).text("world"))
-    with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
+    with Http = effect Http { send(host, port, secure, request, config) -> Result[[]u8, HttpError] { m.reply(request) } } {
         ro resp = HttpClient.new().get("http://api.example.com/hello").send()!!
         assert(resp.status().code() == 200)
         assert(resp.into_text()!! == "world")

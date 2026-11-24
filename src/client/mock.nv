@@ -76,9 +76,9 @@ export fn MockResponse mut @text(s str) -> @ {
 fn MockResponse @echo_target() -> Option[str] => @echo
 
 // Serialize this MockResponse to raw wire bytes.
-fn MockResponse @to_wire() -> str {
+fn MockResponse @to_wire() -> []u8 {
     match @raw {
-        Some(w) => w
+        Some(w) => w.bytes().clone()
         None    => {
             ro sc = match StatusCode.new(@status) {
                 Ok(c)  => c
@@ -117,7 +117,7 @@ export fn MockHttp @on(method str, path str, resp MockResponse) -> MockHttp {
 export fn MockHttp @build() -> Effect[Http] {
     ro routes = @routes
     effect Http {
-        send(host, port, secure, request) -> Result[str, HttpError] {
+        send(host, port, secure, request, config) -> Result[[]u8, HttpError] {
             mock_dispatch(routes, request)
         }
     }
@@ -129,11 +129,11 @@ export fn MockHttp @build() -> Effect[Http] {
 /// (the `.build()` closure copies routes into a heap env that the current runtime
 /// does not root; see [M-178-mock-handler-gc-trace]).
 #stable(since = "0.1")
-export fn MockHttp @reply(request str) -> Result[str, HttpError] =>
+export fn MockHttp @reply(request []u8) -> Result[[]u8, HttpError] =>
     mock_dispatch(@routes, request)
 
 // Route `request` (raw serialized bytes) to a programmed response.
-fn mock_dispatch(routes []MockRoute, request str) -> Result[str, HttpError] {
+fn mock_dispatch(routes []MockRoute, request []u8) -> Result[[]u8, HttpError] {
     ro (method, path) = match parse_request_line(request) {
         Some(mp) => mp
         None     => return Err(HttpError.protocol_error("mock: malformed request line"))

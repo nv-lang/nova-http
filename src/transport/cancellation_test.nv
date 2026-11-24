@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+module http.transport
+import std.net.{real_net}
+
+test "native: absolute total deadline interrupts stalled read" {
+    with Net = real_net() { assert(stalled_read(false)) }
+}
+
+test "native: CancelToken interrupts stalled read" {
+    with Net = real_net() { assert(stalled_read(true)) }
+}

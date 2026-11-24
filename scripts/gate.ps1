@@ -62,14 +62,18 @@ try {
     Write-Host ("gate: strict check clean (expected neg/* FAILs: {0})" -f $failLines.Count) -ForegroundColor Green
 
     # ── step 2: full test suite ─────────────────────────────────────────────
-    Write-Host "gate step 2/2: nova test src" -ForegroundColor Cyan
+    # `--full` is MANDATORY here: without it the neg/* EXPECT_COMPILE_ERROR
+    # lane always SKIPs ("requires --full") and only dirty CUs rerun, so the
+    # gate would silently under-cover (production-rework приёмка замечание 6:
+    # `PASS: 4 FAIL: 0 SKIP: 3` was the old normal — it must be a real run).
+    Write-Host "gate step 2/2: nova test src --full" -ForegroundColor Cyan
     if ($TestTimeout -gt 0) {
-        & $nova test src --timeout $TestTimeout
+        & $nova test src --full --timeout $TestTimeout
     } else {
-        & $nova test src
+        & $nova test src --full
     }
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "gate: nova test src failed" -ForegroundColor Red
+        Write-Host "gate: nova test src --full failed" -ForegroundColor Red
         exit 1
     }
     Write-Host "gate: GREEN (strict check + full tests)" -ForegroundColor Green

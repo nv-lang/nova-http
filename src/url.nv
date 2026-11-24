@@ -368,12 +368,13 @@ fn is_dotted_quad(s str) -> bool {
 // ──────────────────────────────────────────────────────────────────────────
 
 /// Origin-тройка `(scheme, host, port)` — для cross-origin auth-strip и pool-key
-/// (Ф.2). Порт по умолчанию — из scheme (http=80, https=443, ws=80, wss=443).
+/// (Ф.2). Каноничная форма: scheme и host в lowercase, порт — эффективный
+/// (заданный или дефолт scheme: http=80, https=443, ws=80, wss=443).
 #stable(since = "0.1")
 export fn Url @origin() -> (str, str, int) {
-    ro host = match @host { Some(h) => h, None => "" }
+    ro host = match @host { Some(h) => h.to_ascii_lower(), None => "" }
     ro port = match @port { Some(p) => p, None => default_port(@scheme) }
-    (@scheme, host, port)
+    (@scheme.to_ascii_lower(), host, port)
 }
 
 fn default_port(scheme str) -> int {

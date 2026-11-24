@@ -1,0 +1,172 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Public-API acceptance: identical fixture also run against exact 5505f31.
+module http.client
+import http.{Http}
+
+fn acceptance_reject(wire str) -> bool {
+    ro m = mock_http().on("GET", "/", MockResponse.raw(wire))
+    mut rejected = false
+    with Http = m.build() {
+        match HttpClient.new().get("http://example.com/").send() {
+            Ok(consume r) => { r.drain()!!; rejected = false }
+            Err(_) => { rejected = true }
+        }
+    }
+    rejected
+}
+
+test "acceptance: CL plus TE rejected through public client" {
+    assert(acceptance_reject("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"))
+}
+
+test "acceptance: incomplete last chunk rejected through public client" {
+    assert(acceptance_reject("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n"))
+}
+
+test "acceptance: malformed trailer rejected through public client" {
+    assert(acceptance_reject("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nNot-A-Header\r\n\r\n"))
+}
+
+test "acceptance: chunk extensions require valid grammar" {
+    assert(acceptance_reject("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1 garbage\r\na\r\n0\r\n\r\n"))
+}
+
+test "acceptance: HEAD metadata is not body or gzip payload" {
+    ro m = mock_http().on("HEAD", "/", MockResponse.raw("HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nContent-Encoding: gzip\r\n\r\n"))
+    mut passed = false
+    with Http = m.build() {
+        match HttpClient.new().head("http://example.com/").send() {
+            Ok(consume r) => { passed = r.into_bytes()!!.len() == 0 }
+            Err(_) => { passed = false }
+        }
+    }
+    assert(passed)
+}
+
+test "acceptance: informational responses precede final 500" {
+    ro m = mock_http().on("GET", "/", MockResponse.raw("HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 500 Error\r\nContent-Length: 1\r\n\r\nx"))
+    mut passed = false
+    with Http = m.build() {
+        match HttpClient.new().get("http://example.com/").send() {
+            Ok(consume r) => { passed = r.status().code() == 500; r.drain()!! }
+            Err(_) => { passed = false }
+        }
+    }
+    assert(passed)
+}
+
+test "acceptance: redirect cannot downgrade HTTPS" {
+    ro m = mock_http().on("GET", "/start", MockResponse.new(302).header("Location", "http://other.example/end"))
+        .on("GET", "/end", MockResponse.new(200).text("downgraded"))
+    mut rejected = false
+    with Http = m.build() {
+        match HttpClient.new().get("https://example.com/start").send() {
+            Ok(consume r) => { r.drain()!!; rejected = false }
+            Err(_) => { rejected = true }
+        }
+    }
+    assert(rejected)
+}
+
+// ── production-rework negatives (pre-socket: rejection without any I/O) ──────
+
+test "acceptance: manual Host override rejected before socket" {
+    ro m = mock_http().on("GET", "/", MockResponse.new(200).text("must not be reached"))
+    mut rejected = false
+    with Http = m.build() {
+        rejected = match HttpClient.new().get("http://example.com/").header("Host", "attacker").send() {
+            Err(e) => match e.kind { Protocol(_) => true, _ => false }
+            Ok(consume r) => { r.drain()!!; false }
+        }
+    }
+    assert(rejected)
+}
+
+test "acceptance: manual Content-Length and Transfer-Encoding rejected before socket" {
+    ro m = mock_http().on("POST", "/", MockResponse.new(200).text("must not be reached"))
+    mut rejected = false
+    with Http = m.build() {
+        match HttpClient.new().post("http://example.com/").header("Content-Length", "3").text("abc").send() {
+            Err(e) => { rejected = match e.kind { Protocol(_) => true, _ => false } }
+            Ok(consume r) => { r.drain()!!; rejected = false }
+        }
+        if rejected {
+            match HttpClient.new().post("http://example.com/").header("Transfer-Encoding", "chunked").text("abc").send() {
+                Err(e) => { rejected = match e.kind { Protocol(_) => true, _ => false } }
+                Ok(consume r) => { r.drain()!!; rejected = false }
+            }
+        }
+    }
+    assert(rejected)
+}
+
+test "acceptance: connect/total timeout ms must be 1..2147483647" {
+    mut zero = HttpClient.builder()
+    mut cz = HttpConfig.new()
+    cz.connect_timeout = 0.to_millis()
+    zero.config(cz)
+    assert(match zero.into_client() { Err(_) => true, Ok(_) => false })
+    mut huge = HttpClient.builder()
+    mut ch = HttpConfig.new()
+    ch.total_timeout = 2147483648.to_millis()
+    huge.config(ch)
+    assert(match huge.into_client() { Err(_) => true, Ok(_) => false })
+}
+
+test "acceptance: redirect max_hops above 20 rejected at build time" {
+    mut b = HttpClient.builder()
+    b.redirect(Limited(21))
+    assert(match b.into_client() { Err(_) => true, Ok(_) => false })
+    mut ok = HttpClient.builder()
+    ok.redirect(Limited(20))
+    assert(match ok.into_client() { Ok(_) => true, Err(_) => false })
+}
+
+test "acceptance: unparseable redirect Location is a definite protocol error" {
+    ro m = mock_http().on("GET", "/start", MockResponse.new(302).header("Location", "http://[::zz/bad"))
+    mut rejected = false
+    with Http = m.build() {
+        match HttpClient.new().get("http://example.com/start").send() {
+            Err(e) => { rejected = match e.kind { Protocol(_) => true, _ => false } }
+            Ok(consume r) => { r.drain()!!; rejected = false }
+        }
+    }
+    assert(rejected)
+}
+
+test "acceptance: origin allow-list gates initial URL and redirect hops before I/O" {
+    ro m = mock_http().on("GET", "/start", MockResponse.new(302).header("Location", "http://other.example/end"))
+        .on("GET", "/end", MockResponse.new(200).text("reached"))
+    mut initial_blocked = false
+    mut hop_blocked = false
+    mut allowed = false
+    with Http = m.build() {
+        // Initial URL outside the list: rejected WITHOUT the Http handler being
+        // reached (the mock would have served /start if it were called).
+        mut b = HttpClient.builder()
+        b.allowed_origins(["http://good.example/"])
+        ro client = b.into_client()!!
+        match client.get("http://example.com/start").send() {
+            Err(e) => { initial_blocked = match e.kind { Blocked(_) => true, _ => false } }
+            Ok(consume r) => { r.drain()!!; initial_blocked = false }
+        }
+        // Initial URL listed, redirect hop outside: the FIRST hop is served,
+        // the redirect target is rejected before its I/O.
+        mut b1 = HttpClient.builder()
+        b1.allowed_origins(["http://example.com/"])
+        ro client1 = b1.into_client()!!
+        match client1.get("http://example.com/start").send() {
+            Err(e) => { hop_blocked = match e.kind { Blocked(_) => true, _ => false } }
+            Ok(consume r) => { r.drain()!!; hop_blocked = false }
+        }
+        // Both origins listed: the chain completes.
+        mut b2 = HttpClient.builder()
+        b2.allowed_origins(["http://example.com/", "http://other.example/"])
+        ro client2 = b2.into_client()!!
+        match client2.get("http://example.com/start").send() {
+            Ok(consume r) => { allowed = r.into_text()!! == "reached" }
+            Err(_) => { allowed = false }
+        }
+    }
+    assert(initial_blocked && hop_blocked && allowed)
+}

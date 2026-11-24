@@ -52,6 +52,39 @@ fn main() {
 }
 ```
 
+### Конфигурация — `HttpConfig`
+
+Один объект политики для клиентского кодека и нативного транспорта
+(`src/effect.nv`):
+
+- **байтовые лимиты** (применяются ВО ВРЕМЯ приёма/framing, побайтово):
+  `header_bytes`, `encoded_body_bytes`, `decoded_body_bytes`;
+- **таймауты** (production-rework п.2): `connect_timeout` ограничивает
+  DNS/connect/TLS-handshake; `total_timeout` — весь обмен; ОБА должны быть
+  в диапазоне `1..2147483647` мс — значение вне диапазона это явная ошибка
+  сборки (`HttpConfig.check_timeouts`), а не молчаливое «бесконечное»
+  ожидание;
+- `deadline` — опциональный более ранний абсолютный дедлайн
+  (`Option[Monotonic]`); `total_timeout` вычисляется ОДИН раз на всю
+  цепочку редиректов и не продлевается hop'ами;
+- `cancel` — `CancelToken`; поздние callback'и не оживляют отменённое;
+- `tls` — опциональный `tls.ClientConfig` (свои корни, клиентские
+  сертификаты).
+
+Поверхность билдера: `HttpClientBuilder.config(HttpConfig)` ставит всю
+политику целиком; `redirect(Limited(0..20))` ограничивает число hop'ов
+(>20 — ошибка сборки); `allowed_origins(["scheme://host[:port]", ...])`
+разрешает и НАЧАЛЬНЫЙ URL запроса, и все hop'ы редиректов только в
+перечисленные origin (канонизируются к (lowercase scheme, canonical host,
+эффективный порт); нечитаемая запись — ошибка сборки; пустой список
+разрешает все). Host, Content-Length и Transfer-Encoding принадлежат
+ТРАНСПОРТУ — ручное переопределение отвергается до открытия сокета.
+
+Замечание: `send()` / `get()` / `head()` / `post()` / `put()` / `patch()` /
+`delete()` несут эффект `Time` (учёт дедлайнов) помимо `Http` — при вызове
+из кода под `--strict-effects` установите обработчик `Time` (или
+выполняйте в тесте/scope, который его даёт).
+
 ## Структура
 
 ```
@@ -141,9 +174,11 @@ export NOVA_STD_PATH=/path/to/nova/std
 export NOVA_CG_INCLUDE=/path/to/nova/compiler-codegen
 export NOVA_RT_DIR=/path/to/nova/compiler-codegen/nova_rt
 
-# Use `nova test`, not `nova build <single-file>`, for anything beyond a
-# syntax/import smoke check — this package has no `main`.
-nova test src
+# Используйте `nova test`, а не `nova build <single-file>`, для всего, что
+# выходит за рамки smoke-проверки синтаксиса/импортов — в этом пакете нет `main`.
+# `--full` также запускает neg-полосу src/neg (EXPECT_COMPILE_ERROR) — без него
+# она всегда SKIP.
+nova test src --full
 ```
 
 ## Гейт
@@ -167,7 +202,9 @@ powershell -File scripts/gate.ps1            # optionally: -TestTimeout 300
    единице компиляции потребителя, собранной с флагом (прецедент:
    `E_UNDECLARED_TRANSITIVE_EFFECT` дефолтного sink'а фонового
    лога, найденный флагманской сборкой, коммит 4019173).
-2. **`nova test src`** — полный набор тестов через пайплайн C-codegen.
+2. **`nova test src --full`** — полный набор тестов через пайплайн C-codegen,
+   включая neg-полосу `src/neg/*` (EXPECT_COMPILE_ERROR): `--full` обязателен —
+   без него neg-полоса всегда SKIP, а перезапускаются только «грязные» CU.
 
 ## Тестирование клиента без сокетов
 
@@ -184,7 +221,7 @@ Nova-логикой клиента (редиректы, срез авториз�
 ```nova
 test "client: GET round-trip via mock" {
     ro m = mock_http().on("GET", "/hello", MockResponse.new(200).text("world"))
-    with Http = effect Http { send(host, port, secure, request) -> Result[str, HttpError] { m.reply(request) } } {
+    with Http = effect Http { send(host, port, secure, request, config) -> Result[[]u8, HttpError] { m.reply(request) } } {
         ro resp = HttpClient.new().get("http://api.example.com/hello").send()!!
         assert(resp.status().code() == 200)
         assert(resp.into_text()!! == "world")

@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+module http.client
+
+import http.{Http, HttpError, HttpConfig, HeaderMap}
+
+test "request framing: mismatched CL and CL plus TE rejected before transport" {
+    ro client = HttpClient.new()
+    assert(match client.post("http://example.com/").header("Content-Length", "2").text("abc").build() { Err(_) => true, Ok(consume r) => { r.drain()!!; false } })
+    assert(match client.post("http://example.com/").header("Content-Length", "3").header("Transfer-Encoding", "chunked").text("abc").build() { Err(_) => true, Ok(consume r) => { r.drain()!!; false } })
+}
+
+test "request framing: chunked serializer encodes complete body and terminator" {
+    mut h = HeaderMap.new()
+    h.insert("Transfer-Encoding", "chunked")!!
+    ro wire = serialize_request("POST", "/", "example.com", h, "0123456789abcdef".bytes())!!
+    assert(wire.to_str()!!.ends_with("\r\n\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n"))
+    ro empty = serialize_request("POST", "/", "example.com", h, "".bytes())!!
+    assert(empty.to_str()!!.ends_with("\r\n\r\n0\r\n\r\n"))
+}
+
+fn framing_rejected(wire str) -> bool {
+    match parse_response(wire.bytes(), false, 65536, 65536, 65536) {
+        Ok(_) => false
+        Err(_) => true
+    }
+}
+
+test "framing: encoded byte cap and cap+1 checked before append" {
+    mut f = ResponseFramer.new(false, 1024, 3, 1024)
+    f.feed("HTTP/1.1 200 OK\r\n\r\nabc".bytes())!!
+    ro stored = f.bytes().len()
+    assert(match f.feed("d".bytes()) { Err(_) => true, Ok(_) => false })
+    assert(f.bytes().len() == stored)
+    mut exact = ResponseFramer.new(false, 1024, 3, 3)
+    exact.feed("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc".bytes())!!
+    assert(exact.complete())
+}
+
+test "framing: header cap and cap+1 including unterminated head" {
+    ro wire = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    mut f = ResponseFramer.new(false, wire.byte_len(), 0, 0)
+    f.feed(wire.bytes())!!
+    assert(f.complete())
+    mut short = ResponseFramer.new(false, wire.byte_len() - 1, 0, 0)
+    assert(match short.feed(wire.bytes()) { Err(_) => true, Ok(_) => false })
+    assert(short.bytes().len() == wire.byte_len() - 1)
+}
+
+test "framing: Content-Length conflicts TE conflicts and overflow rejected" {
+    assert(framing_rejected("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"))
+    assert(framing_rejected("HTTP/1.1 200 OK\r\nContent-Length: 1, 2\r\n\r\nab"))
+    assert(framing_rejected("HTTP/1.1 200 OK\r\nContent-Length: 9223372036854775808\r\n\r\n"))
+    assert(framing_rejected("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n"))
+    assert(framing_rejected("HTTP/1.1 200 OK\r\nTransfer-Encoding: ,chunked\r\n\r\n0\r\n\r\n"))
+    assert(framing_rejected("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked,\r\n\r\n0\r\n\r\n"))
+    ro p = parse_response("HTTP/1.1 200 OK\r\nContent-Length: 2, 2\r\nContent-Length: 2\r\n\r\nab".bytes(), false, 1024, 2, 2)!!
+    assert(p.body.to_str()!! == "ab")
+}
+
+test "framing: truncated CL and chunks and trailers are errors" {
+    assert(framing_rejected("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nab"))
+    assert(framing_rejected("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nab"))
+    assert(framing_rejected("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n"))
+    assert(framing_rejected("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nBadTrailer\r\n\r\n"))
+    assert(framing_rejected("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nContent-Length: 1\r\n\r\n"))
+    assert(framing_rejected("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFFF\r\n"))
+}
+
+test "framing: fragmented chunks trailers and keepalive complete without EOF" {
+    ro wire = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n2;foo=bar\r\nab\r\n1\r\nc\r\n0\r\nX-Trace: yes\r\n\r\n"
+    mut f = ResponseFramer.new(false, 1024, 1024, 3)
+    ro b = wire.bytes()
+    mut i = 0
+    while i < b.len() { f.feed(b[i..i + 1])!!; i += 1 }
+    assert(f.complete())
+    ro p = parse_response(f.bytes(), false, 1024, 1024, 3)!!
+    assert(p.body.to_str()!! == "abc")
+}
+
+test "framing: HEAD 204 304 and informational before final" {
+    ro head = parse_response("HTTP/1.1 200 OK\r\nContent-Length: 999999\r\n\r\n".bytes(), true, 1024, 0, 0)!!
+    assert(head.body.len() == 0)
+    ro no_content = parse_response("HTTP/1.1 204 No Content\r\n\r\n".bytes(), false, 1024, 0, 0)!!
+    assert(no_content.body.len() == 0)
+    ro not_modified = parse_response("HTTP/1.1 304 Not Modified\r\nContent-Length: 999999\r\n\r\n".bytes(), false, 1024, 0, 0)!!
+    assert(not_modified.body.len() == 0)
+    ro final = parse_response("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: x\r\n\r\nHTTP/1.1 500 Error\r\nContent-Length: 1\r\n\r\nx".bytes(), false, 1024, 1, 1)!!
+    assert(final.status.code() == 500)
+    assert(final.body.to_str()!! == "x")
+}
+
+test "framing: fragmented UTF8 and nonUTF8 payload stays bytes" {
+    mut raw = "HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n\r\n".bytes().clone()
+    raw.push(0xE2 as u8); raw.push(0x82 as u8); raw.push(0xAC as u8); raw.push(0xFF as u8)
+    mut f = ResponseFramer.new(false, 1024, 4, 4)
+    mut i = 0
+    while i < raw.len() { f.feed(raw[i..i + 1])!!; i += 1 }
+    assert(f.complete())
+    ro p = parse_response(f.bytes(), false, 1024, 4, 4)!!
+    assert(p.status.code() == 404)
+    assert(p.body.len() == 4 && p.body[3] == 0xFF as u8)
+    assert(match p.body.to_str() { Err(_) => true, Ok(_) => false })
+}
+
+test "redirect: HTTPS downgrade is blocked" {
+    ro m = mock_http().on("GET", "/", MockResponse.new(302).header("Location", "http://other.example/"))
+    with Http = effect Http { send(host, port, secure, request, config) -> Result[[]u8, HttpError] { m.reply(request) } } {
+        match HttpClient.new().get("https://example.com/").send() {
+            Ok(consume r) => { r.drain()!!; assert(false) }
+            Err(e) => assert(match e.kind { Blocked(_) => true, _ => false })
+        }
+    }
+}
+
+test "redirect: cross origin strips Authorization Cookie Proxy-Authorization and Host" {
+    ro m = mock_http().on("GET", "/start", MockResponse.new(302).header("Location", "http://other.example/end"))
+        .on("GET", "/end", MockResponse.echo_request_header("proxy-authorization"))
+    with Http = effect Http { send(host, port, secure, request, config) -> Result[[]u8, HttpError] { m.reply(request) } } {
+        ro r = HttpClient.new().get("http://example.com/start").header("Proxy-Authorization", "secret").send()!!
+        assert(r.into_text()!! == "")
+    }
+}

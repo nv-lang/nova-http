@@ -1,0 +1,123 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+module http.transport
+
+import std.net.{TcpListener, SocketAddr, real_net}
+import std.time.duration
+import http.{Http, HttpError, HttpConfig}
+import http.client.{HttpClient}
+
+// The server refuses to close until the client has returned. Waiting for EOF
+// therefore DEADLOCKS and fails the harness timeout rather than passing slowly.
+fn loopback_response(wire []u8, config HttpConfig) Net Io Time -> Result[[]u8, HttpError] {
+    transport_trace("HTTP framing start")
+    consume listener = TcpListener.bind(SocketAddr.loopback(0))!!
+    ro port = listener.local_port()
+    ro (done_tx, done_rx) = Channel[int].new(1)
+    mut result Result[[]u8, HttpError] = Err(HttpError.new(Closed))
+    supervised(timeout: 5.to_seconds()) {
+        spawn consume listener {
+            transport_trace("HTTP framing server accepting")
+            consume peer = listener.accept()!!
+            assert(peer.read_bytes(4096)!!.len() > 0)
+            transport_trace("HTTP framing request received; wire ready")
+            // Deliberately fragment every byte, including UTF8 code points.
+            mut i = 0
+            while i < wire.len() { peer.write_all(wire[i..i + 1])!!; i += 1 }
+            assert(done_rx.recv() == Some(1))
+            peer.close()
+            listener.close()
+            transport_trace("HTTP framing peer and listener closed")
+        }
+        with Http = real_http() {
+            mut b = HttpClient.builder()
+            b.config(config)
+            ro client = b.into_client()!!
+            result = match client.get("http://127.0.0.1:${port}/").send() {
+                Ok(consume r) => r.into_bytes()
+                Err(e) => Err(e)
+            }
+        }
+        transport_trace("HTTP framing client returned")
+        assert(done_tx.try_send(1))
+    }
+    transport_trace("HTTP framing resources joined")
+    result
+}
+
+test "native: CL keepalive completion returns before peer EOF fragmented binary" {
+    with Net = real_net() {
+        mut wire = "HTTP/1.1 500 Error\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n".bytes().clone()
+        wire.push(0xE2 as u8); wire.push(0x82 as u8); wire.push(0xAC as u8); wire.push(0xFF as u8)
+        ro body = loopback_response(wire, HttpConfig.new())!!
+        assert(body.len() == 4 && body[3] == 0xFF as u8)
+    }
+}
+
+test "native: chunked trailers completion returns before peer EOF" {
+    with Net = real_net() {
+        ro body = loopback_response("HTTP/1.1 404 Not Found\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-Trace: yes\r\n\r\n".bytes(), HttpConfig.new())!!
+        assert(body.to_str()!! == "abc")
+    }
+}
+
+test "native: raw byte limit enforced on network without EOF" {
+    with Net = real_net() {
+        mut config = HttpConfig.new()
+        config.encoded_body_bytes = 3
+        ro result = loopback_response("HTTP/1.1 200 OK\r\n\r\nabcd".bytes(), config)
+        assert(match result { Err(e) => match e.kind { BodyTooLarge => true, _ => false }, Ok(_) => false })
+    }
+}
+
+fn transport_trace(step str) Io Time -> () {
+    println("wire ${Timestamp.now().unix_millis()} ${step}")
+}
+
+fn stalled_read(cancel bool) Net Io Time -> bool {
+    transport_trace("read start cancel=${cancel}")
+    consume listener = TcpListener.bind(SocketAddr.loopback(0))!!
+    ro port = listener.local_port()
+    ro (done_tx, done_rx) = Channel[int].new(1)
+    ro tok = CancelToken.new()
+    mut failed = false
+    ro start = Timestamp.now().unix_millis()
+    supervised(timeout: 5.to_seconds()) {
+        spawn consume listener {
+            transport_trace("read server accepting")
+            consume peer = listener.accept()!!
+            transport_trace("read server accepted")
+            ro request = peer.read_bytes(4096)!!
+            assert(request.len() > 0)
+            transport_trace("read request received; stalled-read wire ready")
+            if cancel { 100.to_millis().sleep(); transport_trace("read token cancel"); tok.cancel() }
+            ro done = done_rx.recv()
+            assert(done == Some(1))
+            transport_trace("read server completion received")
+            peer.close()
+            listener.close()
+            transport_trace("read peer and listener closed")
+        }
+        mut config = HttpConfig.new()
+        config.cancel = tok
+        config.total_timeout = if cancel { 4.to_seconds() } else { 100.to_millis() }
+        with Http = real_http() {
+            mut b = HttpClient.builder()
+            b.config(config)
+            ro client = b.into_client()!!
+            transport_trace("read client send")
+            match client.get("http://127.0.0.1:${port}/").send() {
+                Ok(consume r) => { r.drain()!!; failed = false }
+                Err(e) => {
+                    failed = if cancel { match e.kind { Canceled => true, _ => false } } else { match e.kind { Timeout => true, _ => false } }
+                }
+            }
+        }
+        transport_trace("read client returned failed=${failed}")
+        assert(done_tx.try_send(1))
+    }
+    transport_trace("read resources joined")
+    ro elapsed = Timestamp.now().unix_millis() - start
+    println("read elapsed=${elapsed} failed=${failed}")
+    failed && elapsed < 2000
+}
+

@@ -1,0 +1,317 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+module http.transport
+
+import std.net.{TcpListener, SocketAddr, real_net}
+import std.time.duration
+import tls.{TlsStream, ClientConfig, ServerConfig, VerificationMode}
+import http.{HttpConfig, HttpError}
+import http.client.{HttpClient}
+import compress.{gzip_encode, CompressLevel}
+
+// Public, deliberately non-secret localhost fixtures copied from nova-tls tests.
+fn https_cert() -> []u8 => embed("localhost_cert.pem")
+fn https_key() -> []u8 => embed("localhost_key.pem")
+fn wrong_hostname_cert() -> []u8 => embed("wrong_hostname_cert.pem")
+
+// Both failures must reach the native handshake, retain its typed TLS source,
+// and join the server (including its failed-handshake cleanup).
+fn https_reject_certificate(wrong_host bool) Net Time -> bool {
+    consume listener = TcpListener.bind(SocketAddr.loopback(0))!!
+    ro port = listener.local_port()
+    ro cert = if wrong_host { wrong_hostname_cert() } else { https_cert() }
+    ro (wire_tx, wire_rx) = Channel[int].new(2)
+    mut rejected = false
+    supervised(timeout: 5.to_seconds()) {
+        spawn consume listener {
+            consume tcp = listener.accept()!!
+            listener.close()
+            assert(wire_tx.try_send(1))
+            match TlsStream.accept(tcp, ServerConfig.new(cert, https_key())) {
+                Ok(consume peer) => peer.close()
+                Err(_) => ()
+            }
+        }
+        mut config = HttpConfig.new()
+        config.total_timeout = 3.to_seconds()
+        // Trust the wrong-name leaf so only hostname validation can reject it.
+        if wrong_host { config.tls = Some(ClientConfig.new("localhost").verification(VerificationMode.CustomRoots(cert))) }
+        with Http = real_http() {
+            mut builder = HttpClient.builder()
+            builder.config(config)
+            ro client = builder.into_client()!!
+            match client.get("https://localhost:${port}/").send() {
+                Ok(consume r) => { r.drain()!! }
+                Err(e) => { rejected = match e.kind { Tls => match e.source { Some(Tls(_)) => true, _ => false }, _ => false } }
+            }
+        }
+    }
+    rejected && wire_rx.try_recv() == Some(1)
+}
+
+test "HTTPS native: untrusted certificate retains TLS source" {
+    with Net = real_net() { assert(https_reject_certificate(false)) }
+}
+
+test "HTTPS native: trusted certificate with wrong hostname rejected" {
+    with Net = real_net() { assert(https_reject_certificate(true)) }
+}
+
+fn https_probe(mode int, cancel bool) Net Io Time -> bool {
+    transport_trace("HTTPS start mode=${mode} cancel=${cancel}")
+    consume listener = TcpListener.bind(SocketAddr.loopback(0))!!
+    ro port = listener.local_port()
+    ro (done_tx, done_rx) = Channel[int].new(1)
+    ro tok = CancelToken.new()
+    mut result Result[[]u8, HttpError] = Err(HttpError.new(Closed))
+    mut body []u8 = []u8.new()
+    if mode == 2 { body.resize(16777216, 65 as u8) }
+    ro start = Timestamp.now().unix_millis()
+    supervised(timeout: 5.to_seconds()) {
+        spawn consume listener {
+            transport_trace("HTTPS server accepting")
+            consume tcp = listener.accept()!!
+            transport_trace("HTTPS TCP accepted")
+            listener.close()
+            consume peer = TlsStream.accept(tcp, ServerConfig.new(https_cert(), https_key()))!!
+            transport_trace("HTTPS handshake ready")
+            if mode != 2 {
+                assert(peer.read_bytes(4096)!!.len() > 0)
+                transport_trace("HTTPS request received; stalled-read wire ready")
+            } else { transport_trace("HTTPS stalled-write wire ready") }
+            if mode == 0 {
+                ro wire = "HTTP/1.1 500 Error\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n3\r\nabc\r\n0\r\nX-Trace: yes\r\n\r\n".bytes()
+                mut i = 0
+                while i < wire.len() { peer.write_all(wire[i..i + 1])!!; i += 1 }
+            } else if cancel {
+                100.to_millis().sleep()
+                transport_trace("HTTPS token cancel")
+                tok.cancel()
+            }
+            assert(done_rx.recv() == Some(1))
+            transport_trace("HTTPS server completion received")
+            peer.close()
+            transport_trace("HTTPS peer closed")
+        }
+        mut config = HttpConfig.new()
+        config.cancel = tok
+        config.total_timeout = if mode == 0 || cancel { 4.to_seconds() } else { 500.to_millis() }
+        config.tls = Some(ClientConfig.new("localhost").verification(VerificationMode.CustomRoots(https_cert())))
+        with Http = real_http() {
+            mut builder = HttpClient.builder()
+            builder.config(config)
+            ro client = builder.into_client()!!
+            ro host = if mode == 0 { "localhost" } else { "127.0.0.1" }
+            result = match client.post("https://${host}:${port}/").body(body).send() {
+                Ok(consume r) => { assert(r.status().code() == 500); r.into_bytes() }
+                Err(e) => Err(e)
+            }
+        }
+        transport_trace("HTTPS client returned")
+        assert(done_tx.try_send(1))
+    }
+    transport_trace("HTTPS resources joined")
+    if mode == 0 { return match result { Ok(b) => b.to_str()!! == "abc", Err(_) => false } }
+    ro failed = match result {
+        Ok(_) => false
+        Err(e) => if cancel { match e.kind { Canceled => true, _ => false } }
+                  else { match e.kind { Timeout => true, _ => false } }
+    }
+    failed && Timestamp.now().unix_millis() - start < 2000
+}
+
+test "HTTPS native: public ClientConfig custom roots chunked trailers keepalive 500" {
+    with Net = real_net() { assert(https_probe(0, false)) }
+}
+
+test "HTTPS native: absolute deadline interrupts stalled encrypted read" {
+    with Net = real_net() { assert(https_probe(1, false)) }
+}
+
+test "HTTPS native: cancellation interrupts stalled encrypted read" {
+    with Net = real_net() { assert(https_probe(1, true)) }
+}
+
+test "HTTPS native: absolute deadline interrupts stalled encrypted write" {
+    with Net = real_net() { assert(https_probe(2, false)) }
+}
+
+test "HTTPS native: cancellation interrupts stalled encrypted write" {
+    with Net = real_net() { assert(https_probe(2, true)) }
+}
+
+fn https_response(wire []u8, config HttpConfig) Net Io Time -> Result[[]u8, HttpError] {
+    consume listener = TcpListener.bind(SocketAddr.loopback(0))!!
+    ro port = listener.local_port()
+    ro (tx, rx) = Channel[int].new(1)
+    ro (wire_tx, wire_rx) = Channel[int].new(2)
+    mut result Result[[]u8, HttpError] = Err(HttpError.new(Closed))
+    supervised(timeout: 5.to_seconds()) {
+        spawn consume listener {
+            consume tcp = listener.accept()!!
+            listener.close()
+            consume peer = TlsStream.accept(tcp, ServerConfig.new(https_cert(), https_key()))!!
+            assert(peer.read_bytes(4096)!!.len() > 0)
+            assert(wire_tx.try_send(1))
+            peer.write_all(wire)!!
+            ro _done = rx.recv()
+            peer.close()
+        }
+        with Http = real_http() {
+            mut builder = HttpClient.builder()
+            builder.config(config)
+            ro client = builder.into_client()!!
+            result = match client.get("https://localhost:${port}/").send() {
+                Ok(consume r) => r.into_bytes()
+                Err(e) => Err(e)
+            }
+        }
+        ro _sent = tx.try_send(1)
+    }
+    match result { Err(e) => println("HTTPS boundary error: ${e}"), Ok(_) => () }
+    assert(wire_rx.try_recv() == Some(1))
+    result
+}
+
+fn trusted_http_config() -> HttpConfig {
+    mut config = HttpConfig.new()
+    config.tls = Some(ClientConfig.new("localhost").verification(VerificationMode.CustomRoots(https_cert())))
+    config
+}
+
+test "HTTPS native: exact encoded decoded and header boundaries" {
+    with Net = real_net() {
+        ro head = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n"
+        mut config = trusted_http_config()
+        config.header_bytes = head.byte_len()
+        config.encoded_body_bytes = 3
+        config.decoded_body_bytes = 3
+        assert(https_response("${head}abc".bytes(), config)!!.to_str()!! == "abc")
+        config.header_bytes -= 1
+        assert(match https_response("${head}abc".bytes(), config) { Err(e) => match e.kind { Protocol(_) => true, _ => false }, Ok(_) => false })
+        config.header_bytes += 1
+        config.encoded_body_bytes = 2
+        assert(match https_response("${head}abc".bytes(), config) { Err(e) => match e.kind { BodyTooLarge => true, _ => false }, Ok(_) => false })
+        config.encoded_body_bytes = 3
+        config.decoded_body_bytes = 2
+        assert(match https_response("${head}abc".bytes(), config) { Err(e) => match e.kind { BodyTooLarge => true, _ => false }, Ok(_) => false })
+    }
+}
+
+test "HTTPS native: informational binary body and malformed framing" {
+    with Net = real_net() {
+        mut wire = "HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 404 Missing\r\nContent-Length: 2\r\n\r\n".bytes().clone()
+        wire.push(0 as u8); wire.push(255 as u8)
+        ro bytes = https_response(wire, trusted_http_config())!!
+        assert(bytes.len() == 2 && bytes[0] == 0 as u8 && bytes[1] == 255 as u8)
+        assert(match https_response("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".bytes(), trusted_http_config()) { Err(e) => match e.kind { Protocol(_) => true, _ => false }, Ok(_) => false })
+    }
+}
+
+test "HTTPS native: compressed encoded and decoded caps are independent" {
+    with Net = real_net() {
+        ro compressed = gzip_encode("abc".bytes(), CompressLevel.default())!!
+        mut wire = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: ${compressed.len()}\r\n\r\n".bytes().clone()
+        for b in compressed { wire.push(b) }
+        mut config = trusted_http_config()
+        config.encoded_body_bytes = compressed.len()
+        config.decoded_body_bytes = 3
+        assert(https_response(wire, config)!!.to_str()!! == "abc")
+        config.decoded_body_bytes = 2
+        assert(match https_response(wire, config) { Err(e) => match e.kind { BodyTooLarge => true, _ => false }, Ok(_) => false })
+        config.decoded_body_bytes = 3
+        config.encoded_body_bytes -= 1
+        assert(match https_response(wire, config) { Err(e) => match e.kind { BodyTooLarge => true, _ => false }, Ok(_) => false })
+    }
+}
+
+fn native_redirect(secure bool, delay bool) Net Time -> bool {
+    consume first = TcpListener.bind(SocketAddr.loopback(0))!!
+    consume second = TcpListener.bind(SocketAddr.loopback(0))!!
+    ro p1 = first.local_port()
+    ro p2 = second.local_port()
+    ro scheme = if secure { "https" } else { "http" }
+    ro (wire_tx, wire_rx) = Channel[int].new(2)
+    mut good = false
+    supervised(timeout: 5.to_seconds()) {
+        spawn consume first {
+            consume tcp = first.accept()!!
+            first.close()
+            ro wire = "HTTP/1.1 302 Found\r\nLocation: ${scheme}://localhost:${p2}/end\r\nContent-Length: 0\r\n\r\n".bytes()
+            if secure {
+                consume peer = TlsStream.accept(tcp, ServerConfig.new(https_cert(), https_key()))!!
+                ro request = peer.read_bytes(4096)!!.to_str()!!
+                assert(request.contains("authorization: Bearer secret"))
+                assert(wire_tx.try_send(1))
+                if delay { 300.to_millis().sleep() }
+                ro sent = peer.write_all(wire)
+                if !delay { sent!! }
+                peer.close()
+            } else {
+                ro request = tcp.read_bytes(4096)!!.to_str()!!
+                assert(request.contains("authorization: Bearer secret"))
+                assert(wire_tx.try_send(1))
+                if delay { 300.to_millis().sleep() }
+                ro sent = tcp.write_all(wire)
+                if !delay { sent!! }
+                tcp.close()
+            }
+        }
+        spawn consume second {
+            consume tcp = second.accept()!!
+            second.close()
+            ro wire = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".bytes()
+            if secure {
+                consume peer = TlsStream.accept(tcp, ServerConfig.new(https_cert(), https_key()))!!
+                ro request = peer.read_bytes(4096)!!.to_str()!!
+                assert(!request.contains("authorization:") && !request.contains("cookie:") && !request.contains("host: attacker"))
+                assert(request.contains("Host: localhost:${p2}"))
+                assert(wire_tx.try_send(1))
+                if delay { 300.to_millis().sleep() }
+                ro sent = peer.write_all(wire)
+                if !delay { sent!! }
+                peer.close()
+            } else {
+                ro request = tcp.read_bytes(4096)!!.to_str()!!
+                assert(!request.contains("authorization:") && !request.contains("cookie:") && !request.contains("host: attacker"))
+                assert(request.contains("Host: localhost:${p2}"))
+                assert(wire_tx.try_send(1))
+                if delay { 300.to_millis().sleep() }
+                ro sent = tcp.write_all(wire)
+                if !delay { sent!! }
+                tcp.close()
+            }
+        }
+        with Http = real_http() {
+            mut builder = HttpClient.builder()
+            mut config = trusted_http_config()
+            if delay { config.total_timeout = 500.to_millis() }
+            builder.config(config)
+            ro client = builder.into_client()!!
+            // NOTE: a manual `.header("Host", "attacker")` probe is no longer
+            // possible — Host is transport-owned and a manual override is
+            // rejected pre-socket (production-rework п.3); the wire assertions
+            // below still verify the client never leaks a stale attacker Host.
+            match client.get("${scheme}://localhost:${p1}/start").bearer_auth("secret").header("Cookie", "secret").header("Proxy-Authorization", "secret").send() {
+                Ok(consume r) => { good = r.into_text()!! == "ok" && !delay }
+                Err(e) => { good = delay && match e.kind { Timeout => true, _ => false } }
+            }
+        }
+    }
+    good && wire_rx.try_recv() == Some(1) && wire_rx.try_recv() == Some(1)
+}
+
+test "HTTP native: cross origin redirect credential isolation on wire" {
+    with Net = real_net() { assert(native_redirect(false, false)) }
+}
+
+test "HTTPS native: cross origin redirect credential isolation on wire" {
+    with Net = real_net() { assert(native_redirect(true, false)) }
+}
+
+test "HTTP native: delayed redirects share one absolute deadline" {
+    with Net = real_net() { assert(native_redirect(false, true)) }
+}
+
+test "HTTPS native: delayed redirects share one absolute deadline" {
+    with Net = real_net() { assert(native_redirect(true, true)) }
+}
