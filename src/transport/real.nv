@@ -158,7 +158,8 @@ fn https_send_over_net(host str, port int, request []u8, config HttpConfig) Net 
     // Bind verification/SNI to the actual destination, not the previous hop.
     ro cfg = ClientConfig {
         server_name: host, alpn_protocols: ["http/1.1"], verification: base.verification,
-        client_cert_pem: base.client_cert_pem, client_key_pem: base.client_key_pem
+        client_cert_pem: base.client_cert_pem, client_key_pem: base.client_key_pem,
+        proxy: base.proxy, trust_digest: base.trust_digest
     }
     consume stream = match tls_connect_bounded(host, port, cfg, config) {
         Ok(consume s) => s

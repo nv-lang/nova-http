@@ -469,7 +469,8 @@ fn run_request(mut method Method, mut url Url, mut headers HeaderMap, mut body [
                         hop_config.tls = match hop_config.tls {
                             Some(c) => Some(ClientConfig {
                                 server_name: nh, alpn_protocols: ["http/1.1"], verification: c.verification,
-                                client_cert_pem: []u8.new(), client_key_pem: []u8.new()
+                                client_cert_pem: []u8.new(), client_key_pem: []u8.new(),
+                                proxy: c.proxy, trust_digest: c.trust_digest
                             })
                             None => None
                         }
