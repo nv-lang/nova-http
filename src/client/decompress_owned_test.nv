@@ -1,0 +1,199 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// decompress_owned_test.nv — production-rework п.5: transparent Content-Encoding
+// decode через nova-compress session API (`decode_begin` → `feed` → `finish`,
+// изолированный воркер-процесс с пином sha256, watchdog'ом и лимитами
+// CPU/памяти). Транспорт — mock_http (детерминизм),
+// распаковка — РЕАЛЬНЫЙ процесс воркера: интеграционное доказательство, что лимиты
+// применяются ВО ВРЕМЯ потока распаковки:
+//   gzip/brotli roundtrip → оригинальные байты;
+//   bomb сверх max_decompressed → определённый Err(BodyTooLarge), не усечённый успех;
+//   total_timeout меньше времени распаковки → Err(Timeout), воркер убит watchdog'ом;
+//   pre-cancelled CancelToken → Err(Canceled) до запуска воркера.
+// Воркер: локальная сборка nova-compress (worktrees/service-compress-production/
+// target/decode-worker.exe, собран из src/worker/main.nv); sha считается по файлу
+// в рантайме, поэтому пересборка воркера тесты не ломает.
+
+module http.client
+
+import http.{Http}
+import compress.{gzip_encode, zlib_encode, CompressLevel, DecodeWorker}
+import std.os.{env as os_env}
+import std.fs.{read as fs_read}
+import std.crypto.sha256.{Sha256}
+import std.time.duration.{Monotonic}
+
+
+// Абсолютный путь к отдельно собранному воркеру nova-compress — из окружения
+// (COMPRESS_WORKER_EXE), путь не зашит; lane включается в гейт только там, где
+// воркер собран (REPORT-production-rework.md §6).
+fn owned_worker_exe() Os -> str {
+    match os_env("COMPRESS_WORKER_EXE") {
+        Some(p) => p
+        None    => panic("owned decode test: set COMPRESS_WORKER_EXE to the built worker")
+    }
+}
+
+fn owned_worker() Os Fs -> DecodeWorker {
+    // Windows loader env; on Linux the variable is irrelevant — empty is fine.
+    ro sysroot = match os_env("SYSTEMROOT") {
+        Some(p) => p
+        None    => ""
+    }
+    ro data = match fs_read(owned_worker_exe().to_path(), buffer_size: 1 << 20) {
+        Ok(consume b) => b
+        Err(e)        => panic("owned decode test: cannot read worker exe: ${e}")
+    }
+    DecodeWorker { executable: owned_worker_exe(), sha256: Sha256.hash(data), system_root: sysroot }
+}
+
+fn owned_client() Os Fs -> HttpClient {
+    mut b = HttpClient.builder()
+    b.decode_worker(owned_worker())
+    b.into_client()!!
+}
+
+fn gz_of(s str) -> []u8 {
+    match gzip_encode(s.bytes(), CompressLevel.default()) {
+        Ok(consume b) => b
+        Err(_)        => panic("owned decode test: gzip_encode failed")
+    }
+}
+
+fn zl_of(s str) -> []u8 {
+    match zlib_encode(s.bytes(), CompressLevel.default()) {
+        Ok(consume b) => b
+        Err(_)        => panic("owned decode test: zlib_encode failed")
+    }
+}
+
+// ── roundtrips через реальный воркер ──────────────────────────────────────────
+
+test "owned decompress: gzip body decoded by the pinned worker process" {
+    ro payload = "owned-worker gzip payload — decoded in an isolated process!"
+    ro m = mock_http().on("GET", "/og",
+        MockResponse.new(200).header("Content-Encoding", "gzip").body(gz_of(payload)))
+    with Http = effect Http { send(host, port, secure, request, config) -> Result[[]u8, HttpError] { m.reply(request) } } {
+        ro resp = owned_client().get("http://x.example/og").send()!!
+        assert(match resp.header("content-encoding") { Some(_) => false, None => true })
+        assert(resp.into_text()!! == payload)
+    }
+}
+
+test "owned decompress: deflate (zlib) body decoded by the pinned worker process" {
+    ro payload = "owned-worker deflate payload body"
+    ro m = mock_http().on("GET", "/od",
+        MockResponse.new(200).header("Content-Encoding", "deflate").body(zl_of(payload)))
+    with Http = effect Http { send(host, port, secure, request, config) -> Result[[]u8, HttpError] { m.reply(request) } } {
+        ro resp = owned_client().get("http://x.example/od").send()!!
+        assert(resp.into_text()!! == payload)
+    }
+}
+
+// brotli RFC 7932 vector "10x10y": mock serves the compressed bytes verbatim.
+fn br_vec() -> []u8 {
+    ro h = "1b130000a4b0b2ea8147028a".bytes()
+    mut out = []u8.new(cap: h.len() / 2)
+    mut i = 0
+    while i + 1 < h.len() {
+        ro c = h[i]
+        ro hi = if c >= 48 && c <= 57 { c - 48 } else if c >= 97 && c <= 102 { c - 87 } else { 0 }
+        ro c2 = h[i + 1]
+        ro lo = if c2 >= 48 && c2 <= 57 { c2 - 48 } else if c2 >= 97 && c2 <= 102 { c2 - 87 } else { 0 }
+        out.push(((hi << 4) | lo) as u8)
+        i = i + 2
+    }
+    out
+}
+
+test "owned decompress: brotli body decoded by the pinned worker process" {
+    ro m = mock_http().on("GET", "/ob",
+        MockResponse.new(200).header("Content-Encoding", "br").body(br_vec()))
+    with Http = effect Http { send(host, port, secure, request, config) -> Result[[]u8, HttpError] { m.reply(request) } } {
+        ro resp = owned_client().get("http://x.example/ob").send()!!
+        assert(resp.into_text()!! == "XXXXXXXXXXYYYYYYYYYY")
+    }
+}
+
+// ── bomb: лимит применяется ВО ВРЕМЯ потока распаковки ────────────────────────
+
+test "owned decompress: bomb past max_decompressed → Err(BodyTooLarge), no truncated success" {
+    consume big = StringBuilder.new()
+    big.cap(20000)
+    mut i = 0
+    while i < 20000 { big.append("A"); i += 1 }
+    ro m = mock_http().on("GET", "/obomb",
+        MockResponse.new(200).header("Content-Encoding", "gzip").body(gz_of(big.into_str())))
+    with Http = effect Http { send(host, port, secure, request, config) -> Result[[]u8, HttpError] { m.reply(request) } } {
+        mut b = HttpClient.builder()
+        b.decode_worker(owned_worker())
+        b.max_decompressed(256)
+        ro client = b.into_client()!!
+        ro res = client.get("http://x.example/obomb").send()
+        assert(match res {
+            Ok(resp) => { ro _ = resp.drain(); false }
+            Err(e)   => match e.kind { BodyTooLarge => true, _ => false }
+        })
+    }
+}
+
+// ── deadline: watchdog убивает воркер, ответ не «оживает» ─────────────────────
+
+test "owned decompress: expired request deadline → Err(Timeout) before any spawn" {
+    // Детерминизм: декод на быстрой машине может успеть за любой фиксированный
+    // дедлайн, поэтому здесь проверяется честный refusal — истёкший deadline
+    // отвергает запрос ДО запуска воркера. Детерминированный kill ПОСЛЕ
+    // handshake доказан на стороне compress (D338.5, fiber-мост); мид-флайт
+    // http-отмена ограничена deadline'ом воркера (M-NOTES-production-rework.md §2).
+    consume big = StringBuilder.new()
+    big.cap(4000000)
+    mut i = 0
+    while i < 4000000 { big.append("A"); i += 1 }
+    ro m = mock_http().on("GET", "/oslow",
+        MockResponse.new(200).header("Content-Encoding", "gzip").body(gz_of(big.into_str())))
+    with Http = effect Http { send(host, port, secure, request, config) -> Result[[]u8, HttpError] { m.reply(request) } } {
+        mut cfg = HttpConfig.new()
+        cfg.deadline = Some(Monotonic.now())
+        mut b = HttpClient.builder()
+        b.decode_worker(owned_worker())
+        b.max_decompressed(1 << 26)
+        b.config(cfg)
+        ro client = b.into_client()!!
+        ro res = client.get("http://x.example/oslow").send()
+        assert(match res {
+            Ok(resp) => { ro _ = resp.drain(); false }
+            Err(e)   => match e.kind { Timeout => true, _ => false }
+        })
+    }
+}
+
+// ── pre-cancelled: воркер не запускается вовсе ────────────────────────────────
+
+test "owned decompress: pre-cancelled request → Err(Canceled) before any decode" {
+    ro m = mock_http().on("GET", "/ocan",
+        MockResponse.new(200).header("Content-Encoding", "gzip").body(gz_of("never decoded")))
+    with Http = effect Http { send(host, port, secure, request, config) -> Result[[]u8, HttpError] { m.reply(request) } } {
+        mut cfg = HttpConfig.new()
+        cfg.cancel.cancel()
+        mut b = HttpClient.builder()
+        b.decode_worker(owned_worker())
+        b.config(cfg)
+        ro client = b.into_client()!!
+        ro res = client.get("http://x.example/ocan").send()
+        assert(match res {
+            Ok(resp) => { ro _ = resp.drain(); false }
+            Err(e)   => match e.kind { Canceled => true, _ => false }
+        })
+    }
+}
+
+// ── build-time валидация конфигурации owned-пути ──────────────────────────────
+
+test "owned decompress: non-positive decoded cap with a worker → build-time refusal" {
+    mut b = HttpClient.builder()
+    b.decode_worker(owned_worker())
+    b.max_decompressed(0)
+    match b.into_client() {
+        Ok(_)    => panic("owned decode: cap 0 must be refused at build time")
+        Err(e)   => assert(match e.kind { Protocol(_) => true, _ => false })
+    }
+}

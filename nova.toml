@@ -46,4 +46,4 @@ src = "src"
 # extraction shape as `tls` above) — client/client.nv and error.nv import it.
 [dependencies]
 tls = { git = "https://github.com/nv-lang/nova-tls", version = "0.3" }
-compress = { git = "https://github.com/nv-lang/nova-compress", version = "0.1" }
+compress = { git = "https://github.com/nv-lang/nova-compress", version = "0.2" }

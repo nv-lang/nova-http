@@ -36,6 +36,8 @@ import http.{Method, Url, HeaderMap, Response, Request, Http, HttpError, ErrorKi
 import std.encoding.base64.{Base64}
 import std.encoding.json.{JsonValue, Json}
 import compress.{gzip_decode, zlib_decode, inflate, brotli_decode, CompressError}
+import compress.{DecodeWorker, DecodeLimits, DecodeDeadline, DecodeCancel, DecodeCodec, decode_begin, OwnedDecodeError}
+import std.os.{Proc}
 import tls.{ClientConfig}
 
 // ── RedirectPolicy ───────────────────────────────────────────────────────────
@@ -66,6 +68,12 @@ export type HttpClient value {
     priv user_agent       str
     priv auto_decompress  bool
     priv max_decompressed int
+    // Owned-decode worker pin (production-rework п.5), stored by components —
+    // the codegen cannot embed a foreign-package value record as a field.
+    priv has_decode_worker bool
+    priv worker_exe      str
+    priv worker_sha256   [32]u8
+    priv worker_sysroot  str
     priv config HttpConfig
 }
 
@@ -79,6 +87,12 @@ export type HttpClientBuilder value {
     priv user_agent       str
     priv auto_decompress  bool
     priv max_decompressed int
+    // Owned-decode worker pin (production-rework п.5), stored by components —
+    // the codegen cannot embed a foreign-package value record as a field.
+    priv has_decode_worker bool
+    priv worker_exe      str
+    priv worker_sha256   [32]u8
+    priv worker_sysroot  str
     priv config HttpConfig
 }
 
@@ -88,14 +102,14 @@ export type HttpClientBuilder value {
 export fn HttpClient.builder() -> HttpClientBuilder =>
     { default_headers: []HeaderKV.new(), follow_redirects: true, max_redirects: 10,
       allowed_origins: []str.new(),
-      user_agent: "nova-http/0.1", auto_decompress: true, max_decompressed: DEFAULT_MAX_DECOMPRESSED, config: HttpConfig.new() }
+      user_agent: "nova-http/0.1", auto_decompress: true, max_decompressed: DEFAULT_MAX_DECOMPRESSED, has_decode_worker: false, worker_exe: "", worker_sha256: d338_zero32(), worker_sysroot: "", config: HttpConfig.new() }
 
 /// Client with production defaults.
 #stable(since = "0.1")
 export fn HttpClient.new() -> HttpClient =>
     { default_headers: []HeaderKV.new(), follow_redirects: true, max_redirects: 10,
       allowed_origins: []str.new(),
-      user_agent: "nova-http/0.1", auto_decompress: true, max_decompressed: DEFAULT_MAX_DECOMPRESSED, config: HttpConfig.new() }
+      user_agent: "nova-http/0.1", auto_decompress: true, max_decompressed: DEFAULT_MAX_DECOMPRESSED, has_decode_worker: false, worker_exe: "", worker_sha256: d338_zero32(), worker_sysroot: "", config: HttpConfig.new() }
 
 // Internal self-accessors (field privacy is enforced at the call-site module,
 // so cross-type reads of these `priv` fields go through owner methods, D281).
@@ -114,6 +128,38 @@ fn HttpClient @cfg_auto_decompress() -> bool => @auto_decompress
 fn HttpClient @cfg_max_decompressed() -> int => @max_decompressed
 
 fn HttpClient @cfg_transport() -> HttpConfig => @config
+
+fn HttpClient @cfg_decode_worker() -> Option[DecodeWorker] => if @has_decode_worker {
+    Some(DecodeWorker { executable: @worker_exe, sha256: @worker_sha256, system_root: @worker_sysroot })
+} else {
+    None
+}
+
+/// 32 zero bytes (no array-repeat literal in the parser — see std sha256).
+fn d338_zero32() -> [32]u8 {
+    mut out [32]u8 = [
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0,
+    ]
+    out
+}
+
+/// Production Content-Encoding decode (production-rework п.5): run gzip/deflate/br
+/// in the PINNED owned worker process (nova-compress session API
+/// `decode_begin` → `feed` → `finish`) instead of in-process codecs. Byte limits
+/// (encoded cap from the framer, `max_decompressed` output cap) are enforced
+/// DURING the decode stream — over the cap is a definitive failure, never a
+/// truncated success — and the decode is bounded by the request deadline
+/// (watchdog kills the worker). Requires the separately deployed worker
+/// (absolute path + sha256 pin).
+export fn HttpClientBuilder mut @decode_worker(w DecodeWorker) -> @ {
+    @has_decode_worker = true
+    @worker_exe = w.executable
+    @worker_sha256 = w.sha256
+    @worker_sysroot = w.system_root
+}
 
 /// Configure byte budgets, native TLS, cancellation and request deadlines.
 export fn HttpClientBuilder mut @config(config HttpConfig) -> @ {
@@ -186,6 +232,12 @@ export fn HttpClientBuilder consume @into_client() -> Result[HttpClient, HttpErr
     if @config.header_bytes < 0 || @config.encoded_body_bytes < 0 || @config.decoded_body_bytes < 0 || @max_redirects < 0 {
         return Err(HttpError.protocol_error("negative HTTP limit"))
     }
+    // Owned decode path (production-rework п.5): the worker's output cap IS
+    // max_decompressed, and decode_begin requires 1..=DECODE_OUTPUT_MAX — refuse
+    // at build time instead of mid-response.
+    if @has_decode_worker && (@max_decompressed <= 0 || @max_decompressed > 268435456) {
+        return Err(HttpError.protocol_error("owned decode: decoded cap must be 1..=268435456"))
+    }
     // production-rework п.2: 1..2147483647 ms, явный отказ вне диапазона.
     @config.check_timeouts()?
     // production-rework п.4: max_hops 0..20; 20+ — явный отказ, не «как повезёт».
@@ -200,7 +252,7 @@ export fn HttpClientBuilder consume @into_client() -> Result[HttpClient, HttpErr
         ro (s, h, p) = u.origin()
         keys.push(origin_key(s, h, p))
     }
-    Ok({ @default_headers, @follow_redirects, @max_redirects, allowed_origins: keys, @user_agent, @auto_decompress, @max_decompressed, @config })
+    Ok({ @default_headers, @follow_redirects, @max_redirects, allowed_origins: keys, @user_agent, @auto_decompress, @max_decompressed, @has_decode_worker, @worker_exe, @worker_sha256, @worker_sysroot, @config })
 }
 
 // ── verb shortcuts ───────────────────────────────────────────────────────────
@@ -351,7 +403,7 @@ export fn RequestBuilder @build() -> Result[Request, HttpError] {
 // into_* покрывает конверсии, не сетевые действия (приёмка волны №79;
 // кандидат — эффект-исключение в сам линт W_CONSUME_NAKED_NAME).
 // nova:allow W_CONSUME_NAKED_NAME -- effectful action, not a conversion
-export fn RequestBuilder consume @send() Http Time -> Result[Response, HttpError] {
+export fn RequestBuilder consume @send() Http Time Proc Child ChildStdin ChildStdout DecodeGuard -> Result[Response, HttpError] {
     // `mut` (not `ro`): `apply_query` takes `u` as a `mut` in-out param
     // (D246 canon (a)) — used exactly once, right below.
     mut url0 = @url_input.to_url()?
@@ -365,7 +417,7 @@ export fn RequestBuilder consume @send() Http Time -> Result[Response, HttpError
     }
     mut headers = build_headers(@client, @header_ops, @content_type)?
     run_request(@method, url1, headers, @body_bytes, @client.cfg_follow(), @client.cfg_max(), @client.cfg_allowed(),
-                @client.cfg_auto_decompress(), @client.cfg_max_decompressed(), @client.cfg_transport())
+                @client.cfg_auto_decompress(), @client.cfg_max_decompressed(), @client.cfg_decode_worker(), @client.cfg_transport())
 }
 
 // ── convenience (script / one-shot) — uses a fresh default client ────────────
@@ -373,27 +425,27 @@ export fn RequestBuilder consume @send() Http Time -> Result[Response, HttpError
 
 /// One-shot GET (script convenience).
 #stable(since = "0.1")
-export fn get(url str) Http Time -> Result[Response, HttpError] => HttpClient.new().get(url).send()
+export fn get(url str) Http Time Proc Child ChildStdin ChildStdout DecodeGuard -> Result[Response, HttpError] => HttpClient.new().get(url).send()
 
 /// One-shot HEAD.
 #stable(since = "0.1")
-export fn head(url str) Http Time -> Result[Response, HttpError] => HttpClient.new().head(url).send()
+export fn head(url str) Http Time Proc Child ChildStdin ChildStdout DecodeGuard -> Result[Response, HttpError] => HttpClient.new().head(url).send()
 
 /// One-shot DELETE.
 #stable(since = "0.1")
-export fn delete(url str) Http Time -> Result[Response, HttpError] => HttpClient.new().delete(url).send()
+export fn delete(url str) Http Time Proc Child ChildStdin ChildStdout DecodeGuard -> Result[Response, HttpError] => HttpClient.new().delete(url).send()
 
 /// One-shot POST with a byte body.
 #stable(since = "0.1")
-export fn post(url str, body []u8) Http Time -> Result[Response, HttpError] => HttpClient.new().post(url).body(body).send()
+export fn post(url str, body []u8) Http Time Proc Child ChildStdin ChildStdout DecodeGuard -> Result[Response, HttpError] => HttpClient.new().post(url).body(body).send()
 
 /// One-shot PUT with a byte body.
 #stable(since = "0.1")
-export fn put(url str, body []u8) Http Time -> Result[Response, HttpError] => HttpClient.new().put(url).body(body).send()
+export fn put(url str, body []u8) Http Time Proc Child ChildStdin ChildStdout DecodeGuard -> Result[Response, HttpError] => HttpClient.new().put(url).body(body).send()
 
 /// One-shot PATCH with a byte body.
 #stable(since = "0.1")
-export fn patch(url str, body []u8) Http Time -> Result[Response, HttpError] => HttpClient.new().patch(url).body(body).send()
+export fn patch(url str, body []u8) Http Time Proc Child ChildStdin ChildStdout DecodeGuard -> Result[Response, HttpError] => HttpClient.new().patch(url).body(body).send()
 
 // ── request execution + redirect loop ───────────────────────────────────────
 
@@ -410,7 +462,7 @@ fn http_seam_send(host str, port int, secure bool, request []u8, config HttpConf
 // `url = next`) as it walks the chain, not an independent-copy case. The one
 // call site (`@send` below) never reuses its own `url1`/`headers` bindings
 // after this call.
-fn run_request(mut method Method, mut url Url, mut headers HeaderMap, mut body []u8, follow bool, max int, allowed []str, auto_decompress bool, max_decompressed int, config HttpConfig) Http Time -> Result[Response, HttpError] {
+fn run_request(mut method Method, mut url Url, mut headers HeaderMap, mut body []u8, follow bool, max int, allowed []str, auto_decompress bool, max_decompressed int, worker Option[DecodeWorker], config HttpConfig) Http Time Proc Child ChildStdin ChildStdout DecodeGuard -> Result[Response, HttpError] {
     // One absolute budget for ALL hops, never renewed by redirects.
     ro end = Monotonic.now() + config.total_timeout
     ro deadline = match config.deadline { Some(d) => if d.compare(end) < 0 { d } else { end }, None => end }
@@ -479,11 +531,11 @@ fn run_request(mut method Method, mut url Url, mut headers HeaderMap, mut body [
                     remaining -= 1
                 }
                 None => {
-                    return finalize_deadlined(parsed.version, st, parsed.headers, parsed.body, auto_decompress && method.str() != "HEAD" && code != 204 && code != 304, max_decompressed, deadline, config.cancel)
+                    return finalize_deadlined(parsed.version, st, parsed.headers, parsed.body, auto_decompress && method.str() != "HEAD" && code != 204 && code != 304, max_decompressed, deadline, config.cancel, worker)
                 }
             }
         } else {
-            return finalize_deadlined(parsed.version, st, parsed.headers, parsed.body, auto_decompress && method.str() != "HEAD" && code != 204 && code != 304, max_decompressed, deadline, config.cancel)
+            return finalize_deadlined(parsed.version, st, parsed.headers, parsed.body, auto_decompress && method.str() != "HEAD" && code != 204 && code != 304, max_decompressed, deadline, config.cancel, worker)
         }
     }
     Err(HttpError.new(TooManyRedirects(max)).with_url(url))
@@ -501,27 +553,147 @@ fn run_request(mut method Method, mut url Url, mut headers HeaderMap, mut body [
 // headers`'s own `mut` param on the decode branches below; both callers
 // (`run_request` above) pass `parsed.headers` (a field access, not a bound
 // identifier), so this doesn't constrain them.
-// These are boundary checks, NOT active interruption of synchronous decode.
-// compress 0.1.3 has no public Brotli incremental decoder/cancellation hook;
-// its DEFLATE finish() may also pump unbounded work. A total decode deadline
-// requires a package-supported input/output/work-bounded step API for every
-// codec, including bounded EOF/checksum validation and explicit cleanup.
-fn finalize_deadlined(ver Version, st StatusCode, mut headers HeaderMap, body []u8, auto_decompress bool, max_decompressed int, deadline Monotonic, cancel CancelToken) Time -> Result[Response, HttpError] {
+// Decompression paths (production-rework п.5):
+//   - worker configured → `finalize_owned`: gzip/deflate/br decode in the PINNED
+//     owned worker process via the nova-compress session API (decode_begin →
+//     feed → finish). The encoded cap is enforced IN the feed stream (a chunk
+//     over the cap is refused mid-stream, before finish), the output bomb-cap
+//     trips inside the worker DURING decode, the decode is bounded by the
+//     request deadline (the watchdog kills the worker), and a killed or
+//     abandoned worker never yields partial output. CancelToken bridging is
+//     honest: the http CancelToken and the compress DecodeCancel are different
+//     native tokens, so an http cancel does NOT interrupt a running decode
+//     mid-flight — the decode is bounded by the deadline instead, and
+//     pre-existing cancellation still refuses before spawn.
+//   - no worker → in-process one-shot decode (fallback; bounded by the codec
+//     caps, not interruptible — documented, non-production).
+fn finalize_deadlined(ver Version, st StatusCode, mut headers HeaderMap, body []u8, auto_decompress bool, max_decompressed int, deadline Monotonic, cancel CancelToken, worker Option[DecodeWorker]) Time Proc Child ChildStdin ChildStdout DecodeGuard -> Result[Response, HttpError] {
     if cancel.is_cancelled() { return Err(HttpError.new(Canceled)) }
     if Monotonic.now().compare(deadline) >= 0 { return Err(HttpError.new(Timeout)) }
-    match finalize_response(ver, st, headers, body, auto_decompress, max_decompressed) {
-        Err(e) => Err(e)
-        Ok(consume response) => {
-            if cancel.is_cancelled() {
-                response.drain()?
-                return Err(HttpError.new(Canceled))
+    match worker {
+        Some(w) => {
+            ro enc = content_encoding_lower(headers)
+            ro needs_decode = enc == "gzip" || enc == "x-gzip" || enc == "deflate" || enc == "br"
+            if !auto_decompress || !needs_decode {
+                match finalize_response(ver, st, headers, body, auto_decompress, max_decompressed) {
+                    Err(e) => return Err(e)
+                    Ok(consume response) => {
+                        if cancel.is_cancelled() { response.drain()?; return Err(HttpError.new(Canceled)) }
+                        if Monotonic.now().compare(deadline) >= 0 { response.drain()?; return Err(HttpError.new(Timeout)) }
+                        return Ok(response)
+                    }
+                }
             }
-            if Monotonic.now().compare(deadline) >= 0 {
-                response.drain()?
-                return Err(HttpError.new(Timeout))
+            // Deadline bridge: the compress worker watchdog runs on its own OS
+            // monotonic ms clock — hand it the REMAINING budget, never mix clocks.
+            ro remaining_ms = deadline.minus(Monotonic.now()).millis()
+            match finalize_owned(ver, st, headers, body, max_decompressed, remaining_ms, w) {
+                Err(e) => Err(e)
+                Ok(consume response) => {
+                    if cancel.is_cancelled() { response.drain()?; return Err(HttpError.new(Canceled)) }
+                    Ok(response)
+                }
             }
-            Ok(response)
         }
+        None => {
+            match finalize_response(ver, st, headers, body, auto_decompress, max_decompressed) {
+                Err(e) => Err(e)
+                Ok(consume response) => {
+                    if cancel.is_cancelled() {
+                        response.drain()?
+                        return Err(HttpError.new(Canceled))
+                    }
+                    if Monotonic.now().compare(deadline) >= 0 {
+                        response.drain()?
+                        return Err(HttpError.new(Timeout))
+                    }
+                    Ok(response)
+                }
+            }
+        }
+    }
+}
+
+// Owned decode of one Content-Encoding body (production-rework п.5). Limits:
+//   encoded  = body.len() (already capped in-stream by the framer's
+//              `encoded_body_bytes` during reception — the session's feed
+//              re-checks it per chunk),
+//   output   = max_decompressed (bomb-cap enforced by the worker DURING decode),
+//   memory   = the protocol's hard ceiling (2 GiB).
+// CPU is bounded via the deadline (ceil to seconds inside decode_begin) —
+// measured by the watchdog as worker CPU time, never as bytes.
+fn finalize_owned(ver Version, st StatusCode, mut headers HeaderMap, body []u8, max_decompressed int, remaining_ms int, w DecodeWorker) Proc Child ChildStdin ChildStdout DecodeGuard -> Result[Response, HttpError] {
+    if body.len() == 0 { return Err(HttpError.protocol_error("empty compressed body")) }
+    ro enc = content_encoding_lower(headers)
+    // HTTP "deflate" is nominally zlib (RFC 9110); raw-DEFLATE senders are
+    // tolerated by a second owned run with the raw codec (mirrors the in-process
+    // zlib_decode→inflate fallback in finalize_response).
+    ro codec = if enc == "gzip" || enc == "x-gzip" {
+        DecodeGzip
+    } else if enc == "deflate" {
+        DecodeZlib
+    } else {
+        DecodeBrotli
+    }
+    ro dl = match DecodeDeadline.now().plus_millis(remaining_ms) {
+        Ok(d) => d
+        Err(_) => return Err(HttpError.new(Timeout))
+    }
+    ro limits = DecodeLimits { encoded: body.len(), output: max_decompressed, memory: 2147483648 }
+    match owned_decode_run(w, codec, body, limits, dl) {
+        Ok(consume bytes) => Ok(Response.new(ver, st, rewrite_encoding_headers(headers, bytes.len()), bytes))
+        Err(DecodeFailure(consume c)) => {
+            if c.is_bomb() { return Err(HttpError.body_too_large()) }
+            if codec != DecodeZlib { return Err(HttpError.from_compress(c)) }
+            // zlib-framing rejected → retry once as RAW deflate in a fresh owned
+            // session (the same budget — the deadline is absolute on the worker clock).
+            match owned_decode_run(w, DecodeDeflate, body, limits, dl) {
+                Ok(consume bytes) => Ok(Response.new(ver, st, rewrite_encoding_headers(headers, bytes.len()), bytes))
+                Err(e2) => Err(owned_decode_err(e2))
+            }
+        }
+        Err(e) => Err(owned_decode_err(e))
+    }
+}
+
+// One owned decode run through the incremental session API: decode_begin
+// (pin + guard + spawn + handshake) → feed the encoded body in 64 KiB chunks
+// (the encoded cap is checked on EVERY feed — an over-cap chunk is refused
+// mid-stream, before finish) → finish (framed outcome, reap, guard commit).
+// A feed/finish failure unwinds through DecodeSession.@cleanup, which hard-
+// kills and reaps the worker — no path leaves a live child or a partial body.
+// Each run owns a fresh DecodeCancel token (one operation per token).
+fn owned_decode_run(w DecodeWorker, codec DecodeCodec, body []u8, limits DecodeLimits, dl DecodeDeadline) Proc Child ChildStdin ChildStdout DecodeGuard -> Result[[]u8, OwnedDecodeError] {
+    consume cancel = match DecodeCancel.new() {
+        Ok(consume c) => c
+        Err(e) => return Err(e)
+    }
+    consume session = decode_begin(w, codec, limits, dl, cancel)?
+    mut at = 0
+    while at < body.len() {
+        ro end = (at + 65536).min(body.len())
+        session.feed(body[at..end])?
+        at = end
+    }
+    session.finish()
+}
+
+// Map owned-decode failures to honest http outcomes: over-cap → BodyTooLarge,
+// cancellation → Canceled, deadline → Timeout; every other failure (protocol,
+// integrity/pin, worker exit, IO) is a DEFINITE error — never a partial body.
+fn owned_decode_err(e OwnedDecodeError) -> HttpError {
+    match e {
+        DecodeCancelled   => HttpError.new(Canceled)
+        DecodeTimedOut    => HttpError.new(Timeout)
+        DecodeInputLimit  => HttpError.body_too_large()
+        DecodeFailure(c)  => if c.is_bomb() { HttpError.body_too_large() } else { HttpError.from_compress(c) }
+        DecodeIntegrity   => HttpError.protocol_error("owned decode: worker pin (sha256) mismatch")
+        DecodeProtocol    => HttpError.protocol_error("owned decode: worker protocol violation")
+        DecodeWorkerExit(n) => HttpError.protocol_error("owned decode: worker exited ${n}")
+        DecodeCleanup     => HttpError.protocol_error("owned decode: worker not reaped in budget")
+        DecodeIo          => HttpError.protocol_error("owned decode: worker io failure")
+        DecodeResource    => HttpError.protocol_error("owned decode: worker resources unavailable")
+        DecodeConfiguration => HttpError.protocol_error("owned decode: invalid worker configuration")
     }
 }
 
